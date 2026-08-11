@@ -1,343 +1,212 @@
 # Architecture
 
-## 1. 设计目标
-
-系统要解决的不是单图 OCR，而是两个版本之间的结构化内容迁移：
-
-- Source A：旧版低清中文汉化图。
-- Source B：高清日文原图。
-- Output：以 B 为画面母版，保留 A 的中文译文内容，并重新完成清字、排字和出版级 QA。
-
-所有阶段必须可独立测试、可替换、可回滚。
-
-## 2. 总体模块
-
-```text
-                         ┌────────────────────┐
-Old Chinese Pages ──────▶│ Page Pairing       │◀────── HD Japanese Pages
-                         └─────────┬──────────┘
-                                   │ paired pages
-                                   ▼
-                         ┌────────────────────┐
-                         │ Registration        │
-                         │ global + local      │
-                         └──────┬────────┬────┘
-                                │        │
-             ┌──────────────────┘        └──────────────────┐
-             ▼                                                ▼
-┌────────────────────────┐                         ┌────────────────────────┐
-│ Chinese Extraction     │                         │ HD Structure Analysis  │
-│ detect + OCR + group   │                         │ JP text + bubbles      │
-└────────────┬───────────┘                         └────────────┬───────────┘
-             │                                                │
-             └──────────────────┬─────────────────────────────┘
-                                ▼
-                    ┌────────────────────────┐
-                    │ Cross-Version Matcher  │
-                    └────────────┬───────────┘
-                                 ▼
-                    ┌────────────────────────┐
-                    │ Text Removal / Inpaint │
-                    └────────────┬───────────┘
-                                 ▼
-                    ┌────────────────────────┐
-                    │ Lettering Optimizer    │
-                    └────────────┬───────────┘
-                                 ▼
-                    ┌────────────────────────┐
-                    │ QA + Review Queue      │
-                    └────────────┬───────────┘
-                                 ▼
-                    ┌────────────────────────┐
-                    │ Export                 │
-                    └────────────────────────┘
-```
-
-## 3. Page Pairing
-
-职责：确定两套图片中哪些页面对应。
-
-输入：文件序列、缩略图。
-
-输出：
-
-```json
-{
-  "source_page": "old/001.jpg",
-  "target_page": "hd/003.png",
-  "confidence": 0.998,
-  "signals": {
-    "sequence": 0.8,
-    "phash": 0.96,
-    "feature_match": 0.99
-  }
-}
-```
-
-不能假设两边页码永远一一对应；必须处理封面、广告、staff 页、双页拆分等情况。
-
-## 4. Registration
-
-### 4.1 Global registration
-
-优先估计：
-
-- translation + scale
-- similarity
-- affine
-- homography
-
-模型复杂度逐级增加；只有低阶模型无法解释匹配点时才升级。
-
-### 4.2 Feature backends
-
-Backend 接口：
-
-```python
-class FeatureMatcher:
-    def match(self, image_a, image_b) -> MatchSet:
-        ...
-```
-
-实现候选：
-
-- OpenCV SIFT/ORB baseline
-- ALIKED + LightGlue
-- DISK + LightGlue
-- LoFTR fallback
+## 1. 原则
 
-### 4.3 Registration quality
+系统围绕三个完全分离的坐标/语义对象设计：
 
-至少计算：
+- **Source translation geometry**：旧中文版上中文译文在哪里，只是来源证据。
+- **Target erase geometry**：高清日文版哪些像素属于需要删除的日文。
+- **Target lettering geometry**：最终中文可以出现在哪个气泡/文本框安全区。
 
-- match count
-- RANSAC inlier ratio
-- median reprojection error
-- spatial coverage
-- forward/backward consistency
+任何两个对象都不能用一个 bbox 代替。
 
-若控制点只集中在一个角落，即使误差低也不能判为高置信度。
+## 2. 数据对象
 
-### 4.4 Local registration
+### PagePair
 
-对于局部裁剪、纸张弯曲、汉化重绘：按 panel/bubble neighborhood 建局部映射。
+保存 source/target 页、视觉指纹成本、置信度与理由。页面配对采用顺序约束动态规划，可显式跳过 source 或 target 的额外页。
 
-## 5. Chinese Extraction
+### RegistrationResult
 
-### 5.1 Detection data model
+保存：
 
-```json
-{
-  "id": "cn_001",
-  "polygon": [[0,0],[1,0],[1,1],[0,1]],
-  "text": "……",
-  "ocr_confidence": 0.0,
-  "reading_order": 0,
-  "kind": "speech",
-  "bubble_id": "old_bubble_01",
-  "candidates": []
-}
-```
+- 3x3 source→target 变换；
+- backend/method；
+- RANSAC inlier ratio；
+- median reprojection error；
+- spatial coverage；
+- confidence；
+- 采样匹配点与候选模型诊断。
 
-### 5.2 OCR ensemble
+### TextBlock
 
-OCR provider 使用统一接口：
+OCR/检测的最小文字区域：polygon、text、confidence、kind、reading order、可选 `mask_path`。
 
-```python
-class OcrEngine:
-    def recognize(self, crop, hints=None) -> OcrCandidate:
-        ...
-```
+### BubbleInstance
 
-默认单模型即可完成高置信度区域；只有低置信度区域才触发 ensemble。
+实例 polygon、完整 mask、safe mask、类型、包含的 TextBlock。
 
-## 6. HD Structure Analysis
+### TextUnit
 
-输出两类几何：
+真正参与跨版本身份匹配的单位。气泡内多条 OCR line 会先合成一个 bubble-level TextUnit，从根源上减少“日文多竖列 vs 中文重新断行”造成的一对多噪声。
 
-1. **text mask / text polygon**：用于准确清除日文。
-2. **bubble / narration safe region**：用于重新排版中文。
+### UnitMatch
 
-不能把两者混为一个矩形框。
+记录 source unit → target unit 的成本、置信度、relation 与证据。`one_to_many` / `many_to_one` 会被识别，但默认不能自动出版。
 
-### 6.1 Bubble representation
+## 3. 页面配对
 
-```json
-{
-  "id": "bubble_01",
-  "mask_ref": "...",
-  "bbox": [0,0,0,0],
-  "safe_polygon": [],
-  "tail_exclusion": [],
-  "kind": "speech",
-  "confidence": 0.0
-}
-```
+指纹成本包含：
 
-## 7. Cross-Version Matcher
+- 模糊缩略图 dHash；
+- 边缘空间分布；
+- 宽高比；
+- 卷内相对顺序。
 
-### 7.1 Candidate generation
+使用 sequence alignment 而不是全局 Hungarian，防止漫画页顺序交叉，同时允许 staff/广告/缺页。
 
-旧中文版区域通过 registration transform 投影到高清版坐标，生成局部候选。
+## 4. 配准
 
-### 7.2 Cost function
+### OpenCV 离线基线
 
-```text
-cost =
-  w1 * normalized_center_distance
-+ w2 * shape_difference
-+ w3 * bubble_mismatch
-+ w4 * reading_order_difference
-+ w5 * local_visual_inconsistency
-+ w6 * class_mismatch
-```
+SIFT 优先，ORB 后备；KNN ratio test 后执行弱一对一去重。
 
-不使用固定 IoU 0.3 作为唯一判断。
+分别估计：
 
-### 7.3 Assignment
+1. similarity；
+2. affine；
+3. homography。
 
-- 一对一：Hungarian/min-cost matching。
-- 一对多/多对一：建立 group node，再进行匹配。
-- unmatched：保留并进入 Review Queue，不能强行塞到最近框。
+候选按：inlier ratio + reprojection error + feature spatial coverage - complexity penalty 打分，因此能满足条件时优先更简单、稳定的变换。
 
-## 8. Masking and Inpainting
+### LightGlue
 
-### 8.1 Mask policy
+可选 `SIFT / ALIKED / DISK + LightGlue`。只有安装对应 extra 后才启用，不是核心离线测试硬依赖。
 
-```text
-text segmentation mask
-  -> remove tiny noise
-  -> adaptive dilation
-  -> clip to allowed repair region
-  -> protect bubble border / line art
-  -> risk classification
-```
+### LoFTR
 
-### 8.2 Repair backend
+困难页后备。`auto` 模式不会因为没有 kornia 而失败。
 
-```python
-class Inpainter:
-    def inpaint(self, image, mask, context) -> InpaintResult:
-        ...
-```
+### 安全 fallback
 
-后端：
+所有特征法失败时只能退回 resize + phase correlation，并把 confidence 限制为低值；它不能越过 publication gate 自动修改高清母版。
 
-- flat-fill
-- texture/patch fill
-- LaMa
-- manual-required
+## 5. OCR 与文本结构
 
-QA 不通过时可换后端重跑，而无需重新 OCR/配准。
+默认 source 中文使用 PP-OCRv5。低于 `retry_confidence` 的块会：
 
-## 9. Lettering Engine
+- 扩边 crop；
+- 2x 高质量放大；
+- 原图 / sharpen 两个候选复识；
+- 保存所有候选；
+- 只有置信度明确提升才替换原 OCR。
 
-### 9.1 Layout representation
+外部 detector/OCR 可以通过 sidecar 接入；`mask_path` 让 comic text segmentation 直接进入清字。
 
-```json
-{
-  "text": "中文译文",
-  "font_family": "...",
-  "font_size": 42,
-  "tracking": 0,
-  "line_spacing": 1.05,
-  "alignment": "center",
-  "rotation": 0,
-  "lines": [],
-  "fit_score": 0.0
-}
-```
+## 6. 气泡与 safe area
 
-### 9.2 Constraint solver
+核心自带 `seeded_white` fallback：以 OCR 文字中心寻找封闭白色连通区域，然后用外轮廓填补原文字造成的黑洞。
 
-硬约束：
+safe area 使用 distance/erosion 向内收缩，保护气泡边线；窄气泡尾部通常在腐蚀后与主体断开。
 
-- 所有 glyph 落在 safe area。
-- 不跨越禁止区域。
-- 不低于最小可读字号（除非人工确认）。
+专业 speech-bubble instance segmentation 推荐通过 `*.bubbles.json` 输入完整实例 mask。
 
-软目标：
+## 7. 跨版本身份匹配
 
-- 字号尽量大。
-- 行宽均衡。
-- 视觉中心接近原文本中心。
-- 避免单字孤行。
-- 中文标点禁则合理。
+source TextUnit 先经 Registration 投影到 target 坐标。
 
-## 10. SFX / 艺术字独立路径
+成本包含：
 
-拟声词不能与对白共用普通字体排版逻辑。
+- 中心位置；
+- bbox overlap-over-smaller；
+- 面积/长宽形状；
+- reading order；
+- speech/narration/free-text kind。
 
-三档：
+一对一使用 Hungarian assignment。assignment best-vs-second margin 进入 confidence。
 
-1. 保留日文拟声词，不迁移。
-2. OCR 中文后人工字体/变形排版。
-3. 旧中文版像素风格迁移：必须先做局部 registration 和 alpha/mask 提取，再进行高分辨率重建。
+未匹配区域额外检查 one-to-many/many-to-one，但这些 relation 一律进入 Review，不自动复制/合并译文。
 
-默认不自动执行第 3 档。
+## 8. 日文清字
 
-## 11. QA Engine
+优先级：
 
-每个 stage 输出自己的 confidence 和 diagnostics；最终 QA 只聚合，不重新猜测。
+1. `TextBlock.meta.mask_path` 像素级 segmentation；
+2. OCR polygon rasterization。
 
-`PageQA` 示例：
+之后使用与字高相关的自适应 dilation。若 target unit 属于 bubble，最终 mask 还必须与“气泡向内保护后的 mask”相交，因此不会因为 dilation 擦穿边线。
 
-```json
-{
-  "status": "review_required",
-  "registration": {"score": 0.94},
-  "ocr": {"low_confidence_blocks": ["cn_04"]},
-  "matching": {"ambiguous": ["cn_09"]},
-  "cleanup": {"residual_japanese": ["jp_07"]},
-  "lettering": {"overflow": []}
-}
-```
+## 9. Inpainting
 
-## 12. Artifact-first 调试
+`auto` 根据 mask 周边像素方差选择：
 
-每页都应可选输出：
+- 低方差：robust local median 的确定性填充；
+- 高方差：OpenCV Telea；
+- 配有 `lama_command`：复杂区域优先外部 LaMa，失败会记录并退回 OpenCV。
 
-```text
-debug/page_0001/
-  01_pairing.jpg
-  02_registration_matches.jpg
-  03_registration_warp.jpg
-  04_cn_text_regions.jpg
-  05_hd_text_regions.jpg
-  06_bubbles.jpg
-  07_cross_version_matches.jpg
-  08_cleanup_mask.png
-  09_inpainted.png
-  10_lettering_safe_area.jpg
-  11_final_overlay.jpg
-  page.json
-  qa.json
-```
+LaMa 通过命令模板调用，不在项目里复制模型代码/权重。
 
-这比单纯打印日志更适合定位出版级视觉问题。
+## 10. 中文排字
 
-## 13. 可测试性
+排字不是 bbox 字号缩放，而是约束搜索：
 
-每个模块必须支持离线 golden test：
+- 从 `max_font_size` 向下搜索；
+- CJK char-level 动态规划断行；
+- 禁止典型中文关闭标点出现在行首；
+- 禁止打开标点留在行尾；
+- 惩罚孤字和极不均衡行宽；
+- 根据 safe-mask 质心居中；
+- 小范围位置搜索；
+- 实际渲染 glyph mask；
+- `glyph ∩ safe / glyph >= min_safe_coverage` 才算成功。
 
-- registration：固定页面对，比较 transform/error。
-- OCR：固定 crop，比较字符级结果。
-- matcher：固定区域图，比较 assignment。
-- mask：比较 IoU + protected-pixel violation。
-- lettering：检查 glyph mask 是否越界。
-- export：像素尺寸、色彩空间、alpha、文件完整性。
+支持 horizontal / vertical / auto。
 
-## 14. 性能策略
+## 11. Publication gate
 
-质量优先，但避免所有页面都跑最重模型：
+自动应用某个文本至少同时要求：
 
-```text
-fast path success
-  -> continue
-fast path low confidence
-  -> robust model
-still uncertain
-  -> review queue
-```
+- page pair confidence 通过；
+- registration confidence 通过；
+- source OCR confidence 通过；
+- target geometry confidence 通过；
+- unit match confidence 通过；
+- relation 必须是 one_to_one；
+- 中文文本非空。
 
-缓存所有阶段结果，以页面内容 hash + 配置 hash 作为 cache key。
+任一失败：保留高清母版，不自动清字/排字。
+
+## 12. QA
+
+逐页检查：
+
+- 页面配对低置信度；
+- 配准低置信度；
+- source OCR 低置信度；
+- target geometry 低置信度；
+- match 低置信度；
+- split/merge；
+- source unmatched；
+- mask 被气泡边界大量裁剪；
+- 清字后 dark-pixel 残留启发式；
+- lettering missing/failed；
+- glyph 越 safe area；
+- 字号过小。
+
+## 13. Review
+
+`mhd-transfer review output` 启动仅绑定 `127.0.0.1` 的本地 HTTP 编辑器。
+
+Review 保存：
+
+- `text_overrides`；
+- `match_overrides`；
+- `accepted_source_units`；
+- `manual_clear_mask.png`；
+- status / notes。
+
+`apply_review_page()` 从高清母版重新执行清字和排字，不在已经压过文字的 final 上二次加工。
+
+## 14. 可编辑输出
+
+每页最少保留：
+
+- Original HD Japanese；
+- Inpainted；
+- Chinese text transparent layer；
+- clear mask；
+- bubble/safe masks；
+- ORA；
+- 有 ImageMagick 时 PSD；
+- project/QA JSON；
+- registration/structure/matching/mask overlays。

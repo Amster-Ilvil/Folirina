@@ -1,0 +1,107 @@
+{
+  "pairing": {
+    "gap_penalty": 0.52,
+    "max_pair_cost": 0.62,
+    "order_weight": 0.16,
+    "hash_weight": 0.58,
+    "aspect_weight": 0.1,
+    "edge_weight": 0.16,
+    "confidence_floor": 0.45
+  },
+  "registration": {
+    "backend": "auto",
+    "feature": "sift",
+    "max_features": 6000,
+    "ratio_test": 0.76,
+    "min_matches": 10,
+    "ransac_threshold": 4.0,
+    "model_preference": ["similarity", "affine", "homography"],
+    "min_inlier_ratio": 0.28,
+    "max_median_error": 7.0,
+    "min_spatial_coverage": 0.08,
+    "review_confidence": 0.55,
+    "allow_reflection": false
+  },
+  "ocr": {
+    "backend": "paddle",
+    "source_backend": null,
+    "target_backend": null,
+    "source_lang": "ch",
+    "target_lang": "japan",
+    "ocr_version": "PP-OCRv5",
+    "min_confidence": 0.66,
+    "retry_confidence": 0.8,
+    "sidecar_suffix": ".ocr.json",
+    "preserve_line_breaks": true,
+    "retry_low_confidence": true,
+    "retry_scale": 2.0
+  },
+  "bubbles": {
+    "backend": "seeded_white",
+    "sidecar_suffix": ".bubbles.json",
+    "white_threshold": 205,
+    "min_area_ratio": 0.0015,
+    "max_area_ratio": 0.38,
+    "safe_margin_px": 8,
+    "safe_margin_ratio": 0.035,
+    "close_kernel": 3,
+    "search_radius": 32
+  },
+  "matching": {
+    "auto_apply_kinds": ["speech", "narration"],
+    "centroid_weight": 0.42,
+    "overlap_weight": 0.34,
+    "shape_weight": 0.1,
+    "order_weight": 0.08,
+    "kind_weight": 0.06,
+    "max_cost": 0.74,
+    "review_confidence": 0.6,
+    "unmatched_cost": 0.78
+  },
+  "masking": {
+    "dilation_ratio": 0.07,
+    "min_dilation_px": 1,
+    "max_dilation_px": 6,
+    "bubble_border_protection_px": 2,
+    "clip_to_bubble": true
+  },
+  "inpainting": {
+    "backend": "auto",
+    "solid_variance_threshold": 75.0,
+    "opencv_radius": 3.0,
+    "lama_command": null,
+    "lama_timeout_seconds": 120
+  },
+  "lettering": {
+    "font_path": null,
+    "min_font_size": 10,
+    "max_font_size": 72,
+    "min_safe_coverage": 0.997,
+    "line_spacing_ratio": 0.16,
+    "side_padding_ratio": 0.04,
+    "orientation": "horizontal",
+    "vertical_aspect_threshold": 2.25,
+    "stroke_width": 0,
+    "fill": [0, 0, 0],
+    "stroke_fill": [255, 255, 255],
+    "max_lines": 8
+  },
+  "qa": {
+    "registration_min_confidence": 0.55,
+    "ocr_min_confidence": 0.66,
+    "match_min_confidence": 0.6,
+    "residual_dark_ratio_max": 0.06,
+    "lettering_safe_coverage_min": 0.997,
+    "min_font_size": 10,
+    "fail_on_error": false
+  },
+  "export": {
+    "save_inpainted": true,
+    "save_debug": true,
+    "save_masks": true,
+    "save_project_json": true,
+    "image_format": "png",
+    "tiff": false,
+    "layer_bundle": true
+  }
+}

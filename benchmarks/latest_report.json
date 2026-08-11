@@ -1,0 +1,20 @@
+{
+  "registration": {
+    "trials": 20,
+    "median_error_px": 0.05080746114253998,
+    "p95_error_px": 0.11656420342624195,
+    "min_confidence": 0.8380041572566803,
+    "failures": [],
+    "pass": true
+  },
+  "lettering": {
+    "cases": [
+      {"text_len": 3, "success": true, "font_size": 54, "coverage": 1.0},
+      {"text_len": 11, "success": true, "font_size": 54, "coverage": 0.9996223208384477},
+      {"text_len": 39, "success": true, "font_size": 31, "coverage": 0.9979293208172281},
+      {"text_len": 26, "success": true, "font_size": 38, "coverage": 0.9987559287769224}
+    ],
+    "pass": true
+  },
+  "pass": true
+}

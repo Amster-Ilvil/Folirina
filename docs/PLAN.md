@@ -1,314 +1,52 @@
-# 实施计划：旧版中文汉化 → 高清日文原图译文迁移
-
-## 1. 成功标准
-
-本项目不是“一键翻译器”，而是“跨版本译文迁移 + 出版级重新嵌字工具”。
-
-核心验收标准：
-
-- **页配对正确率**：自动配对后，普通章节目标 ≥ 99.5%；不确定页必须标红进入人工确认。
-- **区域迁移正确率**：对白/旁白文本单元与高清版目标区域匹配准确率目标 ≥ 99%。
-- **日文残留**：对白气泡和旁白框内不应存在可见原文残留。
-- **误伤率**：不得因清字破坏人物线条、气泡边界、网点或非目标拟声词；高风险区域必须转人工。
-- **排字溢出率**：自动 QA 后不得有文字越出气泡安全区、遮挡气泡尾巴、压到边框等明显问题。
-- **可追溯**：每个输出文本块必须能追溯到旧中文版 OCR 来源、高清版目标区域、配准映射与置信度。
-
-## 2. 数据基准先行
-
-在写复杂算法前，先建立 100–300 页的代表性测试集，覆盖：
-
-1. 同尺寸但不同压缩质量。
-2. 不同分辨率。
-3. 四周裁边不同。
-4. 页面有 1–20 px 平移。
-5. 非等比缩放。
-6. 轻微旋转/扫描倾斜。
-7. 双页拆分/合并。
-8. 汉化组加入页码、水印、staff、黑边。
-9. 中文版重绘过气泡或局部画面。
-10. 同一页中对白、旁白、画外字、拟声词同时存在。
-
-每页建立人工真值：页面对应关系、文本区域对应关系、中文文本、目标气泡/文本框 mask、日文清除 mask。
-
-## 3. Phase 0 — 基线复现
-
-目标：复现 `manga-translator-ui` 替换翻译逻辑，建立对照组。
-
-实现：
-
-- 两边文本检测 + OCR。
-- 按宽高 resize 坐标。
-- 以小框为基准的 overlap/IoU 匹配。
-- 日文区域 inpaint。
-- 中文 OCR 文本重新渲染。
-
-保留该基线仅用于 A/B 对比，不作为最终架构。
-
-验收：输出 baseline 指标报告，量化裁边、偏移、旋转等条件下的失败率。
-
-## 4. Phase 1 — 页面配对与鲁棒配准
-
-### 4.1 页面配对
-
-建立多级页面指纹：
-
-- 文件顺序/页码弱先验。
-- 灰度缩略图 pHash/dHash。
-- 面板结构轮廓。
-- 局部特征匹配得分。
-
-输出 `page_pair_confidence`，低于阈值时禁止静默自动继续。
-
-### 4.2 页级几何配准
-
-三级回退：
-
-1. **快速路径**：ORB/SIFT + RANSAC 仿射/单应性。
-2. **鲁棒路径**：ALIKED/DISK/SIFT + LightGlue，估计 homography/affine。
-3. **困难页**：LoFTR 或分块局部匹配。
-
-不允许只用单个中心模板作为最终配准。
-
-### 4.3 局部形变
-
-对于扫描纸张弯曲、旧版局部重绘、非线性缩放：
-
-- 将页面切为面板/气泡邻域。
-- 对每个区域计算局部 affine/homography。
-- 保留全局映射作为先验，避免局部漂移。
-
-输出：
-
-```json
-{
-  "global_transform": "...",
-  "local_transforms": [],
-  "inlier_ratio": 0.0,
-  "reprojection_error": 0.0,
-  "registration_confidence": 0.0
-}
-```
-
-验收：人工标注关键点的中位重投影误差达到可稳定落入同一气泡/文本框的水平。
-
-## 5. Phase 2 — 旧中文版中文 OCR
-
-普通对白不迁移旧图像素，而迁移“文字内容 + 结构”。
-
-### 5.1 检测
-
-组合：
-
-- comic-text-detector 类漫画文本检测。
-- PP-OCR 文本检测作为第二候选。
-- 气泡实例分割结果辅助约束。
-
-### 5.2 识别
-
-主 OCR：PP-OCRv5 中文识别。
-
-低置信度策略：
-
-- 同一区域多尺度识别。
-- 灰度/二值化/去网点预处理多候选。
-- 可选第二 OCR 引擎交叉验证。
-- 只有冲突/低置信度区域才进入 VLM/OCR 复核，控制成本。
-
-### 5.3 文本结构
-
-保存：
-
-- 原始 OCR 文本。
-- 规范化文本。
-- 行/列顺序。
-- 标点与全半角。
-- 区域 polygon。
-- 识别置信度。
-- 对白/旁白/拟声词类别。
-
-不得在 OCR 阶段擅自重写译文。
-
-## 6. Phase 3 — 高清日文版结构理解
-
-### 6.1 文本检测
-
-输出日文字符/行级 mask，而不是只保留矩形框。
-
-### 6.2 气泡与文本框实例分割
-
-优先使用专门漫画气泡模型；SAM 2 仅作为交互式精修/困难样本后备。
-
-每个文本块需要关联：
-
-- bubble instance id
-- bubble polygon/mask
-- safe inset mask
-- tail/边缘保护区
-- 文本方向
-- 原始文字 bbox/polygon
-
-### 6.3 非气泡文字分类
-
-至少分为：
-
-- speech bubble
-- narration box
-- free text
-- SFX/拟声词
-- page number / credits / watermark
-
-不同类别使用不同清字与重嵌策略。
-
-## 7. Phase 4 — 跨版本文本身份匹配
-
-匹配不再只看 IoU，而使用综合成本函数：
-
-- 配准后的几何距离。
-- 所属气泡/文本框实例。
-- 阅读顺序。
-- 区域形状与面积。
-- 周围面板视觉特征。
-- 一对多/多对一关系。
-
-采用二分图/最小成本匹配，并显式支持：
-
-- 一个日文框对应多个中文行。
-- 多个日文竖排行合并成一个中文块。
-- 汉化版拆分/合并气泡文字。
-
-低置信度匹配进入 Review Queue。
-
-## 8. Phase 5 — 日文清字与背景恢复
-
-### 8.1 精准清字 mask
-
-优先使用像素级文本 mask + 小幅自适应 dilation，而不是扩大整个文本矩形。
-
-约束：
-
-- mask 不越过气泡边界。
-- 对气泡边线做保护带。
-- 与人物线条重叠时标记高风险。
-
-### 8.2 修复策略分级
-
-1. 纯白/纯色气泡：直接局部颜色重建，比生成式 inpaint 更稳定。
-2. 网点/规则背景：纹理复制/频域或 patch 修复。
-3. 复杂画面文字：LaMa 类高分辨率 inpainting。
-4. 线稿穿字：需要线条重建或人工修复入口。
-
-每次修复都保留 before/mask/after debug artifact。
-
-## 9. Phase 6 — 出版级中文重新排字
-
-### 9.1 气泡安全区
-
-从 bubble mask 向内腐蚀得到 safe area；气泡尾巴、尖角、窄颈区域从排版区域排除。
-
-### 9.2 字号与断行优化
-
-把排版视为约束优化：
-
-- 最大化可读字号。
-- 控制行数、行宽方差、字间距、行间距。
-- 避免孤字、标点悬挂、不自然短行。
-- 保持视觉重心接近原气泡中心。
-- 禁止超出 safe area。
-
-中文使用专门的标点禁则与语义断行。
-
-### 9.3 字体与风格
-
-建立 style preset：
-
-- 正文对白。
-- 旁白。
-- 小字。
-- 强调/粗体。
-- 黑底白字。
-- 手写/拟声词。
-
-普通对白默认重新排字；艺术拟声词可以进入“风格迁移/像素迁移”独立流程，不能和对白共用简单直接粘贴。
-
-## 10. Phase 7 — 自动 QA
-
-每页自动产生问题列表：
-
-- OCR 低置信度。
-- 页面配准低置信度。
-- 区域匹配歧义。
-- 中文缺失/重复。
-- 日文残留检测。
-- 清字 mask 越界。
-- 修复纹理异常。
-- 文字越出安全区。
-- 字号异常小。
-- 文本与气泡边缘距离过小。
-- 同页字体/字号风格异常。
-
-输出 `qa.json` 和可视化 overlay。
-
-## 11. Phase 8 — 人工复核编辑器
-
-出版级目标必须保留编辑入口：
-
-- 左：旧中文版。
-- 中：高清日文原图/清字结果。
-- 右：最终嵌字预览。
-- 显示配准控制点、气泡 mask、文本 mask、目标框、安全区。
-- 可拖动/重匹配文本块。
-- 可编辑 OCR 文本。
-- 可编辑清字 mask。
-- 可调整字号、行距、字距、字体、旋转、对齐。
-- 支持撤销/重做。
-
-## 12. Phase 9 — 输出与可编辑工程
-
-至少输出：
-
-- 无损 PNG；可选 TIFF。
-- 每页 project JSON。
-- 整册 manifest。
-- debug overlays。
-- 可选 PSD：原图 / 清字层 / 中文文本层 / mask 层分离。
-
-原图永不覆盖。
-
-## 13. 工程目录建议
-
-```text
-src/
-  pairing/
-  registration/
-  detection/
-  ocr/
-  bubbles/
-  matching/
-  masking/
-  inpainting/
-  lettering/
-  qa/
-  export/
-  ui/
-models/
-tests/
-  fixtures/
-  golden/
-docs/
-```
-
-## 14. 开发优先级
-
-P0：页面配对、鲁棒配准、中文 OCR、高清版文字/气泡检测、区域匹配、清字、基础气泡排字、QA overlay。
-
-P1：局部形变、多 OCR 仲裁、网点修复、PSD、人工复核编辑器。
-
-P2：艺术字/拟声词风格迁移、批量字体风格学习、跨卷模板学习。
-
-## 15. 第一版禁止事项
-
-- 不加入机器翻译服务；项目的输入译文就是旧中文版。
-- 不先做“全自动黑箱 AI 重绘整页”。
-- 不以超分旧汉化图作为最终成品来源。
-- 不把 OCR 结果无条件当真。
-- 不在匹配置信度不足时自动覆盖高清原图。
+# Implementation plan and status
+
+## 已实现 P0
+
+- [x] 测试/合成基线框架。
+- [x] 页面视觉指纹 + 保序列配对 + extra/missing page。
+- [x] SIFT/ORB + RANSAC similarity/affine/homography。
+- [x] LightGlue optional backend。
+- [x] LoFTR optional fallback。
+- [x] PP-OCRv5 adapter。
+- [x] 旧中文低置信度多次 crop 复识与候选保留。
+- [x] 外部 OCR/text segmentation sidecar。
+- [x] seeded-white bubble fallback。
+- [x] 外部 bubble instance/safe mask sidecar。
+- [x] bubble-level TextUnit 聚合。
+- [x] Hungarian cross-edition identity matching。
+- [x] one-to-many / many-to-one detection + Review gate。
+- [x] 像素 text mask 优先、polygon fallback。
+- [x] bubble border protection + adaptive dilation。
+- [x] solid / OpenCV / external LaMa inpainting。
+- [x] CJK 动态规划断行、标点禁则、最大字号搜索。
+- [x] horizontal / vertical / auto lettering。
+- [x] glyph safe-mask 验证。
+- [x] publication QA。
+- [x] PNG / JSON / debug overlays。
+- [x] OpenRaster layer export。
+- [x] ImageMagick layered PSD export。
+- [x] 本地 Review：文字 / 匹配 / mask 编辑。
+- [x] Review 回写并从高清母版重新生成。
+- [x] Linux/macOS GitHub Actions。
+
+## 已实现自验收
+
+- [x] 8 个 unit/integration tests。
+- [x] 内置端到端 `mhd-transfer selftest`。
+- [x] 20 组随机几何扰动 registration benchmark。
+- [x] 多长度中文 safe-area lettering benchmark。
+- [x] 离线 editable install 验证（no build isolation）。
+- [x] ORA/PSD 本机导出验证。
+
+## 真实出版验收仍需数据
+
+程序实现完成不等于“对未知漫画已经获得出版认证”。必须用真实成对漫画建立 100–300 页基准：
+
+- 页面配对准确率 ≥ 99.5%；
+- ordinary speech/narration identity match ≥ 99%；
+- 自动通过页面中可见日文残留为 0；
+- 自动通过页面中 bubble border/人物线稿误伤为 0；
+- glyph safe-area overflow 为 0；
+- 统计需要人工 Review 的页面率与每页平均修改次数。
+
+真实数据无法由仓库凭空生成，因此这部分是项目上线前唯一剩余的“数据验收”，不是代码 TODO。
