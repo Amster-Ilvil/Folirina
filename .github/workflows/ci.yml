@@ -19,12 +19,5 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e '.[dev]'
-      # PySide6/pytest-qt are deliberately isolated in gui-e2e.yml.
-      # test_white_container_cleanup.py is a pre-existing main-branch contract
-      # mismatch (it imports helpers not present in text_only_transfer.py); keep
-      # that baseline debt separate from this aligned-overlay GUI PR.
-      - run: >-
-          pytest
-          --ignore=tests/test_gui_aligned_overlay_e2e.py
-          --ignore=tests/test_white_container_cleanup.py
+      - run: pytest
       - run: mhd-transfer selftest

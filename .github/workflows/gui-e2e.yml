@@ -49,6 +49,15 @@ jobs:
           print('Qt=', qVersion())
           PY
 
+      - name: Run aligned-overlay safety regression gate
+        run: |
+          python -m pytest -q \
+            tests/test_aligned_overlay_reveal.py \
+            tests/test_aligned_overlay_color_guard.py \
+            tests/test_architecture_state.py \
+            tests/test_workspace_manual_effect_candidates.py
+          mhd-transfer selftest
+
       - name: Run real GUI click-path test
         run: |
           python -m pytest -vv -s tests/test_gui_aligned_overlay_e2e.py
