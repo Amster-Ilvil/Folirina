@@ -1,0 +1,63 @@
+name: PySide6 GUI E2E
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  gui-e2e:
+    name: GUI E2E (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      QT_QPA_PLATFORM: offscreen
+      GUI_E2E_ARTIFACT_DIR: ${{ github.workspace }}/gui-e2e-artifacts
+      PYTHONUNBUFFERED: '1'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install Linux Qt runtime libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libxkbcommon-x11-0 libxcb-cursor0
+
+      - name: Install project and GUI test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[gui,dev]' pytest-qt
+          python - <<'PY'
+          import platform
+          import PySide6
+          from PySide6.QtCore import qVersion
+          print('platform=', platform.platform())
+          print('machine=', platform.machine())
+          print('PySide6=', PySide6.__version__)
+          print('Qt=', qVersion())
+          PY
+
+      - name: Run real GUI click-path test
+        run: |
+          python -m pytest -vv -s tests/test_gui_aligned_overlay_e2e.py
+
+      - name: Upload GUI evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-e2e-${{ matrix.os }}
+          path: gui-e2e-artifacts/
+          if-no-files-found: warn
+          retention-days: 14
