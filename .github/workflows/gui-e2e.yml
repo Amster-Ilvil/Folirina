@@ -60,7 +60,32 @@ jobs:
 
       - name: Run real GUI click-path test
         run: |
-          python -m pytest -vv -s tests/test_gui_aligned_overlay_e2e.py
+          rm -rf gui-e2e-tmp
+          python -m pytest -vv -s \
+            --basetemp=${{ github.workspace }}/gui-e2e-tmp \
+            tests/test_gui_aligned_overlay_e2e.py
+
+      - name: Collect pipeline diagnostics
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p gui-e2e-artifacts/pipeline-diagnostics
+          if [ -d gui-e2e-tmp ]; then
+            find gui-e2e-tmp -type f \( \
+              -name 'project.json' -o \
+              -name 'aligned_overlay_reveal.json' -o \
+              -name 'aligned_overlay_reveal_mask.png' -o \
+              -name 'aligned_overlay_reveal_regions.png' -o \
+              -name 'aligned_overlay_reveal_layer.png' \
+            \) -print0 | while IFS= read -r -d '' file; do
+              rel="${file#gui-e2e-tmp/}"
+              dest="gui-e2e-artifacts/pipeline-diagnostics/$rel"
+              mkdir -p "$(dirname "$dest")"
+              cp "$file" "$dest"
+            done
+          fi
+          echo 'Collected GUI evidence:'
+          find gui-e2e-artifacts -type f -maxdepth 10 -print | sort || true
 
       - name: Upload GUI evidence
         if: always()
