@@ -15,6 +15,9 @@ facade owns the cross-rendition safety contract:
 * Core REJECT regions remain rejected.  In particular, ``empty_refined_mask`` is
   not automatically rescued; the real-page regression showed that such a rescue
   can reinterpret character artwork as text.
+* REJECT/colour-withheld candidates stay visible in diagnostics but are not
+  automatically prefilled into the manual-effect dialog.  Users can still draw a
+  region themselves when they know an artwork-like area is actually lettering.
 """
 
 import cv2
@@ -48,7 +51,7 @@ def _region_allows_colour_text_release(
     """Require evidence beyond cross-rendition pixel difference.
 
     White/near-white dialogue containers can release a small amount of colour
-    caused by antialiasing or palette bleed.  True open text on coloured artwork
+    caused by antialiasing or palette bleed. True open text on coloured artwork
     is also supported, but only when the changed-ink field is large/dense enough
     to look like lettering rather than a tiny face/detail component.
     """
@@ -61,15 +64,9 @@ def _region_allows_colour_text_release(
     if source_pixels < min_container_ink or target_pixels < min_container_ink:
         return False
 
-    # A region that is substantially paper-like has independent container
-    # evidence.  This covers ordinary white bubbles whose antialiased boundary
-    # may contain a few saturated pixels.
     if float(region.white_ratio) >= 0.35:
         return True
 
-    # Low-white open-text route: require materially more ink and a sufficiently
-    # large field.  This intentionally withholds tiny high-colour regions such as
-    # mouths/eyes until manual review can confirm them.
     x0, y0, x1, y1 = region.target_bbox
     bw = max(1, int(x1) - int(x0))
     bh = max(1, int(y1) - int(y0))
@@ -105,6 +102,43 @@ def _planned_ink_support(
         support = cv2.bitwise_or(support, region.source_ink_mask)
         released.append(region.id)
     return support, released, withheld
+
+
+def _sync_manual_candidate_actionability(
+    plan: AlignedOverlayPlan,
+    released_ids: list[str],
+    withheld_ids: list[str],
+) -> None:
+    """Do not auto-prefill candidates that look like character/artwork detail."""
+    items = plan.diagnostics.get("manual_effect_candidates", [])
+    if not isinstance(items, list):
+        return
+    regions = {r.id: r for r in plan.regions}
+    withheld = set(map(str, withheld_ids))
+    released = set(map(str, released_ids))
+    actionable: list[str] = []
+    safety_withheld: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        rid = str(item.get("id", ""))
+        region = regions.get(rid)
+        blocked_reason = ""
+        if region is not None and region.triage == "REJECT":
+            blocked_reason = "route_rejected"
+        elif rid in withheld:
+            blocked_reason = "colour_artwork_risk"
+        if blocked_reason:
+            item["auto_actionable"] = False
+            item["manual_prefill_safety_gate"] = blocked_reason
+            safety_withheld.append(rid)
+        else:
+            if rid in released:
+                item["manual_prefill_safety_gate"] = "evidence_gated_text"
+            if bool(item.get("auto_actionable", False)):
+                actionable.append(rid)
+    plan.diagnostics["manual_effect_auto_actionable_ids"] = actionable
+    plan.diagnostics["manual_effect_safety_withheld_ids"] = safety_withheld
 
 
 def _target_color_guard_masks(
@@ -174,6 +208,7 @@ def build_aligned_overlay_plan(
     plan = _core.build_aligned_overlay_plan(source, target, registration, cfg)
 
     protect, release, saturated, released_ids, withheld_ids = _target_color_guard_masks(target, cfg, plan)
+    _sync_manual_candidate_actionability(plan, released_ids, withheld_ids)
     _strip_protected_pixels(plan, protect)
     _refresh_plan_diagnostics(plan)
     plan.diagnostics.update({
@@ -197,10 +232,8 @@ def execute_aligned_overlay(
     target: np.ndarray,
     cfg: AlignedOverlayRevealConfig,
 ) -> AlignedOverlayResult:
-    # Recompute from the current plan in case review/manual tooling changed masks
-    # between build and execute.  Only evidence-gated ink-only regions can release
-    # the colour guard.
     protect, release, saturated, released_ids, withheld_ids = _target_color_guard_masks(target, cfg, plan)
+    _sync_manual_candidate_actionability(plan, released_ids, withheld_ids)
     _strip_protected_pixels(plan, protect)
     _refresh_plan_diagnostics(plan)
     result = _core.execute_aligned_overlay(plan, source, target, cfg)
@@ -248,6 +281,8 @@ def execute_aligned_overlay(
         ),
         "hard_color_contract": "target_background_authority_with_evidence_gated_text_release",
         "empty_refined_mask_auto_rescue": False,
+        "manual_effect_auto_actionable_ids": plan.diagnostics.get("manual_effect_auto_actionable_ids", []),
+        "manual_effect_safety_withheld_ids": plan.diagnostics.get("manual_effect_safety_withheld_ids", []),
         "page_triage": "REVIEW" if nearly_unchanged else result.plan.page_triage,
     })
     return result
