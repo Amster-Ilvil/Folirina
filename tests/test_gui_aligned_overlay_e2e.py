@@ -249,17 +249,16 @@ def test_real_uploaded_page_is_processed_by_clicking_the_gui(qtbot, monkeypatch,
 
     diagnostics = aligned.get("diagnostics", {})
     assert diagnostics.get("registration_gate_passed") is True, diagnostics
-    assert int(diagnostics.get("applied_count", 0)) >= 8, diagnostics
+    assert int(diagnostics.get("applied_count", 0)) >= 7, diagnostics
     assert diagnostics.get("nearly_unchanged") is False, diagnostics
+    assert diagnostics.get("empty_refined_mask_auto_rescue") is False, diagnostics
 
-    # Regression for the one region Run #18 lost after progressive border
-    # guarding. The local exclusive-ink rescue is deliberately REVIEW-only.
-    assert int(diagnostics.get("rescued_empty_region_count", 0)) >= 1, diagnostics
-    assert "aligned_009" in diagnostics.get("rescued_empty_regions", []), diagnostics
+    # Real-page audit proved this bbox is character head/arm artwork, not missing
+    # lettering. It must stay rejected rather than being auto-rescued.
     regions = {r.get("id"): r for r in aligned.get("regions", [])}
-    rescued = regions.get("aligned_009", {})
-    assert rescued.get("triage") == "REVIEW", rescued
-    assert rescued.get("reason") == "empty_mask_local_exclusive_rescue", rescued
+    false_art = regions.get("aligned_009", {})
+    assert false_art.get("triage") == "REJECT", false_art
+    assert false_art.get("reason") == "empty_refined_mask", false_art
 
     target = cv2.imread(str(target_dir / "006.jpg"), cv2.IMREAD_COLOR)
     final = cv2.imread(str(final_path), cv2.IMREAD_COLOR)
@@ -269,18 +268,28 @@ def test_real_uploaded_page_is_processed_by_clicking_the_gui(qtbot, monkeypatch,
     assert changed_pixels > 200, "real-page GUI result remained effectively all Japanese TARGET"
     assert changed_pixels == int(diagnostics.get("changed_pixels", -1))
 
-    # Refined colour contract: TARGET colour remains authoritative as background,
-    # while exact core-proven ink-only masks may change saturated pixels. This is
-    # required for open text/SFX drawn directly on coloured artwork.
+    # Refined colour contract: TARGET colour is authoritative by default. Only
+    # accepted ink-only regions with extra container/text evidence can release it.
     hsv = cv2.cvtColor(target, cv2.COLOR_BGR2HSV)
     coloured = hsv[..., 1] >= 20
     assert int(np.count_nonzero(coloured)) > 100
-    assert diagnostics.get("hard_color_contract") == "target_background_authority_except_proven_text_masks"
+    assert diagnostics.get("hard_color_contract") == "target_background_authority_with_evidence_gated_text_release"
     assert int(diagnostics.get("hard_color_background_changed_after", -1)) == 0, diagnostics
     assert int(diagnostics.get("hard_color_saturated_pixels", 0)) == int(np.count_nonzero(coloured)), diagnostics
-    assert int(diagnostics.get("hard_color_text_release_pixels", 0)) > 0, diagnostics
-    saturated_changed = int(diagnostics.get("hard_color_saturated_changed_pixels", 0))
-    released_changed = int(diagnostics.get("hard_color_released_changed_pixels", 0))
-    assert saturated_changed > 0, "real colour/open-text path was still globally colour-locked"
-    assert released_changed >= saturated_changed > 0, diagnostics
-    assert int(diagnostics.get("hard_color_restored_pixels", -1)) >= 0
+    assert int(diagnostics.get("hard_color_text_release_pixels", 0)) >= 0, diagnostics
+    assert int(diagnostics.get("hard_color_released_changed_pixels", 0)) >= int(diagnostics.get("hard_color_saturated_changed_pixels", 0)), diagnostics
+
+    release_ids = diagnostics.get("hard_color_release_region_ids", [])
+    withheld_ids = diagnostics.get("hard_color_withheld_region_ids", [])
+    # aligned_012 is a real dialogue balloon over a yellow panel and has enough
+    # text/container evidence. aligned_015 is the girl's mouth and must be held.
+    assert "aligned_012" in release_ids, diagnostics
+    assert "aligned_015" in withheld_ids, diagnostics
+
+    # Fixture-specific visual safety guards discovered by downloading Run #23:
+    # aligned_009 = man's head/arm; aligned_015 = girl's mouth. Both must remain
+    # byte-for-byte TARGET even if the surrounding page is translated.
+    for rid in ("aligned_009", "aligned_015"):
+        region = regions[rid]
+        x0, y0, x1, y1 = [int(v) for v in region["target_bbox"]]
+        assert np.array_equal(final[y0:y1, x0:x1], target[y0:y1, x0:x1]), rid
