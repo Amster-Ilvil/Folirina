@@ -1,0 +1,41 @@
+{
+  "schema": "manga_hd_transfer.v082_real_pair_retest.v1",
+  "version": "0.8.2",
+  "primary_fix": "photo-crisp-ink antialiased reconstruction; no direct blurred photo-pixel paste",
+  "runs": [
+    {
+      "page": "009",
+      "registration_method": "opencv-sift+similarity",
+      "registration_confidence": 0.8952885783223987,
+      "detected_photo_regions": 8,
+      "applied": 8,
+      "clarity_modes": [
+        "photo-crisp-ink"
+      ],
+      "qa": {
+        "errors": 0,
+        "warnings": 2,
+        "info": 8,
+        "pass": true
+      },
+      "notes": "Detected-region result only; OCR-less mode still warns about potentially missed open/SFX text."
+    },
+    {
+      "page": "007",
+      "registration_method": "opencv-sift+affine",
+      "registration_confidence": 0.8809081505498518,
+      "detected_photo_regions": 4,
+      "applied": 4,
+      "clarity_modes": [
+        "photo-crisp-ink"
+      ],
+      "qa": {
+        "errors": 0,
+        "warnings": 1,
+        "info": 4,
+        "pass": true
+      },
+      "notes": "Detected-region result only; OCR-less mode still warns about potentially missed open/SFX text."
+    }
+  ]
+}

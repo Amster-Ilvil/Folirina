@@ -1,0 +1,29 @@
+{
+  "schema": "manga_hd_transfer.photo_pair_edge_clip_retest.v1",
+  "version": "0.8.3",
+  "009": {
+    "registration_method": "opencv-sift+similarity",
+    "registration_confidence": 0.8952885783223987,
+    "detected_regions": 8,
+    "applied_regions": 7,
+    "rejected_regions": 1,
+    "rejected_reason": "source_text_region_clipped_at_page_edge",
+    "rejected_coverage": 0.8637014700339238,
+    "rejected_edge": "right",
+    "partial_ocr_fallback_blocked": true,
+    "manual_reletter_required": 1,
+    "edge_touch_complete_region_coverage": 0.9888782967905942,
+    "edge_touch_complete_region_applied": true
+  },
+  "007": {
+    "registration_method": "opencv-sift+affine",
+    "detected_regions": 4,
+    "applied_regions": 4,
+    "qa_errors": 0
+  },
+  "tests": {
+    "pytest": "34/34 passed",
+    "source_edge_pixel_transfer_guard": true,
+    "source_edge_ocr_reletter_guard": true
+  }
+}

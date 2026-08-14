@@ -1,0 +1,163 @@
+{
+  "version": "0.8.6",
+  "samples": {
+    "007": {
+      "registration_method": "opencv-sift+affine",
+      "registration_confidence": 0.8809081505498518,
+      "applied_count": 6,
+      "reletter_applied_count": 0,
+      "review_region_count": 6,
+      "required_review_count": 0,
+      "qa_summary": {
+        "errors": 0,
+        "warnings": 1,
+        "info": 6,
+        "pass": true
+      },
+      "records": [
+        {
+          "source_bubble_id": "photo-src-000",
+          "target_bubble_id": "photo-dst-000",
+          "reason": "applied",
+          "clarity_mode": "photo-crisp-ink",
+          "target_coverage": 0.9676788527350753,
+          "candidate": false,
+          "review_required": false
+        },
+        {
+          "source_bubble_id": "photo-src-001",
+          "target_bubble_id": "photo-dst-001",
+          "reason": "applied",
+          "clarity_mode": "photo-crisp-ink",
+          "target_coverage": 1.0,
+          "candidate": false,
+          "review_required": false
+        },
+        {
+          "source_bubble_id": "photo-src-002",
+          "target_bubble_id": "photo-dst-002",
+          "reason": "applied",
+          "clarity_mode": "photo-crisp-ink",
+          "target_coverage": 1.0,
+          "candidate": false,
+          "review_required": false
+        },
+        {
+          "source_bubble_id": "photo-src-003",
+          "target_bubble_id": "photo-dst-003",
+          "reason": "applied",
+          "clarity_mode": "photo-crisp-ink",
+          "target_coverage": 0.9975507347795661,
+          "candidate": false,
+          "review_required": false
+        },
+        {
+          "source_bubble_id": "diff-src-003",
+          "target_bubble_id": "diff-dst-003",
+          "reason": "applied_paired_target_driven",
+          "clarity_mode": "photo-crisp-ink",
+          "target_coverage": 1.0,
+          "candidate": false,
+          "review_required": false
+        },
+        {
+          "source_bubble_id": "diff-src-004",
+          "target_bubble_id": "diff-dst-004",
+          "reason": "applied_paired_target_driven",
+          "clarity_mode": "photo-crisp-ink",
+          "target_coverage": 1.0,
+          "candidate": false,
+          "review_required": false
+        }
+      ]
+    },
+    "009": {
+      "registration_method": "opencv-sift+similarity",
+      "registration_confidence": 0.8952885783223987,
+      "applied_count": 8,
+      "reletter_applied_count": 0,
+      "review_region_count": 8,
+      "required_review_count": 2,
+      "qa_summary": {
+        "errors": 2,
+        "warnings": 1,
+        "info": 6,
+        "pass": false
+      },
+      "records": [
+        {
+          "source_bubble_id": "photo-src-000",
+          "target_bubble_id": "photo-dst-000",
+          "reason": "applied",
+          "clarity_mode": "photo-crisp-ink",
+          "target_coverage": 0.9984205880986667,
+          "candidate": false,
+          "review_required": false
+        },
+        {
+          "source_bubble_id": "photo-src-001",
+          "target_bubble_id": "photo-dst-001",
+          "reason": "applied_low_confidence_candidate",
+          "clarity_mode": "photo-crisp-ink-candidate",
+          "target_coverage": 0.7911797964568413,
+          "candidate": true,
+          "review_required": true
+        },
+        {
+          "source_bubble_id": "photo-src-002",
+          "target_bubble_id": "photo-dst-002",
+          "reason": "applied",
+          "clarity_mode": "photo-crisp-ink",
+          "target_coverage": 1.0,
+          "candidate": false,
+          "review_required": false
+        },
+        {
+          "source_bubble_id": "photo-src-003",
+          "target_bubble_id": "photo-dst-003",
+          "reason": "applied",
+          "clarity_mode": "photo-crisp-ink",
+          "target_coverage": 1.0,
+          "candidate": false,
+          "review_required": false
+        },
+        {
+          "source_bubble_id": "photo-src-004",
+          "target_bubble_id": "photo-dst-004",
+          "reason": "applied",
+          "clarity_mode": "photo-crisp-ink",
+          "target_coverage": 0.9659975419909873,
+          "candidate": false,
+          "review_required": false
+        },
+        {
+          "source_bubble_id": "photo-src-005",
+          "target_bubble_id": "photo-dst-005",
+          "reason": "applied",
+          "clarity_mode": "photo-crisp-ink",
+          "target_coverage": 0.9323233986497612,
+          "candidate": false,
+          "review_required": false
+        },
+        {
+          "source_bubble_id": "photo-src-006",
+          "target_bubble_id": "photo-dst-006",
+          "reason": "applied",
+          "clarity_mode": "photo-crisp-ink",
+          "target_coverage": 1.0,
+          "candidate": false,
+          "review_required": false
+        },
+        {
+          "source_bubble_id": "photo-src-007",
+          "target_bubble_id": "photo-dst-007",
+          "reason": "applied_low_confidence_candidate",
+          "clarity_mode": "photo-crisp-ink-candidate",
+          "target_coverage": 0.9199237368922784,
+          "candidate": true,
+          "review_required": true
+        }
+      ]
+    }
+  }
+}

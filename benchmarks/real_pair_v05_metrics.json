@@ -1,0 +1,17 @@
+{
+  "date": "2026-08-11",
+  "registration_confidence": 0.9998110506552274,
+  "inlier_ratio": 0.9996335654085746,
+  "reprojection_error_px": 0.00010235906665911898,
+  "spatial_coverage": 0.7037777335272485,
+  "detected_regions": 5,
+  "applied_regions": 5,
+  "qa_errors": 0,
+  "qa_warnings": 0,
+  "inside_mask_exact": 1.0,
+  "outside_mask_target_exact": 1.0,
+  "paired_acceptance_changed_pixel_reconstruction": 1.0,
+  "whole_page_reference_mae": 0.0035695317201316357,
+  "whole_page_reference_psnr_db": 60.01697883329747,
+  "note": "User images are not bundled; metrics are retained for regression documentation only."
+}

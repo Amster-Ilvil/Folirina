@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+outputs/
+models/
+.DS_Store
+
+# Local/private runtime data and generated QA artifacts
+config_mac_*.json
+TEST_REPORT_*.md
+qa-*/
+results-*/
+SakuraTsushin_*/
+*.zip
+*.app/
+SHA256SUMS.txt

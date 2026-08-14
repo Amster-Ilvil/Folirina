@@ -1,0 +1,1026 @@
+{
+  "summary": {
+    "pages": 5,
+    "direct_candidates": 27,
+    "direct_applied": 21,
+    "reletter_required": 4,
+    "geometry_rejected": 2,
+    "median_registration_confidence": 0.8798421964276443,
+    "min_registration_confidence": 0.8672433510484346,
+    "max_photometric_noise_floor": 255.0,
+    "photo_pair_pages": 5,
+    "note": "OCR deliberately disabled in this benchmark to isolate deterministic photographed-mask transfer. Publication QA must remain failed because photo_pair requires OCR evidence for missed/open/tiny regions."
+  },
+  "pages": [
+    {
+      "page": "006.jpg",
+      "registration_method": "opencv-sift+affine",
+      "registration_confidence": 0.8798421964276443,
+      "registration_inlier_ratio": 0.8710382513661202,
+      "registration_reprojection_error": 0.5802003741264343,
+      "paired_method": "photo_pair",
+      "photometric_noise_floor": 253.0,
+      "direct_candidates": 2,
+      "direct_applied": 2,
+      "reletter_required": 0,
+      "geometry_rejected": 0,
+      "clarity_modes": {
+        "photo-normalized-pixels": 2
+      },
+      "qa": {
+        "errors": 1,
+        "warnings": 0,
+        "info": 0,
+        "pass": false
+      },
+      "qa_codes": [
+        "photo_pair_ocr_evidence_missing"
+      ],
+      "records": [
+        {
+          "source_bubble_id": "photo-src-000",
+          "target_bubble_id": "photo-dst-000",
+          "confidence": 0.9108085263637746,
+          "applied": true,
+          "reason": "applied",
+          "sr_backend": "off",
+          "sr_scale": 1.0,
+          "mask_iou": 0.992994274166386,
+          "target_coverage": 0.9976650536360868,
+          "spill_ratio": 0.004692616724621046,
+          "local_dx": 0.0,
+          "local_dy": 0.0,
+          "sharpness": 39029.53515625,
+          "target_sharpness": 26385.150390625,
+          "relative_sharpness": 1.4792235245366545,
+          "clarity_mode": "photo-normalized-pixels",
+          "geometry_mode": "photo_pair",
+          "ink_ratio": 0.0,
+          "source_bbox": [
+            1632,
+            1265,
+            2096,
+            1859
+          ],
+          "target_bbox": [
+            576,
+            415,
+            730,
+            611
+          ]
+        },
+        {
+          "source_bubble_id": "photo-src-001",
+          "target_bubble_id": "photo-dst-001",
+          "confidence": 0.9487684443387728,
+          "applied": true,
+          "reason": "applied",
+          "sr_backend": "off",
+          "sr_scale": 1.0,
+          "mask_iou": 0.9912347408445067,
+          "target_coverage": 0.9919493731725878,
+          "spill_ratio": 0.0007262750161394448,
+          "local_dx": 0.0,
+          "local_dy": 0.0,
+          "sharpness": 31130.494140625,
+          "target_sharpness": 27395.22265625,
+          "relative_sharpness": 1.1363475497623974,
+          "clarity_mode": "photo-normalized-pixels",
+          "geometry_mode": "photo_pair",
+          "ink_ratio": 0.0,
+          "source_bbox": [
+            279,
+            2503,
+            597,
+            3249
+          ],
+          "target_bbox": [
+            121,
+            824,
+            226,
+            1068
+          ]
+        }
+      ]
+    },
+    {
+      "page": "007.jpg",
+      "registration_method": "opencv-sift+affine",
+      "registration_confidence": 0.8710307827056377,
+      "registration_inlier_ratio": 0.8669117647058824,
+      "registration_reprojection_error": 0.7173953652381897,
+      "paired_method": "photo_pair",
+      "photometric_noise_floor": 255.0,
+      "direct_candidates": 4,
+      "direct_applied": 3,
+      "reletter_required": 1,
+      "geometry_rejected": 0,
+      "clarity_modes": {
+        "photo-normalized-pixels": 3,
+        "reletter-required": 1
+      },
+      "qa": {
+        "errors": 2,
+        "warnings": 0,
+        "info": 0,
+        "pass": false
+      },
+      "qa_codes": [
+        "mask_replace_rejected",
+        "photo_pair_ocr_evidence_missing"
+      ],
+      "records": [
+        {
+          "source_bubble_id": "photo-src-000",
+          "target_bubble_id": "photo-dst-000",
+          "confidence": 0.9239972310409997,
+          "applied": true,
+          "reason": "applied",
+          "sr_backend": "off",
+          "sr_scale": 1.0,
+          "mask_iou": 0.9580378250591016,
+          "target_coverage": 0.9686023140855017,
+          "spill_ratio": 0.01125651547077742,
+          "local_dx": -0.7369734644889832,
+          "local_dy": -0.7412503361701965,
+          "sharpness": 42867.9765625,
+          "target_sharpness": 55542.0859375,
+          "relative_sharpness": 0.7718107060425885,
+          "clarity_mode": "photo-normalized-pixels",
+          "geometry_mode": "photo_pair",
+          "ink_ratio": 0.0,
+          "source_bbox": [
+            1925,
+            240,
+            2351,
+            723
+          ],
+          "target_bbox": [
+            614,
+            66,
+            757,
+            225
+          ]
+        },
+        {
+          "source_bubble_id": "photo-src-001",
+          "target_bubble_id": "photo-dst-001",
+          "confidence": 0.9465873450521213,
+          "applied": true,
+          "reason": "applied",
+          "sr_backend": "off",
+          "sr_scale": 1.0,
+          "mask_iou": 0.967499124752013,
+          "target_coverage": 1.0,
+          "spill_ratio": 0.03250087524798693,
+          "local_dx": 0.0,
+          "local_dy": 0.0,
+          "sharpness": 48053.7421875,
+          "target_sharpness": 51914.2578125,
+          "relative_sharpness": 0.9256366981313088,
+          "clarity_mode": "photo-normalized-pixels",
+          "geometry_mode": "photo_pair",
+          "ink_ratio": 0.0,
+          "source_bbox": [
+            224,
+            316,
+            612,
+            796
+          ],
+          "target_bbox": [
+            45,
+            94,
+            173,
+            250
+          ]
+        },
+        {
+          "source_bubble_id": "photo-src-002",
+          "target_bubble_id": "photo-dst-002",
+          "confidence": 0.8717138716900867,
+          "applied": false,
+          "reason": "photo_pair_small_text_reletter_required",
+          "sr_backend": "off",
+          "sr_scale": 1.0,
+          "mask_iou": 0.0,
+          "target_coverage": 0.0,
+          "spill_ratio": 0.0,
+          "local_dx": 0.0,
+          "local_dy": 0.0,
+          "sharpness": 0.0,
+          "target_sharpness": 0.0,
+          "relative_sharpness": 0.0,
+          "clarity_mode": "reletter-required",
+          "geometry_mode": "photo_pair",
+          "ink_ratio": 0.0,
+          "source_bbox": [
+            1034,
+            1268,
+            1277,
+            1511
+          ],
+          "target_bbox": [
+            312,
+            411,
+            389,
+            489
+          ]
+        },
+        {
+          "source_bubble_id": "photo-src-003",
+          "target_bubble_id": "photo-dst-003",
+          "confidence": 0.8535294510114594,
+          "applied": true,
+          "reason": "applied",
+          "sr_backend": "off",
+          "sr_scale": 1.0,
+          "mask_iou": 0.802481319610884,
+          "target_coverage": 0.9958012596221134,
+          "spill_ratio": 0.19479417173574762,
+          "local_dx": 0.0,
+          "local_dy": 0.0,
+          "sharpness": 26341.83203125,
+          "target_sharpness": 28461.013671875,
+          "relative_sharpness": 0.9255408937623623,
+          "clarity_mode": "photo-normalized-pixels",
+          "geometry_mode": "photo_pair",
+          "ink_ratio": 0.0,
+          "source_bbox": [
+            1265,
+            2611,
+            1577,
+            3262
+          ],
+          "target_bbox": [
+            383,
+            910,
+            485,
+            1064
+          ]
+        }
+      ]
+    },
+    {
+      "page": "008.jpg",
+      "registration_method": "opencv-sift+affine",
+      "registration_confidence": 0.8672433510484346,
+      "registration_inlier_ratio": 0.8397626112759644,
+      "registration_reprojection_error": 0.5196242928504944,
+      "paired_method": "photo_pair",
+      "photometric_noise_floor": 151.0,
+      "direct_candidates": 4,
+      "direct_applied": 3,
+      "reletter_required": 0,
+      "geometry_rejected": 1,
+      "clarity_modes": {
+        "pixels": 1,
+        "photo-normalized-pixels": 3
+      },
+      "qa": {
+        "errors": 2,
+        "warnings": 0,
+        "info": 0,
+        "pass": false
+      },
+      "qa_codes": [
+        "mask_replace_rejected",
+        "photo_pair_ocr_evidence_missing"
+      ],
+      "records": [
+        {
+          "source_bubble_id": "photo-src-000",
+          "target_bubble_id": "photo-dst-000",
+          "confidence": 0.8933257897782417,
+          "applied": false,
+          "reason": "target_coverage_below_threshold",
+          "sr_backend": "off",
+          "sr_scale": 1.0,
+          "mask_iou": 0.8476333378802346,
+          "target_coverage": 0.8789001725552318,
+          "spill_ratio": 0.0402792364242911,
+          "local_dx": -6.552687168121338,
+          "local_dy": -0.4591725170612335,
+          "sharpness": 0.0,
+          "target_sharpness": 0.0,
+          "relative_sharpness": 0.0,
+          "clarity_mode": "pixels",
+          "geometry_mode": "photo_pair",
+          "ink_ratio": 0.0,
+          "source_bbox": [
+            173,
+            67,
+            710,
+            843
+          ],
+          "target_bbox": [
+            63,
+            23,
+            275,
+            267
+          ]
+        },
+        {
+          "source_bubble_id": "photo-src-001",
+          "target_bubble_id": "photo-dst-001",
+          "confidence": 0.9478637057597422,
+          "applied": true,
+          "reason": "applied",
+          "sr_backend": "off",
+          "sr_scale": 1.0,
+          "mask_iou": 0.991434320206956,
+          "target_coverage": 0.998783807262408,
+          "spill_ratio": 0.007367330493841372,
+          "local_dx": 0.0,
+          "local_dy": 0.0,
+          "sharpness": 47068.3984375,
+          "target_sharpness": 54427.74609375,
+          "relative_sharpness": 0.8647868378827636,
+          "clarity_mode": "photo-normalized-pixels",
+          "geometry_mode": "photo_pair",
+          "ink_ratio": 0.0,
+          "source_bbox": [
+            1796,
+            2166,
+            2227,
+            2580
+          ],
+          "target_bbox": [
+            646,
+            710,
+            788,
+            846
+          ]
+        },
+        {
+          "source_bubble_id": "photo-src-002",
+          "target_bubble_id": "photo-dst-002",
+          "confidence": 0.9466922840750741,
+          "applied": true,
+          "reason": "applied",
+          "sr_backend": "off",
+          "sr_scale": 1.0,
+          "mask_iou": 0.9655547034764826,
+          "target_coverage": 1.0,
+          "spill_ratio": 0.03444529652351738,
+          "local_dx": 0.0,
+          "local_dy": 0.0,
+          "sharpness": 50873.953125,
+          "target_sharpness": 53435.0,
+          "relative_sharpness": 0.952071734350145,
+          "clarity_mode": "photo-normalized-pixels",
+          "geometry_mode": "photo_pair",
+          "ink_ratio": 0.0,
+          "source_bbox": [
+            968,
+            2167,
+            1365,
+            2561
+          ],
+          "target_bbox": [
+            370,
+            711,
+            502,
+            840
+          ]
+        },
+        {
+          "source_bubble_id": "photo-src-003",
+          "target_bubble_id": "photo-dst-003",
+          "confidence": 0.9408533398149731,
+          "applied": true,
+          "reason": "applied",
+          "sr_backend": "off",
+          "sr_scale": 1.0,
+          "mask_iou": 0.9594932868087689,
+          "target_coverage": 0.9998814276115569,
+          "spill_ratio": 0.040397526836854686,
+          "local_dx": 0.0,
+          "local_dy": 0.0,
+          "sharpness": 49767.73828125,
+          "target_sharpness": 50060.8203125,
+          "relative_sharpness": 0.9941454808486864,
+          "clarity_mode": "photo-normalized-pixels",
+          "geometry_mode": "photo_pair",
+          "ink_ratio": 0.0,
+          "source_bbox": [
+            1659,
+            2733,
+            2227,
+            3336
+          ],
+          "target_bbox": [
+            603,
+            899,
+            789,
+            1094
+          ]
+        }
+      ]
+    },
+    {
+      "page": "009.jpg",
+      "registration_method": "opencv-sift+similarity",
+      "registration_confidence": 0.8900112777977863,
+      "registration_inlier_ratio": 0.8743016759776536,
+      "registration_reprojection_error": 0.9217514991760254,
+      "paired_method": "photo_pair",
+      "photometric_noise_floor": 98.0,
+      "direct_candidates": 7,
+      "direct_applied": 4,
+      "reletter_required": 2,
+      "geometry_rejected": 1,
+      "clarity_modes": {
+        "photo-normalized-pixels": 4,
+        "pixels": 1,
+        "reletter-required": 2
+      },
+      "qa": {
+        "errors": 4,
+        "warnings": 0,
+        "info": 0,
+        "pass": false
+      },
+      "qa_codes": [
+        "mask_replace_rejected",
+        "mask_replace_rejected",
+        "mask_replace_rejected",
+        "photo_pair_ocr_evidence_missing"
+      ],
+      "records": [
+        {
+          "source_bubble_id": "photo-src-000",
+          "target_bubble_id": "photo-dst-000",
+          "confidence": 0.9534207461155627,
+          "applied": true,
+          "reason": "applied",
+          "sr_backend": "off",
+          "sr_scale": 1.0,
+          "mask_iou": 0.971627675460428,
+          "target_coverage": 0.9974450689831375,
+          "spill_ratio": 0.02594810379241517,
+          "local_dx": 0.0,
+          "local_dy": 0.0,
+          "sharpness": 50716.99609375,
+          "target_sharpness": 44564.890625,
+          "relative_sharpness": 1.138048256878225,
+          "clarity_mode": "photo-normalized-pixels",
+          "geometry_mode": "photo_pair",
+          "ink_ratio": 0.0,
+          "source_bbox": [
+            1406,
+            161,
+            1858,
+            801
+          ],
+          "target_bbox": [
+            431,
+            62,
+            580,
+            272
+          ]
+        },
+        {
+          "source_bubble_id": "photo-src-001",
+          "target_bubble_id": "photo-dst-001",
+          "confidence": 0.801896979289871,
+          "applied": false,
+          "reason": "target_coverage_below_threshold",
+          "sr_backend": "off",
+          "sr_scale": 1.0,
+          "mask_iou": 0.8410129617142429,
+          "target_coverage": 0.8462118356577459,
+          "spill_ratio": 0.007252144689130627,
+          "local_dx": -0.6664491891860962,
+          "local_dy": -0.9942828416824341,
+          "sharpness": 0.0,
+          "target_sharpness": 0.0,
+          "relative_sharpness": 0.0,
+          "clarity_mode": "pixels",
+          "geometry_mode": "photo_pair",
+          "ink_ratio": 0.0,
+          "source_bbox": [
+            2101,
+            200,
+            2400,
+            622
+          ],
+          "target_bbox": [
+            663,
+            65,
+            777,
+            198
+          ]
+        },
+        {
+          "source_bubble_id": "photo-src-002",
+          "target_bubble_id": "photo-dst-002",
+          "confidence": 0.9210477697088003,
+          "applied": true,
+          "reason": "applied",
+          "sr_backend": "off",
+          "sr_scale": 1.0,
+          "mask_iou": 0.9653374794219864,
+          "target_coverage": 1.0,
+          "spill_ratio": 0.034662520578013535,
+          "local_dx": -0.18315982818603516,
+          "local_dy": 1.475385069847107,
+          "sharpness": 42824.390625,
+          "target_sharpness": 43330.09765625,
+          "relative_sharpness": 0.9883289662704682,
+          "clarity_mode": "photo-normalized-pixels",
+          "geometry_mode": "photo_pair",
+          "ink_ratio": 0.0,
+          "source_bbox": [
+            1055,
+            176,
+            1363,
+            571
+          ],
+          "target_bbox": [
+            316,
+            67,
+            417,
+            195
+          ]
+        },
+        {
+          "source_bubble_id": "photo-src-003",
+          "target_bubble_id": "photo-dst-003",
+          "confidence": 0.9473691647433783,
+          "applied": true,
+          "reason": "applied",
+          "sr_backend": "off",
+          "sr_scale": 1.0,
+          "mask_iou": 0.9773800872093024,
+          "target_coverage": 0.9775576958022897,
+          "spill_ratio": 0.00018585633305454884,
+          "local_dx": -0.34286919236183167,
+          "local_dy": -0.7593356370925903,
+          "sharpness": 55385.328125,
+          "target_sharpness": 47522.53125,
+          "relative_sharpness": 1.165454083950968,
+          "clarity_mode": "photo-normalized-pixels",
+          "geometry_mode": "photo_pair",
+          "ink_ratio": 0.0,
+          "source_bbox": [
+            343,
+            213,
+            686,
+            588
+          ],
+          "target_bbox": [
+            81,
+            76,
+            193,
+            197
+          ]
+        },
+        {
+          "source_bubble_id": "photo-src-004",
+          "target_bubble_id": "photo-dst-004",
+          "confidence": 0.8970384038658964,
+          "applied": false,
+          "reason": "photo_pair_small_text_reletter_required",
+          "sr_backend": "off",
+          "sr_scale": 1.0,
+          "mask_iou": 0.0,
+          "target_coverage": 0.0,
+          "spill_ratio": 0.0,
+          "local_dx": 0.0,
+          "local_dy": 0.0,
+          "sharpness": 0.0,
+          "target_sharpness": 0.0,
+          "relative_sharpness": 0.0,
+          "clarity_mode": "reletter-required",
+          "geometry_mode": "photo_pair",
+          "ink_ratio": 0.0,
+          "source_bbox": [
+            2123,
+            1476,
+            2357,
+            1776
+          ],
+          "target_bbox": [
+            663,
+            493,
+            743,
+            587
+          ]
+        },
+        {
+          "source_bubble_id": "photo-src-005",
+          "target_bubble_id": "photo-dst-005",
+          "confidence": 0.956150774534554,
+          "applied": true,
+          "reason": "applied",
+          "sr_backend": "off",
+          "sr_scale": 1.0,
+          "mask_iou": 0.9725332769913374,
+          "target_coverage": 1.0,
+          "spill_ratio": 0.027466723008662583,
+          "local_dx": 0.0,
+          "local_dy": 0.0,
+          "sharpness": 51506.890625,
+          "target_sharpness": 45783.68359375,
+          "relative_sharpness": 1.1250053858058569,
+          "clarity_mode": "photo-normalized-pixels",
+          "geometry_mode": "photo_pair",
+          "ink_ratio": 0.0,
+          "source_bbox": [
+            1622,
+            2479,
+            1897,
+            2870
+          ],
+          "target_bbox": [
+            490,
+            826,
+            580,
+            952
+          ]
+        },
+        {
+          "source_bubble_id": "photo-src-006",
+          "target_bubble_id": "photo-dst-006",
+          "confidence": 0.8283519375438589,
+          "applied": false,
+          "reason": "photo_pair_small_text_reletter_required",
+          "sr_backend": "off",
+          "sr_scale": 1.0,
+          "mask_iou": 0.0,
+          "target_coverage": 0.0,
+          "spill_ratio": 0.0,
+          "local_dx": 0.0,
+          "local_dy": 0.0,
+          "sharpness": 0.0,
+          "target_sharpness": 0.0,
+          "relative_sharpness": 0.0,
+          "clarity_mode": "reletter-required",
+          "geometry_mode": "photo_pair",
+          "ink_ratio": 0.0,
+          "source_bbox": [
+            2244,
+            2499,
+            2400,
+            2706
+          ],
+          "target_bbox": [
+            699,
+            839,
+            757,
+            907
+          ]
+        }
+      ]
+    },
+    {
+      "page": "010.jpg",
+      "registration_method": "opencv-sift+similarity",
+      "registration_confidence": 0.8904419971459433,
+      "registration_inlier_ratio": 0.8953405017921147,
+      "registration_reprojection_error": 1.1432095766067505,
+      "paired_method": "photo_pair",
+      "photometric_noise_floor": 124.0,
+      "direct_candidates": 10,
+      "direct_applied": 9,
+      "reletter_required": 1,
+      "geometry_rejected": 0,
+      "clarity_modes": {
+        "photo-normalized-pixels": 9,
+        "reletter-required": 1
+      },
+      "qa": {
+        "errors": 2,
+        "warnings": 0,
+        "info": 0,
+        "pass": false
+      },
+      "qa_codes": [
+        "mask_replace_rejected",
+        "photo_pair_ocr_evidence_missing"
+      ],
+      "records": [
+        {
+          "source_bubble_id": "photo-src-000",
+          "target_bubble_id": "photo-dst-000",
+          "confidence": 0.9119656890865816,
+          "applied": true,
+          "reason": "applied",
+          "sr_backend": "off",
+          "sr_scale": 1.0,
+          "mask_iou": 0.9286900879837569,
+          "target_coverage": 0.9666346461735511,
+          "spill_ratio": 0.04055428426137808,
+          "local_dx": 2.467095136642456,
+          "local_dy": -1.16860830783844,
+          "sharpness": 37141.48046875,
+          "target_sharpness": 38025.9765625,
+          "relative_sharpness": 0.9767396876107513,
+          "clarity_mode": "photo-normalized-pixels",
+          "geometry_mode": "photo_pair",
+          "ink_ratio": 0.0,
+          "source_bbox": [
+            117,
+            159,
+            484,
+            641
+          ],
+          "target_bbox": [
+            85,
+            66,
+            220,
+            219
+          ]
+        },
+        {
+          "source_bubble_id": "photo-src-001",
+          "target_bubble_id": "photo-dst-001",
+          "confidence": 0.882701455520835,
+          "applied": false,
+          "reason": "photo_pair_small_text_reletter_required",
+          "sr_backend": "off",
+          "sr_scale": 1.0,
+          "mask_iou": 0.0,
+          "target_coverage": 0.0,
+          "spill_ratio": 0.0,
+          "local_dx": 0.0,
+          "local_dy": 0.0,
+          "sharpness": 0.0,
+          "target_sharpness": 0.0,
+          "relative_sharpness": 0.0,
+          "clarity_mode": "reletter-required",
+          "geometry_mode": "photo_pair",
+          "ink_ratio": 0.0,
+          "source_bbox": [
+            1074,
+            151,
+            1331,
+            370
+          ],
+          "target_bbox": [
+            416,
+            68,
+            500,
+            136
+          ]
+        },
+        {
+          "source_bubble_id": "photo-src-002",
+          "target_bubble_id": "photo-dst-002",
+          "confidence": 0.9449906351127068,
+          "applied": true,
+          "reason": "applied",
+          "sr_backend": "off",
+          "sr_scale": 1.0,
+          "mask_iou": 0.9476516634050881,
+          "target_coverage": 0.9997419354838709,
+          "spill_ratio": 0.05211646684609738,
+          "local_dx": 0.5268514156341553,
+          "local_dy": 0.9246813654899597,
+          "sharpness": 42169.5390625,
+          "target_sharpness": 38979.0546875,
+          "relative_sharpness": 1.0818512506416207,
+          "clarity_mode": "photo-normalized-pixels",
+          "geometry_mode": "photo_pair",
+          "ink_ratio": 0.0,
+          "source_bbox": [
+            1794,
+            147,
+            2141,
+            449
+          ],
+          "target_bbox": [
+            656,
+            69,
+            766,
+            164
+          ]
+        },
+        {
+          "source_bubble_id": "photo-src-003",
+          "target_bubble_id": "photo-dst-003",
+          "confidence": 0.9169577520738131,
+          "applied": true,
+          "reason": "applied",
+          "sr_backend": "off",
+          "sr_scale": 1.0,
+          "mask_iou": 0.9564161849710983,
+          "target_coverage": 1.0,
+          "spill_ratio": 0.04358381502890173,
+          "local_dx": -1.173210620880127,
+          "local_dy": 1.9488123655319214,
+          "sharpness": 50875.46484375,
+          "target_sharpness": 39728.50390625,
+          "relative_sharpness": 1.280578422077112,
+          "clarity_mode": "photo-normalized-pixels",
+          "geometry_mode": "photo_pair",
+          "ink_ratio": 0.0,
+          "source_bbox": [
+            700,
+            243,
+            999,
+            608
+          ],
+          "target_bbox": [
+            293,
+            96,
+            390,
+            208
+          ]
+        },
+        {
+          "source_bubble_id": "photo-src-004",
+          "target_bubble_id": "photo-dst-004",
+          "confidence": 0.9461780747194223,
+          "applied": true,
+          "reason": "applied",
+          "sr_backend": "off",
+          "sr_scale": 1.0,
+          "mask_iou": 0.981638541575588,
+          "target_coverage": 0.9821537923191321,
+          "spill_ratio": 0.0005341404789459628,
+          "local_dx": 0.0,
+          "local_dy": 0.0,
+          "sharpness": 43811.53515625,
+          "target_sharpness": 37717.1796875,
+          "relative_sharpness": 1.1615803599114214,
+          "clarity_mode": "photo-normalized-pixels",
+          "geometry_mode": "photo_pair",
+          "ink_ratio": 0.0,
+          "source_bbox": [
+            1810,
+            1539,
+            2126,
+            1934
+          ],
+          "target_bbox": [
+            653,
+            523,
+            756,
+            652
+          ]
+        },
+        {
+          "source_bubble_id": "photo-src-005",
+          "target_bubble_id": "photo-dst-005",
+          "confidence": 0.9063306038327387,
+          "applied": true,
+          "reason": "applied",
+          "sr_backend": "off",
+          "sr_scale": 1.0,
+          "mask_iou": 0.9639904372945513,
+          "target_coverage": 1.0,
+          "spill_ratio": 0.03600956270544875,
+          "local_dx": -0.7168301939964294,
+          "local_dy": -0.4231843054294586,
+          "sharpness": 38863.08203125,
+          "target_sharpness": 35448.18359375,
+          "relative_sharpness": 1.0963349342983568,
+          "clarity_mode": "photo-normalized-pixels",
+          "geometry_mode": "photo_pair",
+          "ink_ratio": 0.0,
+          "source_bbox": [
+            549,
+            2150,
+            1012,
+            2656
+          ],
+          "target_bbox": [
+            234,
+            719,
+            384,
+            883
+          ]
+        },
+        {
+          "source_bubble_id": "photo-src-006",
+          "target_bubble_id": "photo-dst-006",
+          "confidence": 0.9534706697500114,
+          "applied": true,
+          "reason": "applied",
+          "sr_backend": "off",
+          "sr_scale": 1.0,
+          "mask_iou": 0.971360493365726,
+          "target_coverage": 1.0,
+          "spill_ratio": 0.02863950663427397,
+          "local_dx": 0.0,
+          "local_dy": 0.0,
+          "sharpness": 40140.40234375,
+          "target_sharpness": 34280.66015625,
+          "relative_sharpness": 1.1709343449277672,
+          "clarity_mode": "photo-normalized-pixels",
+          "geometry_mode": "photo_pair",
+          "ink_ratio": 0.0,
+          "source_bbox": [
+            1050,
+            2146,
+            1445,
+            2705
+          ],
+          "target_bbox": [
+            399,
+            720,
+            527,
+            900
+          ]
+        },
+        {
+          "source_bubble_id": "photo-src-007",
+          "target_bubble_id": "photo-dst-007",
+          "confidence": 0.9470170299777875,
+          "applied": true,
+          "reason": "applied",
+          "sr_backend": "off",
+          "sr_scale": 1.0,
+          "mask_iou": 0.9719557195571956,
+          "target_coverage": 1.0,
+          "spill_ratio": 0.028044280442804426,
+          "local_dx": 1.1585525274276733,
+          "local_dy": -1.2138254642486572,
+          "sharpness": 47257.79296875,
+          "target_sharpness": 38445.71875,
+          "relative_sharpness": 1.229208205887684,
+          "clarity_mode": "photo-normalized-pixels",
+          "geometry_mode": "photo_pair",
+          "ink_ratio": 0.0,
+          "source_bbox": [
+            1961,
+            2164,
+            2244,
+            2559
+          ],
+          "target_bbox": [
+            699,
+            730,
+            791,
+            858
+          ]
+        },
+        {
+          "source_bubble_id": "photo-src-008",
+          "target_bubble_id": "photo-dst-008",
+          "confidence": 0.9487319754160722,
+          "applied": true,
+          "reason": "applied",
+          "sr_backend": "off",
+          "sr_scale": 1.0,
+          "mask_iou": 0.964503709268476,
+          "target_coverage": 0.9999026479750779,
+          "spill_ratio": 0.03540570999248685,
+          "local_dx": 0.7671886682510376,
+          "local_dy": -1.1935302019119263,
+          "sharpness": 44592.9765625,
+          "target_sharpness": 41569.953125,
+          "relative_sharpness": 1.072721357861767,
+          "clarity_mode": "photo-normalized-pixels",
+          "geometry_mode": "photo_pair",
+          "ink_ratio": 0.0,
+          "source_bbox": [
+            1485,
+            2251,
+            1763,
+            2708
+          ],
+          "target_bbox": [
+            542,
+            755,
+            632,
+            904
+          ]
+        },
+        {
+          "source_bubble_id": "photo-src-009",
+          "target_bubble_id": "photo-dst-009",
+          "confidence": 0.8881595960807288,
+          "applied": true,
+          "reason": "applied",
+          "sr_backend": "off",
+          "sr_scale": 1.0,
+          "mask_iou": 0.9155772213605141,
+          "target_coverage": 0.9617503297385367,
+          "spill_ratio": 0.0498237007511881,
+          "local_dx": 1.733240008354187,
+          "local_dy": -1.0474709272384644,
+          "sharpness": 44673.91796875,
+          "target_sharpness": 37940.859375,
+          "relative_sharpness": 1.177461942208577,
+          "clarity_mode": "photo-normalized-pixels",
+          "geometry_mode": "photo_pair",
+          "ink_ratio": 0.0,
+          "source_bbox": [
+            178,
+            2270,
+            471,
+            2690
+          ],
+          "target_bbox": [
+            89,
+            757,
+            206,
+            894
+          ]
+        }
+      ]
+    }
+  ]
+}
