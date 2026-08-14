@@ -6,17 +6,16 @@ The pixel planner/executor lives in :mod:`aligned_overlay_reveal_core`.  This
 facade owns the cross-rendition safety contract:
 
 * TARGET remains the background/colour authority.
-* Proven SOURCE/TARGET lettering masks may edit pixels even when the underlying
-  TARGET background is coloured.  Otherwise open text/SFX on colour artwork
-  could never be transferred completely.
-* Saturated TARGET pixels outside those proven ink masks, plus a small halo,
-  remain byte-for-byte authoritative.
-* A narrowly scoped local rescue can recover a region that the core already
-  identified as text but rejected only because progressive structural guarding
-  reduced both refined masks to almost nothing.  Rescued regions stay REVIEW.
+* Saturated TARGET pixels, plus a small halo, are protected by default.
+* A saturated pixel is released only when it belongs to an already accepted
+  ink-only region with additional container/text evidence.  Merely being a
+  SOURCE/TARGET pixel difference is not proof of lettering: hair, mouths, hands
+  and clothing can differ strongly between B/W and colour editions too.
+* Full SOURCE raster never receives a colour release.
+* Core REJECT regions remain rejected.  In particular, ``empty_refined_mask`` is
+  not automatically rescued; the real-page regression showed that such a rescue
+  can reinterpret character artwork as text.
 """
-
-from typing import Any
 
 import cv2
 import numpy as np
@@ -42,41 +41,85 @@ def _dilate(mask: np.ndarray, radius: int) -> np.ndarray:
     return cv2.dilate(binary, kernel)
 
 
-def _planned_ink_support(plan: AlignedOverlayPlan) -> np.ndarray:
-    """Pixels that the core proved to be TARGET erase or SOURCE lettering.
+def _region_allows_colour_text_release(
+    region: AlignedOverlayRegion,
+    cfg: AlignedOverlayRevealConfig,
+) -> bool:
+    """Require evidence beyond cross-rendition pixel difference.
 
-    Full-raster masks are intentionally excluded.  Saturated colour is never
-    released merely because a white-container fallback wants to copy a raster.
+    White/near-white dialogue containers can release a small amount of colour
+    caused by antialiasing or palette bleed.  True open text on coloured artwork
+    is also supported, but only when the changed-ink field is large/dense enough
+    to look like lettering rather than a tiny face/detail component.
     """
+    if region.triage == "REJECT" or region.composite_mode != "ink_only":
+        return False
+
+    source_pixels = int(region.source_ink_pixels)
+    target_pixels = int(region.target_ink_pixels)
+    min_container_ink = max(20, int(cfg.min_region_ink_pixels) * 2)
+    if source_pixels < min_container_ink or target_pixels < min_container_ink:
+        return False
+
+    # A region that is substantially paper-like has independent container
+    # evidence.  This covers ordinary white bubbles whose antialiased boundary
+    # may contain a few saturated pixels.
+    if float(region.white_ratio) >= 0.35:
+        return True
+
+    # Low-white open-text route: require materially more ink and a sufficiently
+    # large field.  This intentionally withholds tiny high-colour regions such as
+    # mouths/eyes until manual review can confirm them.
+    x0, y0, x1, y1 = region.target_bbox
+    bw = max(1, int(x1) - int(x0))
+    bh = max(1, int(y1) - int(y0))
+    bbox_area = bw * bh
+    min_open_ink = max(80, int(cfg.min_region_ink_pixels) * 8)
+    if source_pixels < min_open_ink or target_pixels < min_open_ink:
+        return False
+    if bbox_area < 900:
+        return False
+    density = float(source_pixels / max(1, bbox_area))
+    if density < 0.018 or density > 0.32:
+        return False
+    if float(region.color_ratio) > min(0.30, float(cfg.reject_color_ratio)):
+        return False
+    return True
+
+
+def _planned_ink_support(
+    plan: AlignedOverlayPlan,
+    cfg: AlignedOverlayRevealConfig,
+) -> tuple[np.ndarray, list[str], list[str]]:
+    """Return colour-release support and auditable region-id decisions."""
     support = np.zeros_like(plan.erase_mask)
+    released: list[str] = []
+    withheld: list[str] = []
     for region in plan.regions:
         if region.triage == "REJECT" or region.composite_mode != "ink_only":
             continue
+        if not _region_allows_colour_text_release(region, cfg):
+            withheld.append(region.id)
+            continue
         support = cv2.bitwise_or(support, region.erase_mask)
         support = cv2.bitwise_or(support, region.source_ink_mask)
-    return support
+        released.append(region.id)
+    return support, released, withheld
 
 
 def _target_color_guard_masks(
     target: np.ndarray,
     cfg: AlignedOverlayRevealConfig,
     plan: AlignedOverlayPlan | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return ``(protect, text_release, saturated_base)``.
-
-    The old guard protected *every* saturated pixel.  That correctly prevented
-    artwork damage but also made legitimate Chinese lettering on coloured
-    backgrounds impossible: the new glyph necessarily replaces some coloured
-    background pixels.  The refined contract protects colour everywhere except
-    exact ink-only masks independently proved by the core planner.
-    """
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str], list[str]]:
+    """Return ``(protect, text_release, saturated_base, released_ids, withheld_ids)``."""
     shape = target.shape[:2]
     if not bool(getattr(cfg, "hard_color_protect_enabled", True)):
         z = np.zeros(shape, dtype=np.uint8)
-        return z.copy(), z.copy(), z.copy()
+        return z.copy(), z.copy(), z.copy(), [], []
     if target.ndim != 3 or target.shape[2] < 3:
         z = np.zeros(shape, dtype=np.uint8)
-        return z.copy(), z.copy(), z.copy()
+        return z.copy(), z.copy(), z.copy(), [], []
 
     hsv = cv2.cvtColor(target[:, :, :3], cv2.COLOR_BGR2HSV)
     threshold = max(0, min(255, int(getattr(cfg, "hard_color_protect_saturation", _HARD_COLOR_SATURATION))))
@@ -85,11 +128,13 @@ def _target_color_guard_masks(
     protect = _dilate(saturated, radius)
 
     release = np.zeros(shape, dtype=np.uint8)
+    released_ids: list[str] = []
+    withheld_ids: list[str] = []
     if plan is not None:
-        support = _planned_ink_support(plan)
+        support, released_ids, withheld_ids = _planned_ink_support(plan, cfg)
         release[(support > 0) & (protect > 0)] = 255
         protect[release > 0] = 0
-    return protect, release, saturated
+    return protect, release, saturated, released_ids, withheld_ids
 
 
 def _strip_protected_pixels(plan: AlignedOverlayPlan, protect: np.ndarray) -> None:
@@ -105,186 +150,6 @@ def _strip_protected_pixels(plan: AlignedOverlayPlan, protect: np.ndarray) -> No
         region.source_ink_pixels = int(cv2.countNonZero(region.source_ink_mask))
         region.target_ink_pixels = int(cv2.countNonZero(region.erase_mask))
         region.erase_area_ratio = float(region.target_ink_pixels / page_area)
-
-
-def _local_changed_components(
-    dark: np.ndarray,
-    exclusive_seed: np.ndarray,
-    bbox: tuple[int, int, int, int],
-    *,
-    min_area: int,
-) -> np.ndarray:
-    """Recover compact changed ink locally without re-admitting long artwork.
-
-    This helper is deliberately used only for an already-created core region with
-    reason ``empty_refined_mask``.  It therefore has much stronger localisation
-    evidence than a page-wide fallback.
-    """
-    h, w = dark.shape
-    x0, y0, x1, y1 = bbox
-    x0 = max(0, min(w, int(x0))); x1 = max(x0, min(w, int(x1)))
-    y0 = max(0, min(h, int(y0))); y1 = max(y0, min(h, int(y1)))
-    out = np.zeros_like(dark, dtype=np.uint8)
-    if x1 <= x0 or y1 <= y0:
-        return out
-
-    crop = (dark[y0:y1, x0:x1] > 0).astype(np.uint8)
-    seed = exclusive_seed[y0:y1, x0:x1] > 0
-    if not np.any(crop) or not np.any(seed):
-        return out
-
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(crop, 8)
-    ch, cw = crop.shape
-    kept = np.zeros_like(crop, dtype=np.uint8)
-    for label in range(1, n):
-        x, y, ww, hh, area = [int(v) for v in stats[label]]
-        if area < max(1, int(min_area)):
-            continue
-        comp = labels == label
-        if not np.any(comp & seed):
-            continue
-        fill = float(area / max(1, ww * hh))
-        span_x = float(ww / max(1, cw))
-        span_y = float(hh / max(1, ch))
-        touches = x <= 0 or y <= 0 or (x + ww) >= cw or (y + hh) >= ch
-        # Long sparse components are panel rules, hair, clothing or balloon
-        # boundaries even when a few changed pixels happen to touch them.
-        if max(span_x, span_y) > 0.92 and fill < 0.22:
-            continue
-        if touches and max(span_x, span_y) > 0.78 and fill < 0.18:
-            continue
-        if area / max(1, cw * ch) > 0.30 and fill < 0.30:
-            continue
-        kept[comp] = 255
-    out[y0:y1, x0:x1] = kept
-    return out
-
-
-def _exclusive_ink(
-    plan: AlignedOverlayPlan,
-    target: np.ndarray,
-    cfg: AlignedOverlayRevealConfig,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    aligned = plan.aligned_source
-    sg = cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY) if aligned.ndim == 3 else aligned.astype(np.uint8)
-    tg = cv2.cvtColor(target, cv2.COLOR_BGR2GRAY) if target.ndim == 3 else target.astype(np.uint8)
-    valid = plan.valid_mask > 0
-    src_dark = (sg <= int(cfg.source_ink_threshold)) & valid
-    tgt_dark = (tg <= int(cfg.target_ink_threshold)) & valid
-    tol = max(0, int(cfg.registration_tolerance_px))
-    src_near = _dilate(src_dark.astype(np.uint8) * 255, tol) > 0
-    tgt_near = _dilate(tgt_dark.astype(np.uint8) * 255, tol) > 0
-    delta = max(0, int(cfg.ink_difference_delta))
-    src_exclusive = src_dark & (~tgt_near | ((tg.astype(np.int16) - sg.astype(np.int16)) >= delta))
-    tgt_exclusive = tgt_dark & (~src_near | ((sg.astype(np.int16) - tg.astype(np.int16)) >= delta))
-    return sg, tg, src_dark, tgt_dark, src_exclusive, tgt_exclusive
-
-
-def _update_manual_candidate(plan: AlignedOverlayPlan, region: AlignedOverlayRegion) -> None:
-    items = plan.diagnostics.get("manual_effect_candidates", [])
-    if not isinstance(items, list):
-        return
-    for item in items:
-        if isinstance(item, dict) and item.get("id") == region.id:
-            item["reason"] = f"aligned_overlay:{region.reason}"
-            item["triage"] = region.triage
-
-
-def _rescue_empty_refined_regions(
-    plan: AlignedOverlayPlan,
-    target: np.ndarray,
-    cfg: AlignedOverlayRevealConfig,
-) -> None:
-    """Recover only core-identified regions rejected by over-aggressive guarding.
-
-    No new page-wide candidate is invented here.  A rescue requires both SOURCE
-    and TARGET local exclusive ink, stays inside the original region bbox and
-    registered SOURCE validity, obeys per-region/page erase caps, and remains
-    REVIEW so the GUI keeps it reversible/editable.
-    """
-    candidates = [r for r in plan.regions if r.triage == "REJECT" and r.reason == "empty_refined_mask"]
-    if not candidates:
-        plan.diagnostics.setdefault("rescued_empty_region_count", 0)
-        return
-
-    sg, _tg, src_dark, tgt_dark, src_exclusive, tgt_exclusive = _exclusive_ink(plan, target, cfg)
-    page_area = max(1, target.shape[0] * target.shape[1])
-    rescue_min = max(4, int(cfg.min_region_ink_pixels) // 2)
-    rescued: list[str] = []
-
-    for region in candidates:
-        src = _local_changed_components(
-            src_dark.astype(np.uint8) * 255,
-            src_exclusive.astype(np.uint8) * 255,
-            region.target_bbox,
-            min_area=max(1, int(cfg.min_component_area_px)),
-        )
-        tgt = _local_changed_components(
-            tgt_dark.astype(np.uint8) * 255,
-            tgt_exclusive.astype(np.uint8) * 255,
-            region.target_bbox,
-            min_area=max(1, int(cfg.min_component_area_px)),
-        )
-        if cv2.countNonZero(src) < rescue_min or cv2.countNonZero(tgt) < rescue_min:
-            continue
-
-        x0, y0, x1, y1 = region.target_bbox
-        bbox_mask = np.zeros_like(plan.erase_mask)
-        bbox_mask[max(0, y0):max(0, y1), max(0, x0):max(0, x1)] = 255
-        corridor = _dilate(cv2.bitwise_or(src, tgt), max(1, int(cfg.text_corridor_radius_px)))
-        corridor = cv2.bitwise_and(corridor, bbox_mask)
-        corridor = cv2.bitwise_and(corridor, plan.valid_mask)
-
-        erase = _dilate(tgt, int(cfg.erase_dilate_px))
-        erase = cv2.bitwise_and(erase, corridor)
-        source_write = cv2.bitwise_and(src, corridor)
-        if int(cfg.source_ink_antialias_px) > 0:
-            fringe = _dilate(source_write, int(cfg.source_ink_antialias_px))
-            source_write = np.where(
-                (fringe > 0) & (sg <= int(cfg.source_antialias_threshold)),
-                255,
-                source_write,
-            ).astype(np.uint8)
-            source_write = cv2.bitwise_and(source_write, corridor)
-
-        ep = int(cv2.countNonZero(erase))
-        sp = int(cv2.countNonZero(source_write))
-        if ep < rescue_min or sp < rescue_min:
-            continue
-        erase_ratio = float(ep / page_area)
-        if erase_ratio > float(cfg.max_single_region_area_ratio):
-            continue
-        candidate_page = cv2.bitwise_or(plan.erase_mask, erase)
-        if float(cv2.countNonZero(candidate_page) / page_area) > float(cfg.max_erase_area_ratio_per_page):
-            continue
-
-        region.erase_mask = erase
-        region.source_ink_mask = source_write
-        region.full_raster_mask[:] = 0
-        region.composite_mode = "ink_only"
-        region.triage = "REVIEW"
-        region.reason = "empty_mask_local_exclusive_rescue"
-        region.erase_area_ratio = erase_ratio
-        region.source_ink_pixels = sp
-        region.target_ink_pixels = ep
-        region.diagnostics.update({
-            "local_exclusive_rescue": True,
-            "rescue_min_ink_pixels": rescue_min,
-            "rescued_source_pixels": sp,
-            "rescued_target_pixels": ep,
-        })
-        plan.erase_mask = candidate_page
-        plan.source_ink_mask = cv2.bitwise_or(plan.source_ink_mask, source_write)
-        plan.full_raster_mask[erase > 0] = 0
-        _update_manual_candidate(plan, region)
-        rescued.append(region.id)
-
-    if rescued:
-        plan.accepted = True
-        if plan.reason == "no_accepted_regions":
-            plan.reason = "ok"
-    plan.diagnostics["rescued_empty_regions"] = rescued
-    plan.diagnostics["rescued_empty_region_count"] = len(rescued)
 
 
 def _refresh_plan_diagnostics(plan: AlignedOverlayPlan) -> None:
@@ -307,19 +172,21 @@ def build_aligned_overlay_plan(
     cfg: AlignedOverlayRevealConfig,
 ) -> AlignedOverlayPlan:
     plan = _core.build_aligned_overlay_plan(source, target, registration, cfg)
-    _rescue_empty_refined_regions(plan, target, cfg)
 
-    protect, release, saturated = _target_color_guard_masks(target, cfg, plan)
+    protect, release, saturated, released_ids, withheld_ids = _target_color_guard_masks(target, cfg, plan)
     _strip_protected_pixels(plan, protect)
     _refresh_plan_diagnostics(plan)
     plan.diagnostics.update({
         "hard_color_protected_pixels": int(cv2.countNonZero(protect)),
         "hard_color_saturated_pixels": int(cv2.countNonZero(saturated)),
         "hard_color_text_release_pixels": int(cv2.countNonZero(release)),
+        "hard_color_release_region_ids": released_ids,
+        "hard_color_withheld_region_ids": withheld_ids,
         "hard_color_protect_saturation": int(
             getattr(cfg, "hard_color_protect_saturation", _HARD_COLOR_SATURATION)
         ),
-        "hard_color_contract": "target_background_authority_except_proven_text_masks",
+        "hard_color_contract": "target_background_authority_with_evidence_gated_text_release",
+        "empty_refined_mask_auto_rescue": False,
     })
     return plan
 
@@ -331,8 +198,9 @@ def execute_aligned_overlay(
     cfg: AlignedOverlayRevealConfig,
 ) -> AlignedOverlayResult:
     # Recompute from the current plan in case review/manual tooling changed masks
-    # between build and execute.  Only ink-only masks get a colour release.
-    protect, release, saturated = _target_color_guard_masks(target, cfg, plan)
+    # between build and execute.  Only evidence-gated ink-only regions can release
+    # the colour guard.
+    protect, release, saturated, released_ids, withheld_ids = _target_color_guard_masks(target, cfg, plan)
     _strip_protected_pixels(plan, protect)
     _refresh_plan_diagnostics(plan)
     result = _core.execute_aligned_overlay(plan, source, target, cfg)
@@ -369,6 +237,8 @@ def execute_aligned_overlay(
         "hard_color_protected_pixels": int(cv2.countNonZero(protect)),
         "hard_color_saturated_pixels": int(cv2.countNonZero(saturated)),
         "hard_color_text_release_pixels": int(cv2.countNonZero(release)),
+        "hard_color_release_region_ids": released_ids,
+        "hard_color_withheld_region_ids": withheld_ids,
         "hard_color_restored_pixels": restored,
         "hard_color_background_changed_after": background_changed,
         "hard_color_saturated_changed_pixels": saturated_changed,
@@ -376,7 +246,8 @@ def execute_aligned_overlay(
         "hard_color_protect_saturation": int(
             getattr(cfg, "hard_color_protect_saturation", _HARD_COLOR_SATURATION)
         ),
-        "hard_color_contract": "target_background_authority_except_proven_text_masks",
+        "hard_color_contract": "target_background_authority_with_evidence_gated_text_release",
+        "empty_refined_mask_auto_rescue": False,
         "page_triage": "REVIEW" if nearly_unchanged else result.plan.page_triage,
     })
     return result
