@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "manga-hd-translation-transfer"
-version = "1.3.13"
+version = "1.3.14"
 description = "Transfer existing Chinese manga translations from low-resolution scans onto high-resolution Japanese source pages with registration, safe inpainting, lettering, and QA."
 readme = "README.md"
 requires-python = ">=3.11"
