@@ -34,6 +34,12 @@ foreach ($relative in @('.github', 'tests', '.gitignore')) {
     Remove-Item -LiteralPath (Join-Path $Stage $relative) -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+foreach ($required in @('LICENSE', 'THIRD_PARTY_NOTICES.md', 'REFERENCES.md', 'CITATION.cff')) {
+    if (-not (Test-Path -LiteralPath (Join-Path $Stage $required))) {
+        throw "Required license/attribution file missing from release stage: $required"
+    }
+}
+
 @"
 Manga HD Transfer Studio $Version - Windows x64
 ================================================
@@ -45,6 +51,12 @@ Manga HD Transfer Studio $Version - Windows x64
 4. Startup installs only the main GUI/runtime dependencies.
 5. OCR/ML dependencies and model weights are never bundled and remain on-demand
    through the application's existing confirmation flow.
+
+License and attribution:
+- Manga HD Transfer Studio original code/documentation: MIT (LICENSE).
+- Third-party software keeps its own license; see THIRD_PARTY_NOTICES.md.
+- Implementation/research references: REFERENCES.md.
+- Repository citation metadata: CITATION.cff.
 
 Privacy: this package is generated from git archive in a clean GitHub Actions
 checkout. It contains no developer cache, .env file, credentials, model cache,
