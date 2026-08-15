@@ -17,6 +17,13 @@ rm -f "$TAR"
 rm -rf "$STAGE/.github" "$STAGE/tests" "$STAGE/.gitignore"
 chmod +x "$STAGE/启动Linux.sh" "$STAGE/packaging/launcher_linux.sh" || true
 
+for required in LICENSE THIRD_PARTY_NOTICES.md REFERENCES.md CITATION.cff; do
+  test -f "$STAGE/$required" || {
+    echo "Required license/attribution file missing from release stage: $required" >&2
+    exit 1
+  }
+done
+
 cat > "$STAGE/RELEASE-README.txt" <<TXT
 Manga HD Transfer Studio ${VERSION} - Linux x86_64
 =================================================
@@ -27,6 +34,12 @@ Manga HD Transfer Studio ${VERSION} - Linux x86_64
    standalone Python runtime is downloaded to the user's data directory.
 4. Only main GUI/runtime dependencies are installed at startup.
 5. OCR/ML dependencies and model weights remain on-demand and user-confirmed.
+
+License and attribution:
+- Manga HD Transfer Studio original code/documentation: MIT (LICENSE).
+- Third-party software keeps its own license; see THIRD_PARTY_NOTICES.md.
+- Implementation/research references: REFERENCES.md.
+- Repository citation metadata: CITATION.cff.
 
 PySide6 may require common desktop/XCB libraries supplied by your distribution.
 The GitHub release workflow validates the package on Ubuntu x86_64.
