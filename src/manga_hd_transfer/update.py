@@ -1,13 +1,15 @@
-"""Small, dependency-free GitHub Release updater for the macOS app.
+"""Small, dependency-free GitHub Release updater.
 
-The updater intentionally performs metadata checks without importing the GUI or
-any optional ML package.  Release assets are expected to contain one
-``Manga HD Transfer Studio.app`` bundle in a zip archive.
+Release metadata checks are platform-aware so a multi-platform release never
+feeds a Windows/Linux archive to the macOS installer. Automatic replacement is
+currently limited to the macOS ``.app`` bundle; Windows/Linux users can still
+check the latest matching release asset and update from the release page.
 """
 from __future__ import annotations
 
 import json
 import os
+import platform
 import plistlib
 import shutil
 import subprocess
@@ -40,6 +42,34 @@ def _version_tuple(value: str) -> tuple[int, ...]:
     return tuple((out + [0, 0, 0])[:3])
 
 
+def _github_headers() -> dict[str, str]:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "Manga-HD-Transfer-Updater",
+    }
+    token = os.environ.get("MHD_GITHUB_TOKEN", "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _asset_matches_platform(name: str, system: str | None = None, machine: str | None = None) -> bool:
+    lower = name.lower()
+    system = (system or platform.system()).lower()
+    machine = (machine or platform.machine()).lower()
+    if system == "darwin":
+        return "macos_universal" in lower and lower.endswith(".zip")
+    if system == "windows":
+        if machine in {"amd64", "x86_64"}:
+            return "windows_x64" in lower and lower.endswith(".zip")
+        return False
+    if system == "linux":
+        if machine in {"amd64", "x86_64"}:
+            return "linux_x86_64" in lower and (lower.endswith(".tar.gz") or lower.endswith(".zip"))
+        return False
+    return False
+
+
 @dataclass(frozen=True)
 class UpdateInfo:
     version: str
@@ -54,10 +84,7 @@ class UpdateInfo:
 
 
 def _request_json(url: str, timeout: float = 8.0) -> Any:
-    request = urllib.request.Request(
-        url,
-        headers={"Accept": "application/vnd.github+json", "User-Agent": "Manga-HD-Transfer-Updater"},
-    )
+    request = urllib.request.Request(url, headers=_github_headers())
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.load(response)
 
@@ -71,16 +98,23 @@ def check_latest(repo: str | None = None, timeout: float = 8.0) -> UpdateInfo | 
     version = tag.lstrip("vV")
     assets = data.get("assets") or []
     asset = next(
-        (x for x in assets if str(x.get("name", "")).lower().endswith(".zip")), None
+        (x for x in assets if _asset_matches_platform(str(x.get("name", "")))),
+        None,
     )
     if not tag or not asset or not asset.get("browser_download_url"):
         return None
-    return UpdateInfo(version, tag, str(asset["browser_download_url"]), str(data.get("body") or ""), str(asset.get("name") or ""))
+    return UpdateInfo(
+        version,
+        tag,
+        str(asset["browser_download_url"]),
+        str(data.get("body") or ""),
+        str(asset.get("name") or ""),
+    )
 
 
 def _download(url: str, destination: Path, timeout: float = 60.0) -> None:
     """Download one release asset atomically with a hard size ceiling."""
-    request = urllib.request.Request(url, headers={"User-Agent": "Manga-HD-Transfer-Updater"})
+    request = urllib.request.Request(url, headers=_github_headers())
     destination.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".part", dir=str(destination.parent))
     os.close(fd)
@@ -154,12 +188,11 @@ def _validate_app(app: Path) -> None:
 
 
 def install_update(info: UpdateInfo, app_path: str | Path) -> Path:
-    """Download and transactionally replace an app bundle with rollback backup.
-
-    The incoming app is fully copied and validated *before* the current app is
-    moved aside. This avoids leaving a half-copied application at ``target`` if
-    disk space, permissions, antivirus or a forced quit interrupts installation.
-    """
+    """Download and transactionally replace a macOS app with rollback backup."""
+    if platform.system() != "Darwin":
+        raise RuntimeError("当前自动安装更新仅支持 macOS；请下载对应平台 Release 包手动更新")
+    if not _asset_matches_platform(info.asset_name, "Darwin", platform.machine()):
+        raise RuntimeError(f"更新资产与当前 macOS 平台不匹配：{info.asset_name}")
     target = Path(app_path).expanduser().resolve()
     if target.suffix != ".app" or not target.exists():
         raise RuntimeError(f"找不到当前应用：{target}")
@@ -217,7 +250,12 @@ def main() -> int:
     if info is None:
         print(json.dumps({"available": False, "current": __version__}, ensure_ascii=False))
         return 0
-    payload = {"available": info.available, "current": __version__, "version": info.version, "asset": info.asset_name}
+    payload = {
+        "available": info.available,
+        "current": __version__,
+        "version": info.version,
+        "asset": info.asset_name,
+    }
     if args.command == "check" or not info.available:
         print(json.dumps(payload, ensure_ascii=False))
         return 0
