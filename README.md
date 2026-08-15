@@ -114,15 +114,17 @@ GUI 是当前完整人工补漏、页面管理和结果复核功能的主要入�
 
 `pyproject.toml` 将大体积/专用组件拆成可选依赖：
 
-- `gui`：PySide6 GUI。
-- `ocr`：PaddleOCR / PaddlePaddle。
-- `lightglue`：Torch + Kornia + LightGlue。
-- `bubbles`：Ultralytics 检测组件。
-- `rtdetr`：Torch + Transformers RT-DETR。
-- `accel`：Torch / Kornia / Spandrel / Ultralytics 加速组件。
-- `dev`：pytest / coverage。
+- `gui`：PySide6 GUI。Qt for Python Community Edition 使用 LGPLv3/GPLv3 许可体系，也提供 Qt 商业许可；主项目 MIT 不会覆盖 Qt/PySide6 的许可义务。
+- `ocr`：PaddleOCR / PaddlePaddle（Apache-2.0）。
+- `lightglue`：Torch + Kornia + LightGlue；LightGlue 代码和其自身预训练权重为 Apache-2.0，但具体特征提取器/权重仍应核对各自许可。
+- `bubbles`：Ultralytics 检测组件。Ultralytics 当前提供 AGPL-3.0 与 Enterprise 两种许可路径，启用或再分发时必须遵守适用许可。
+- `rtdetr`：Torch + Transformers RT-DETR；模型权重的许可可能与 Transformers 软件许可不同。
+- `accel`：Torch / Kornia / Spandrel / Ultralytics 加速组件；其中 Ultralytics 仍受其 AGPL/Enterprise 许可约束。
+- `dev`：pytest / coverage 开发测试依赖。
 
-Release 首次启动只安装 `.[gui]`，不会一次性安装这些可选 ML 栈。
+Release 首次启动只安装 `.[gui]`，不会一次性安装这些可选 ML 栈，也不会把第三方模型权重打进仓库 Release。
+
+完整第三方许可证、上游链接和分发边界见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
 
 ## 推荐工作流
 
@@ -169,21 +171,34 @@ Release 首次启动只安装 `.[gui]`，不会一次性安装这些可选 ML �
 
 任何一项命中都会让 CI 和 Release 失败。
 
-### 3. Release 只从 tracked files 构建
+### 3. License / attribution 审计
+
+`scripts/license_audit.py` 会检查：
+
+- `LICENSE` 仍为标准 MIT 文本；
+- `pyproject.toml` 使用明确的 PEP 639 `MIT` 元数据并包含 `LICENSE`；
+- `VERSION`、包版本和 `CITATION.cff` 版本一致；
+- 第三方许可清单没有遗漏关键直接/可选依赖；
+- PySide6/Qt 与 Ultralytics 等许可证敏感依赖仍被显式标注；
+- LightGlue、LoFTR、RT-DETR、PaddleOCR 学术引用仍保留。
+
+这样许可证/引用文件不会只靠人工记忆维护。
+
+### 4. Release 只从 tracked files 构建
 
 Windows/macOS/Linux 的打包脚本都以 `git archive HEAD` 为输入。即使开发机器目录中存在未跟踪的图片、配置、模型、日志或私有文件，它们也不会进入发布包。
 
 GitHub Actions 还会从干净 checkout 构建，因此 Release 不依赖开发者本机工作目录。
 
-### 4. 最小发布权限
+### 5. 最小发布权限
 
 普通 CI 只有 `contents: read`。只有合并到 `main` 后执行的 `publish` job 临时获得 `contents: write`，用于创建/更新 GitHub Release。
 
 ## GitHub Actions
 
-- `Privacy audit`：每个 PR/push 执行隐私扫描和 Python 语法编译。
+- `Privacy audit`：每个 PR/push 执行隐私扫描、许可证/引用一致性审计和 Python 语法编译。
 - `Build and publish Manga HD Transfer releases`：
-  - 检查 `VERSION`、`pyproject.toml`、运行时版本一致；
+  - 检查 `VERSION`、`pyproject.toml`、运行时版本、许可证和引用元数据一致；
   - Windows x64 安装基础依赖并导入验证；
   - macOS Apple Silicon 安装基础依赖并导入验证；
   - macOS Intel 安装基础依赖并导入验证；
@@ -207,14 +222,22 @@ GitHub Actions 还会从干净 checkout 构建，因此 Release 不依赖开发�
 - `VERSION`
 - `pyproject.toml`
 - `src/manga_hd_transfer/version.py`
+- `CITATION.cff`
 
-Release CI 会强制检查三者完全一致。
+Release CI 会强制检查这些版本元数据一致。
 
 当前首个多平台发布版本：**v1.3.14**。
 
-## 许可证
+## 许可证、第三方声明与引用
 
-MIT License。详见 `LICENSE`。
+- **本项目原创代码/文档**：MIT License，详见 [`LICENSE`](LICENSE)。
+- **第三方软件与许可清单**：详见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。MIT 不会覆盖或替代第三方许可证。
+- **实现来源、设计致谢与学术引用**：详见 [`REFERENCES.md`](REFERENCES.md)。
+- **引用本项目**：仓库提供 [`CITATION.cff`](CITATION.cff)，GitHub 可据此生成引用信息。
+
+已明确标注的实现/设计来源包括 Novel Formatter（Apple OCR 与跨平台/隐私发布架构）和 KCC-Kindle-CHS（UI 配色灵感）；开发研究参考与论文引用则单独列在 `REFERENCES.md`，避免把“概念参考”“代码依赖”“代码改写”混为一谈。
+
+模型权重、字体、扫描图、译文、第三方数据和系统框架均不因本项目采用 MIT 而获得新的授权。使用或再分发前应分别检查它们自己的许可证/授权条件。
 
 ## 使用范围
 
