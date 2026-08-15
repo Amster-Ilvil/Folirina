@@ -82,6 +82,19 @@ The package ranges in `pyproject.toml` can resolve to different versions over ti
 | Ultralytics | optional detection/acceleration paths | **AGPL-3.0 or Ultralytics Enterprise License** | Not relicensed by MIT. Users/distributors enabling this dependency must satisfy the applicable Ultralytics license for their use/distribution |
 | Spandrel | optional model loading/upscale support | MIT | Installed only for relevant optional paths |
 
+### Build/development tooling
+
+These tools are used to build or test this repository rather than forming part of the application's own MIT-licensed source:
+
+| Component | Role | Upstream license |
+| --- | --- | --- |
+| setuptools (>=77) | PEP 517/PEP 639 build backend | MIT |
+| wheel | Python wheel build tooling | MIT |
+| pytest | development test runner | MIT |
+| pytest-cov | development coverage plugin | MIT |
+
+The GitHub Actions workflows also use GitHub-maintained Actions such as checkout/setup-python/upload-artifact/download-artifact. Those workflow actions remain under the licenses published in their respective repositories and are CI infrastructure rather than redistributed application code.
+
 ### Important model-weight rule
 
 A library's software license and a model checkpoint's license are not necessarily the same. Model files obtained from Hugging Face, Paddle, Ultralytics, Torch Hub, GitHub Releases, or other model hosts must be checked against their own model card, repository, or distribution terms before redistribution. Manga HD Transfer's repository license does not grant rights to third-party model weights.
@@ -133,4 +146,8 @@ Third-party project names and trademarks are used only for factual attribution/c
 - Transformers: https://github.com/huggingface/transformers
 - Ultralytics: https://github.com/ultralytics/ultralytics
 - Spandrel: https://github.com/chaiNNer-org/spandrel
+- setuptools: https://github.com/pypa/setuptools
+- wheel: https://github.com/pypa/wheel
+- pytest: https://github.com/pytest-dev/pytest
+- pytest-cov: https://github.com/pytest-dev/pytest-cov
 - python-build-standalone: https://github.com/astral-sh/python-build-standalone
