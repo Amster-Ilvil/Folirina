@@ -22,6 +22,15 @@ def read(name: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def _package_name(spec: str) -> str:
+    raw = str(spec).strip()
+    if " @ " in raw:
+        raw = raw.split(" @ ", 1)[0]
+    raw = raw.split(";", 1)[0]
+    raw = re.split(r"[<>=!~\[\s]", raw, maxsplit=1)[0]
+    return raw.strip().lower().replace("_", "-")
+
+
 def main() -> int:
     license_text = read("LICENSE")
     notices = read("THIRD_PARTY_NOTICES.md")
@@ -35,13 +44,26 @@ def main() -> int:
         fail("project MIT copyright notice is missing")
 
     with (ROOT / "pyproject.toml").open("rb") as fh:
-        project = tomllib.load(fh).get("project", {})
+        metadata = tomllib.load(fh)
+    project = metadata.get("project", {})
+    build_system = metadata.get("build-system", {})
+
+    build_requires = [str(x) for x in build_system.get("requires", [])]
+    setuptools_ok = False
+    for req in build_requires:
+        match = re.match(r"^setuptools\s*>=\s*(\d+)", req, flags=re.I)
+        if match and int(match.group(1)) >= 77:
+            setuptools_ok = True
+            break
+    if not setuptools_ok:
+        fail("PEP 639 metadata requires build-system setuptools>=77")
 
     if project.get("license") != "MIT":
         fail("pyproject.toml must use PEP 639 license = \"MIT\"")
     license_files = project.get("license-files") or []
-    if "LICENSE" not in license_files:
-        fail("pyproject.toml must declare LICENSE in license-files")
+    for required in ("LICENSE", "THIRD_PARTY_NOTICES.md"):
+        if required not in license_files:
+            fail(f"pyproject.toml license-files must include {required}")
     if str(project.get("version", "")).strip() != version:
         fail("VERSION and pyproject.toml version differ")
 
@@ -71,14 +93,40 @@ def main() -> int:
         "Transformers": "RT-DETR dependency",
         "Ultralytics": "optional AGPL-sensitive dependency",
         "Spandrel": "optional dependency",
+        "setuptools": "build dependency",
+        "wheel": "build dependency",
+        "pytest": "development dependency",
+        "pytest-cov": "development dependency",
         "python-build-standalone": "downloaded Python runtime",
     }
     for token, purpose in required_notice_tokens.items():
         if token.lower() not in notices.lower():
             fail(f"THIRD_PARTY_NOTICES.md missing {purpose}: {token}")
 
-    # Keep the two licensing-sensitive dependencies explicit. A generic third-
-    # party disclaimer is not enough for these integration choices.
+    # Ensure every package declared in the runtime/optional dependency groups is
+    # represented by a human-readable notice. Aliases account for PyPI names.
+    notice_aliases = {
+        "opencv-python-headless": "opencv",
+        "pyside6": "pyside6",
+        "paddleocr": "paddleocr",
+        "paddlepaddle": "paddlepaddle",
+        "torch": "pytorch",
+        "transformers": "transformers",
+        "pytest-cov": "pytest-cov",
+    }
+    declared = list(project.get("dependencies", []))
+    for group in (project.get("optional-dependencies", {}) or {}).values():
+        declared.extend(group or [])
+    for spec in declared:
+        package = _package_name(spec)
+        if not package:
+            continue
+        token = notice_aliases.get(package, package)
+        if token.lower() not in notices.lower():
+            fail(f"THIRD_PARTY_NOTICES.md does not mention declared dependency: {package}")
+
+    # Keep licensing-sensitive dependencies explicit. A generic third-party
+    # disclaimer is not enough for these integration choices.
     if "AGPL-3.0" not in notices or "Ultralytics Enterprise License" not in notices:
         fail("Ultralytics AGPL/commercial licensing must be called out explicitly")
     if "LGPLv3/GPLv3" not in notices or "Qt commercial" not in notices:
@@ -92,7 +140,7 @@ def main() -> int:
     if "```bibtex" not in references:
         fail("REFERENCES.md must retain BibTeX citations")
 
-    print("License audit passed: MIT metadata, third-party notices, citations, and sensitive-license callouts are consistent.")
+    print("License audit passed: MIT metadata, PEP 639 files, dependency notices, citations, and sensitive-license callouts are consistent.")
     return 0
 
 
