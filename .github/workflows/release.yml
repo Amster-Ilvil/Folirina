@@ -1,0 +1,309 @@
+name: Build and publish Manga HD Transfer releases
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tools/**"
+      - "packaging/**"
+      - "scripts/**"
+      - "bootstrap.py"
+      - "run_gui.py"
+      - "pyproject.toml"
+      - "VERSION"
+      - ".gitignore"
+      - ".github/workflows/release.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tools/**"
+      - "packaging/**"
+      - "scripts/**"
+      - "bootstrap.py"
+      - "run_gui.py"
+      - "pyproject.toml"
+      - "VERSION"
+      - ".gitignore"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: manga-hd-transfer-release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  metadata:
+    name: Privacy audit and version consistency
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Privacy audit
+        run: python scripts/privacy_audit.py
+      - name: Compile Python sources
+        run: python -m compileall -q bootstrap.py run_gui.py src scripts
+      - id: meta
+        name: Resolve and verify version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          test -n "$VERSION"
+          python - "$VERSION" <<'PY'
+          import pathlib, re, sys, tomllib
+          version = sys.argv[1]
+          pyproject = tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8'))
+          project_version = str(pyproject['project']['version'])
+          version_py = pathlib.Path('src/manga_hd_transfer/version.py').read_text(encoding='utf-8')
+          match = re.search(r'__version__\s*=\s*["\']([^"\']+)', version_py)
+          runtime_version = match.group(1) if match else ''
+          if len({version, project_version, runtime_version}) != 1:
+              raise SystemExit(f'version mismatch: VERSION={version}, pyproject={project_version}, runtime={runtime_version}')
+          print(f'version consistency: {version}')
+          PY
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+  windows:
+    name: Windows x64
+    needs: metadata
+    runs-on: windows-latest
+    timeout-minutes: 35
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          architecture: x64
+      - name: Privacy audit
+        run: python scripts/privacy_audit.py
+      - name: Install and smoke-test core GUI dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check -e ".[gui]"
+          python -c "import cv2, numpy, scipy, PySide6, manga_hd_transfer; print(manga_hd_transfer.__version__)"
+      - name: Build Windows release archive
+        shell: pwsh
+        run: ./packaging/build_windows_release.ps1 -Version $env:VERSION
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MangaHDTransfer-Windows-x64
+          path: dist/MangaHDTransfer_${{ env.VERSION }}_Windows_x64.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  macos:
+    name: macOS ${{ matrix.label }}
+    needs: metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            label: AppleSilicon
+            arch: arm64
+            package: true
+          - os: macos-15-intel
+            label: Intel
+            arch: x86_64
+            package: false
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+      EXPECTED_ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Confirm runner architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "macOS: $(sw_vers -productVersion)"
+          echo "Architecture: $(uname -m)"
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+      - name: Privacy audit
+        run: python scripts/privacy_audit.py
+      - name: Install and smoke-test core GUI dependencies
+        shell: bash
+        run: |
+          python -m pip install --disable-pip-version-check -e '.[gui]'
+          python -c 'import cv2, numpy, scipy, PySide6, manga_hd_transfer; print(manga_hd_transfer.__version__)'
+      - name: Validate Apple Live Text helper source
+        shell: bash
+        run: |
+          test -f tools/apple_live_text_helper/AppleLiveTextOCRHelper.swift
+          bash -n packaging/build_macos_release.sh
+          zsh -n packaging/launcher_macos.zsh
+      - name: Build universal macOS app shell, ZIP and DMG
+        if: matrix.package
+        shell: bash
+        run: bash packaging/build_macos_release.sh
+      - uses: actions/upload-artifact@v4
+        if: matrix.package
+        with:
+          name: MangaHDTransfer-macOS-universal
+          path: |
+            dist/MangaHDTransfer_${{ env.VERSION }}_macOS_universal.zip
+            dist/MangaHDTransfer_${{ env.VERSION }}_macOS_universal.dmg
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  linux:
+    name: Linux x86_64
+    needs: metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Privacy audit
+        run: python scripts/privacy_audit.py
+      - name: Install and smoke-test core GUI dependencies
+        shell: bash
+        run: |
+          python -m pip install --disable-pip-version-check -e '.[gui]'
+          python -c 'import cv2, numpy, scipy, PySide6, manga_hd_transfer; print(manga_hd_transfer.__version__)'
+      - name: Validate shell launchers
+        shell: bash
+        run: |
+          bash -n packaging/launcher_linux.sh
+          bash -n packaging/build_linux_release.sh
+          bash -n ./启动Linux.sh
+      - name: Build Linux release archive
+        shell: bash
+        run: bash packaging/build_linux_release.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MangaHDTransfer-Linux-x86_64
+          path: dist/MangaHDTransfer_${{ env.VERSION }}_Linux_x86_64.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  publish:
+    name: Publish GitHub Release
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    needs: [metadata, windows, macos, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+      RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: downloaded
+      - name: Assemble release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          cp "downloaded/MangaHDTransfer-Windows-x64/MangaHDTransfer_${VERSION}_Windows_x64.zip" release-assets/
+          cp "downloaded/MangaHDTransfer-macOS-universal/MangaHDTransfer_${VERSION}_macOS_universal.zip" release-assets/
+          cp "downloaded/MangaHDTransfer-macOS-universal/MangaHDTransfer_${VERSION}_macOS_universal.dmg" release-assets/
+          cp "downloaded/MangaHDTransfer-Linux-x86_64/MangaHDTransfer_${VERSION}_Linux_x86_64.tar.gz" release-assets/
+
+          cat > release-assets/BUILD-INFO.txt <<EOF
+          Manga HD Transfer Studio ${VERSION}
+          Repository: ${GITHUB_REPOSITORY}
+          Commit: ${GITHUB_SHA}
+          Workflow run: ${GITHUB_RUN_ID}
+          Build source: clean GitHub Actions checkout; release payloads use git archive tracked files only
+          Privacy audit: PASS
+          Windows x64 dependency smoke test: PASS
+          macOS Apple Silicon dependency smoke test: PASS
+          macOS Intel dependency smoke test: PASS
+          Linux x86_64 dependency smoke test: PASS
+          macOS ad-hoc codesign and DMG verification: PASS
+          OCR/ML model weights bundled: no
+          OCR/ML optional runtimes bundled: no
+          Local virtual environments/caches bundled: no
+          .env/API keys/logs/databases/user manga/generated workspaces bundled: no
+          EOF
+
+          cd release-assets
+          sha256sum \
+            "MangaHDTransfer_${VERSION}_Windows_x64.zip" \
+            "MangaHDTransfer_${VERSION}_macOS_universal.zip" \
+            "MangaHDTransfer_${VERSION}_macOS_universal.dmg" \
+            "MangaHDTransfer_${VERSION}_Linux_x86_64.tar.gz" \
+            > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create or update release
+        shell: bash
+        run: |
+          set -euo pipefail
+          NOTES="$(mktemp)"
+          cat > "$NOTES" <<EOF
+          ## Manga HD Transfer Studio ${VERSION}
+
+          首个多平台隐私安全 Release：
+
+          - Windows x64：ZIP；双击 Windows 启动脚本，缺少 Python 时自动下载并校验独立运行时。
+          - macOS Apple Silicon / Intel：同一个 universal App 壳，提供 DMG + ZIP；首次启动按机器架构准备独立 Python。
+          - Linux x86_64：tar.gz；优先使用系统 Python，缺失时下载并校验独立运行时。
+          - 启动阶段只准备主程序 GUI/基础依赖；PaddleOCR、Torch、检测模型和模型权重仍由程序在实际启用功能时按需、经用户确认安装/下载。
+          - 所有发布包均来自 GitHub Actions 干净 checkout，并进一步使用 git archive，仅允许受 Git 管理文件进入发布包。
+          - 隐私审计已检查：密钥/令牌、真实用户目录、个人邮箱、.env、日志、数据库、模型权重、用户漫画/文档、输出工作区、虚拟环境和缓存。
+
+          下载后请使用 SHA256SUMS.txt 校验文件。
+          EOF
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --title "Manga HD Transfer Studio ${VERSION}" --notes-file "$NOTES" --latest
+          else
+            gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --title "Manga HD Transfer Studio ${VERSION}" --notes-file "$NOTES" --latest
+          fi
+          gh release upload "$RELEASE_TAG" release-assets/* --clobber
+
+      - name: Verify published assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = "false"
+          ASSETS="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')"
+          for name in \
+            "MangaHDTransfer_${VERSION}_Windows_x64.zip" \
+            "MangaHDTransfer_${VERSION}_macOS_universal.zip" \
+            "MangaHDTransfer_${VERSION}_macOS_universal.dmg" \
+            "MangaHDTransfer_${VERSION}_Linux_x86_64.tar.gz" \
+            SHA256SUMS.txt BUILD-INFO.txt
+          do
+            grep -qx "$name" <<< "$ASSETS"
+          done
+          gh release view "$RELEASE_TAG" --json url,name,tagName,isDraft,isPrerelease,assets \
+            --jq '{url,name,tagName,isDraft,isPrerelease,assets:[.assets[].name]}'

@@ -1,0 +1,25 @@
+name: Privacy audit
+
+on:
+  pull_request:
+  push:
+    branches-ignore:
+      - "dependabot/**"
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Reject tracked private/runtime artifacts
+        run: python scripts/privacy_audit.py
+      - name: Compile public Python sources
+        run: python -m compileall -q bootstrap.py run_gui.py src scripts
