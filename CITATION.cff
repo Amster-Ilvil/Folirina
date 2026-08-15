@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use Manga HD Transfer Studio in research or published technical work, please cite this repository and the version you used."
+title: "Manga HD Transfer Studio"
+type: software
+authors:
+  - family-names: "Amster-Ilvil"
+version: 1.3.14
+repository-code: "https://github.com/Amster-Ilvil/Manga-HD-Translation-Transfer"
+license: MIT
+keywords:
+  - manga
+  - image-registration
+  - OCR
+  - inpainting
+  - translation-transfer
+  - PySide6
