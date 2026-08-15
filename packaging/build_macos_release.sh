@@ -22,6 +22,16 @@ tar -xf "$TAR" -C "$APP_SOURCE"
 rm -f "$TAR"
 rm -rf "$APP_SOURCE/.github" "$APP_SOURCE/tests" "$APP_SOURCE/.gitignore" "$APP_SOURCE/packaging"
 
+# License boundary: all public macOS artifacts must expose the project license,
+# third-party notices, implementation/research references, and citation metadata.
+for required in LICENSE THIRD_PARTY_NOTICES.md REFERENCES.md CITATION.cff; do
+  test -f "$APP_SOURCE/$required" || {
+    echo "Required license/attribution file missing from release stage: $required" >&2
+    exit 1
+  }
+  cp "$APP_SOURCE/$required" "$STAGE/$required"
+done
+
 cat > "$CONTENTS/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -56,6 +66,12 @@ Manga HD Transfer Studio ${VERSION} - macOS universal source/runtime shell
 - Apple Live Text helper source is included; when needed, the existing application
   flow can build it with Xcode Command Line Tools on supported macOS versions.
 
+License and attribution:
+- Manga HD Transfer Studio original code/documentation: MIT (LICENSE).
+- Third-party software keeps its own license; see THIRD_PARTY_NOTICES.md.
+- Implementation/research references: REFERENCES.md.
+- Repository citation metadata: CITATION.cff.
+
 Privacy: this application is assembled from git archive in a clean GitHub Actions
 checkout. No developer cache, credentials, .env file, model cache, logs, user manga,
 output workspace, database, or local virtual environment is included.
@@ -72,6 +88,9 @@ rm -rf "$DMGROOT"
 mkdir -p "$DMGROOT"
 cp -R "$APP" "$DMGROOT/"
 cp "$STAGE/RELEASE-README.txt" "$DMGROOT/"
+for required in LICENSE THIRD_PARTY_NOTICES.md REFERENCES.md CITATION.cff; do
+  cp "$STAGE/$required" "$DMGROOT/$required"
+done
 hdiutil create -volname "Manga HD Transfer Studio ${VERSION}" -srcfolder "$DMGROOT" -ov -format UDZO "$DMG" >/dev/null
 hdiutil verify "$DMG" >/dev/null
 rm -rf "$DMGROOT"
