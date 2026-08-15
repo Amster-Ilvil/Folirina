@@ -1,4 +1,4 @@
-name: Privacy audit
+name: Privacy and license audit
 
 on:
   pull_request:
@@ -21,5 +21,7 @@ jobs:
           python-version: "3.12"
       - name: Reject tracked private/runtime artifacts
         run: python scripts/privacy_audit.py
+      - name: Verify license metadata and attribution
+        run: python scripts/license_audit.py
       - name: Compile public Python sources
         run: python -m compileall -q bootstrap.py run_gui.py src scripts
