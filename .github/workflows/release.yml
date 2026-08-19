@@ -1,0 +1,343 @@
+name: Build and publish Folirina releases
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "pyproject.toml"
+      - "run_gui.py"
+      - "scripts/**"
+      - "README.md"
+      - ".gitignore"
+      - ".github/workflows/release.yml"
+  push:
+    branches: [main]
+    tags:
+      - "v*"
+    paths:
+      - "src/manga_hd_transfer/version.py"
+      - "pyproject.toml"
+      - "scripts/**"
+      - ".gitignore"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: folirina-release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  metadata:
+    name: Privacy audit and version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Privacy audit
+        run: python scripts/privacy_audit.py
+      - id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(python - <<'PY'
+          import pathlib, re
+          text = pathlib.Path('src/manga_hd_transfer/version.py').read_text(encoding='utf-8')
+          m = re.search(r'^\s*__version__\s*=\s*["\x27]([^"\x27]+)["\x27]', text, re.M)
+          if not m:
+              raise SystemExit('__version__ not found')
+          print(m.group(1))
+          PY
+          )"
+          PROJECT_VERSION="$(python - <<'PY'
+          import pathlib, re
+          text = pathlib.Path('pyproject.toml').read_text(encoding='utf-8')
+          m = re.search(r'^version\s*=\s*["\x27]([^"\x27]+)["\x27]', text, re.M)
+          if not m:
+              raise SystemExit('project version not found')
+          print(m.group(1))
+          PY
+          )"
+          test "$VERSION" = "$PROJECT_VERSION"
+          TAG="v${VERSION}"
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME}" != "$TAG" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match Folirina version ${VERSION}" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Folirina release: $TAG"
+
+  windows:
+    name: Windows x64
+    needs: metadata
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          architecture: x64
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install base desktop dependencies
+        shell: pwsh
+        run: |
+          python -m pip install -U pip wheel setuptools pyinstaller
+          python -m pip install ".[gui]"
+      - name: Compile and import check
+        shell: pwsh
+        run: |
+          python -m compileall -q src run_gui.py scripts/build_desktop.py
+          python -c "import manga_hd_transfer, numpy, cv2, PIL, scipy, PySide6; print('Folirina', manga_hd_transfer.__version__)"
+      - name: Build application
+        shell: pwsh
+        run: python scripts/build_desktop.py --clean
+      - name: Package Windows
+        shell: pwsh
+        run: |
+          Compress-Archive -Path 'dist/Folirina' -DestinationPath "Folirina_${env:VERSION}_Windows_x64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Folirina-Windows-x64
+          path: Folirina_${{ env.VERSION }}_Windows_x64.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  macos:
+    name: macOS ${{ matrix.label }}
+    needs: metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            label: AppleSilicon
+            arch: arm64
+          - os: macos-15-intel
+            label: Intel
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 100
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+      ARCH: ${{ matrix.arch }}
+      PRODUCT_NAME: Folirina
+      DMG_BASENAME: Folirina_${{ needs.metadata.outputs.version }}_macOS_${{ matrix.label }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Confirm runner architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "macOS: $(sw_vers -productVersion)"
+          echo "Architecture: $(uname -m)"
+          test "$(uname -m)" = "$ARCH"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install base desktop dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -U pip wheel setuptools pyinstaller
+          python -m pip install ".[gui]"
+      - name: Compile and import check
+        shell: bash
+        run: |
+          python -m compileall -q src run_gui.py scripts/build_desktop.py
+          python -c "import manga_hd_transfer, numpy, cv2, PIL, scipy, PySide6; print('Folirina', manga_hd_transfer.__version__)"
+      - name: Build application
+        shell: bash
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
+        run: python scripts/build_desktop.py --clean
+      - name: Verify executable architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP='dist/Folirina.app'
+          EXE="$APP/Contents/MacOS/Folirina"
+          test -d "$APP"
+          test -x "$EXE"
+          /usr/bin/file "$EXE"
+          /usr/bin/file "$EXE" | grep -q "$ARCH"
+          plutil -lint "$APP/Contents/Info.plist"
+      - name: Build and verify DMG
+        shell: bash
+        run: bash scripts/build_macos_dmg.sh --skip-build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Folirina-macOS-${{ matrix.label }}
+          path: |
+            package/Folirina_${{ env.VERSION }}_macOS_${{ matrix.label }}.dmg
+            package/Folirina_${{ env.VERSION }}_macOS_${{ matrix.label }}.app.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  linux:
+    name: Linux x64
+    needs: metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          architecture: x64
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install Linux GUI libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxcb-cursor0 libxkbcommon-x11-0 libxcb-xinerama0 libx11-xcb1 libfontconfig1
+      - name: Install base desktop dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -U pip wheel setuptools pyinstaller
+          python -m pip install ".[gui]"
+      - name: Compile and import check
+        shell: bash
+        run: |
+          python -m compileall -q src run_gui.py scripts/build_desktop.py
+          python -c "import manga_hd_transfer, numpy, cv2, PIL, scipy, PySide6; print('Folirina', manga_hd_transfer.__version__)"
+      - name: Build application
+        shell: bash
+        run: python scripts/build_desktop.py --clean
+      - name: Package Linux
+        shell: bash
+        run: tar -C dist -czf "Folirina_${VERSION}_Linux_x64.tar.gz" Folirina
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Folirina-Linux-x64
+          path: Folirina_${{ env.VERSION }}_Linux_x64.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  publish:
+    name: Publish GitHub Release
+    if: github.event_name != 'pull_request'
+    needs: [metadata, windows, macos, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+      RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: downloaded
+      - name: Assemble assets and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          cp "downloaded/Folirina-Windows-x64/Folirina_${VERSION}_Windows_x64.zip" release-assets/
+          cp "downloaded/Folirina-macOS-AppleSilicon/Folirina_${VERSION}_macOS_AppleSilicon.dmg" release-assets/
+          cp "downloaded/Folirina-macOS-AppleSilicon/Folirina_${VERSION}_macOS_AppleSilicon.app.zip" release-assets/
+          cp "downloaded/Folirina-macOS-Intel/Folirina_${VERSION}_macOS_Intel.dmg" release-assets/
+          cp "downloaded/Folirina-macOS-Intel/Folirina_${VERSION}_macOS_Intel.app.zip" release-assets/
+          cp "downloaded/Folirina-Linux-x64/Folirina_${VERSION}_Linux_x64.tar.gz" release-assets/
+
+          cat > release-assets/BUILD-INFO.txt <<EOF
+          Folirina ${RELEASE_TAG}
+          Repository: ${GITHUB_REPOSITORY}
+          Commit: ${GITHUB_SHA}
+          Workflow run: ${GITHUB_RUN_ID}
+          Python: 3.11
+          Privacy audit: PASS
+          Windows x64: native desktop base runtime
+          Linux x64: native desktop base runtime
+          macOS Apple Silicon: native arm64; MPS-capable optional runtimes supported
+          macOS Intel: native x86_64
+          macOS signing: ad-hoc (not notarized)
+          macOS DMG verification: PASS
+          Optional OCR/ML runtimes and model weights bundled: no; managed on demand by Folirina
+          EOF
+
+          cd release-assets
+          sha256sum \
+            "Folirina_${VERSION}_Windows_x64.zip" \
+            "Folirina_${VERSION}_macOS_AppleSilicon.dmg" \
+            "Folirina_${VERSION}_macOS_AppleSilicon.app.zip" \
+            "Folirina_${VERSION}_macOS_Intel.dmg" \
+            "Folirina_${VERSION}_macOS_Intel.app.zip" \
+            "Folirina_${VERSION}_Linux_x64.tar.gz" \
+            > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create or update GitHub Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          NOTES=$(mktemp)
+          cat > "$NOTES" <<EOF
+          ## Folirina ${RELEASE_TAG}
+
+          Multi-platform desktop release built from a clean GitHub Actions checkout after a mandatory privacy audit.
+
+          - Windows x64: portable ZIP build.
+          - macOS Apple Silicon: native arm64 `.dmg` and `.app.zip`.
+          - macOS Intel: native x86_64 `.dmg` and `.app.zip`.
+          - Linux x64: portable `tar.gz` build.
+          - Optional Paddle/Torch/OCR/detection runtimes and model weights are not bundled; Folirina prepares them on demand using its existing runtime/model-center paths.
+          - macOS public builds are ad-hoc signed and are not Apple-notarized.
+          - Release publication is blocked if tracked private/local artifacts or common credential patterns are detected.
+
+          See `SHA256SUMS.txt` and `BUILD-INFO.txt` for verification details.
+          EOF
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --title "Folirina ${RELEASE_TAG}" --notes-file "$NOTES" --latest
+          else
+            gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --title "Folirina ${RELEASE_TAG}" --notes-file "$NOTES" --latest
+          fi
+          gh release upload "$RELEASE_TAG" release-assets/* --clobber
+
+      - name: Verify release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          ASSETS="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')"
+          for name in \
+            "Folirina_${VERSION}_Windows_x64.zip" \
+            "Folirina_${VERSION}_macOS_AppleSilicon.dmg" \
+            "Folirina_${VERSION}_macOS_AppleSilicon.app.zip" \
+            "Folirina_${VERSION}_macOS_Intel.dmg" \
+            "Folirina_${VERSION}_macOS_Intel.app.zip" \
+            "Folirina_${VERSION}_Linux_x64.tar.gz" \
+            SHA256SUMS.txt \
+            BUILD-INFO.txt
+          do
+            grep -qx "$name" <<< "$ASSETS"
+          done
+          gh release view "$RELEASE_TAG" --json url,name,tagName,isDraft,isPrerelease,assets \
+            --jq '{url,name,tagName,isDraft,isPrerelease,assets:[.assets[].name]}'
