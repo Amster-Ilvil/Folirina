@@ -28,6 +28,7 @@ QComboBox = StableComboBox
 from .gui_theme import semantic_palette
 from .font_catalog import discover_fonts
 from .io_utils import load_json
+from .direct_patch_status import summarize_direct_patch_payload
 from .pairing import pairing_method
 from .schema_compat import as_dict, normalize_project
 from .workspace import page_id_for_pair, resolve_page_workspace
@@ -259,6 +260,7 @@ class ProjectPage(QWidget):
         self._last_refresh_key = None
         self._thumb_generation = 0
         self._thumb_queue: list[int] = []
+        self._thumb_retry_count = 0
         self._thumb_items: dict[int, QListWidgetItem] = {}
         self._preview_dialog: PagePreviewDialog | None = None
         self._detail_side = "target"
@@ -267,7 +269,8 @@ class ProjectPage(QWidget):
         # bounded cache of already-scaled thumbnail pixels and load visible cards
         # after scrolling settles.
         self._thumb_image_cache: OrderedDict[tuple[str, int, int, int, int], QPixmap] = OrderedDict()
-        self._thumb_image_cache_limit = 128
+        self._thumb_image_cache_limit = 96
+        self._thumb_placeholder_cache: QIcon | None = None
         self._thumb_loaded: set[int] = set()
         self._thumb_load_timer = QTimer(self); self._thumb_load_timer.setSingleShot(True)
         self._thumb_load_timer.timeout.connect(self._pump_thumbnails)
@@ -1245,7 +1248,7 @@ class ProjectPage(QWidget):
             st = path.stat()
         except OSError:
             return None
-        key = (str(path.resolve()), int(st.st_mtime_ns), int(st.st_size), self.THUMB_SIZE.width(), self.THUMB_SIZE.height())
+        key = (str(path), int(st.st_mtime_ns), int(st.st_size), self.THUMB_SIZE.width(), self.THUMB_SIZE.height())
         cached = self._thumb_image_cache.pop(key, None)
         if cached is not None:
             self._thumb_image_cache[key] = cached
@@ -1285,17 +1288,24 @@ class ProjectPage(QWidget):
         return QIcon(canvas)
 
     def _placeholder_icon(self, index: int) -> QIcon:
+        # A single generic placeholder is enough: the QListWidget item text already
+        # carries the page number. Reusing one icon avoids allocating/painting
+        # hundreds of QPixmaps when an existing large project is restored.
+        if self._thumb_placeholder_cache is not None:
+            return self._thumb_placeholder_cache
         canvas = QPixmap(self.THUMB_CANVAS); colors = self._theme_colors(); canvas.fill(QColor(colors["thumb_bg"])); painter = QPainter(canvas)
         try:
             painter.setPen(QColor(colors["muted_2"])); f=painter.font(); f.setPointSize(11); painter.setFont(f)
-            painter.drawText(canvas.rect(), Qt.AlignmentFlag.AlignCenter, f"第 {index+1} 页\n加载中…")
-        finally: painter.end()
-        return QIcon(canvas)
+            painter.drawText(canvas.rect(), Qt.AlignmentFlag.AlignCenter, "加载中…")
+        finally:
+            painter.end()
+        self._thumb_placeholder_cache = QIcon(canvas)
+        return self._thumb_placeholder_cache
 
     def _rebuild_thumbnails(self):
         selected = set(self._selected_thumb_rows()); current = self.window.state.selected_index
         self._thumb_generation += 1
-        self._thumb_load_timer.stop(); self._thumb_queue = []; self._thumb_loaded.clear(); self._thumb_items.clear()
+        self._thumb_load_timer.stop(); self._thumb_queue = []; self._thumb_retry_count = 0; self._thumb_loaded.clear(); self._thumb_items.clear()
         self.thumb_list.setUpdatesEnabled(False)
         try:
             self.thumb_list.clear()
@@ -1340,29 +1350,56 @@ class ProjectPage(QWidget):
     def _schedule_visible_thumbnails(self, delay_ms: int = 60):
         if self.view_stack.currentIndex() != 0:
             return
+        # Any scroll/filter/selection change invalidates the old visible queue.
+        # Rebuild it only after the event stream settles; do not rescan every
+        # 12–18 ms while individual thumbnails are decoded.
+        self._thumb_queue = []
+        self._thumb_retry_count = 0
         self._thumb_load_timer.start(max(0, int(delay_ms)))
 
     def _pump_thumbnails(self):
-        indices = self._visible_thumbnail_indices()
-        if not indices:
+        if self.view_stack.currentIndex() != 0 or not self._thumb_items:
             return
-        # Decoding scaled images is still synchronous in Qt. A tiny batch keeps
-        # each event-loop slice short; wheel/trackpad scrolling restarts the timer
-        # and therefore takes priority over thumbnail work.
-        for idx in indices[:3]:
-            item = self._thumb_items.get(idx)
-            if item is None or idx >= len(self.window.state.pairs):
-                continue
+        if not self._thumb_queue:
+            self._thumb_queue = self._visible_thumbnail_indices()
+            if not self._thumb_queue:
+                # Immediately after restoring a session QListView may not yet
+                # have valid visualItemRect geometry. Previously the 0 ms timer
+                # returned here and never ran again, leaving the left gallery on
+                # “加载中…” until a later scroll. Give Qt a few layout frames and
+                # retry automatically.
+                remaining = any(
+                    (not item.isHidden()) and idx not in self._thumb_loaded
+                    for idx, item in self._thumb_items.items()
+                )
+                if remaining and self._thumb_retry_count < 8:
+                    self._thumb_retry_count += 1
+                    self._thumb_load_timer.start(16 if self._thumb_retry_count <= 3 else 48)
+                return
+            self._thumb_retry_count = 0
+
+        # Decode one scaled image per event-loop slice. This is intentionally
+        # conservative for 4K/8K manga pages: first previews appear promptly but
+        # trackpad scrolling and tab changes remain responsive.
+        idx = self._thumb_queue.pop(0)
+        item = self._thumb_items.get(idx)
+        if item is not None and idx < len(self.window.state.pairs):
             try:
                 item.setIcon(self._thumbnail_icon(idx))
             except Exception:
                 item.setIcon(self._placeholder_icon(idx))
             self._thumb_loaded.add(idx)
-        if len(indices) > 3:
-            self._thumb_load_timer.start(18)
+
+        if self._thumb_queue:
+            self._thumb_load_timer.start(10)
+        else:
+            # The just-decoded icon can change QListView geometry on some Qt/macOS
+            # versions. Re-evaluate once, cheaply, to pick up another newly visible
+            # card without entering a permanent polling loop.
+            self._thumb_load_timer.start(24)
 
     def _force_thumbnail_refresh(self):
-        self._thumb_image_cache.clear(); self._thumb_loaded.clear()
+        self._thumb_image_cache.clear(); self._thumb_placeholder_cache = None; self._thumb_loaded.clear(); self._thumb_queue = []; self._thumb_retry_count = 0
         self._thumb_signature = None; self._table_signature = None; self._last_refresh_key = None; self.refresh()
 
     def _filter_accepts(self, index: int) -> bool:

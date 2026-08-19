@@ -2660,6 +2660,39 @@ class StudioWindow(QMainWindow):
             QMessageBox.warning(self, "无法定位日志", str(exc)); return
         dlg = RunLogDialog(page_root, self); dlg.exec()
 
+    def closeEvent(self, event):
+        # Prevent QThread::~QThread aborts during PySide shutdown. The attached
+        # macOS crash report showed ComponentProbeWorker still alive while QtCore
+        # was finalizing. Read-only probes are drained here; processing workers
+        # receive their existing cooperative cancellation signal.
+        try:
+            if hasattr(self, "models"):
+                self.models.shutdown_background_probes()
+        except Exception:
+            logger.debug("background probe shutdown failed", exc_info=True)
+
+        still_running = False
+        for worker in (self.worker, self._prepare_worker, self._page_action_worker):
+            try:
+                if worker is None or not worker.isRunning():
+                    continue
+                if hasattr(worker, "request_cancel"):
+                    worker.request_cancel()
+                else:
+                    worker.requestInterruption()
+                worker.wait(1800)
+                still_running = still_running or worker.isRunning()
+            except Exception:
+                logger.debug("worker shutdown failed", exc_info=True)
+                still_running = True
+        if still_running:
+            # Never destroy a live QThread wrapper. Keep the window alive and let
+            # the existing cooperative stop finish; the user can close again.
+            self.statusBar().showMessage("正在安全结束后台任务，完成后即可退出。", 5000)
+            event.ignore()
+            return
+        super().closeEvent(event)
+
     def _busy_running(self) -> bool:
         return bool(
             (self.worker is not None and self.worker.isRunning())

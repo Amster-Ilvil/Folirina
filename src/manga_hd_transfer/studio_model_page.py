@@ -947,6 +947,29 @@ class ModelPage(QWidget):
             return
         self._apply_probe_statuses(self._probe_cache)
 
+
+    def shutdown_background_probes(self, timeout_ms: int = 2200) -> None:
+        """Stop read-only probe QThreads before QApplication teardown.
+
+        PySide/Qt aborts when a live QThread wrapper is destroyed during Python
+        finalization. Component/network probes are read-only, so a bounded wait
+        followed by termination is safer than letting Qt tear them down alive.
+        Model downloads/dependency installs are intentionally not force-killed.
+        """
+        for attr in ("_probe_worker", "_network_probe_worker"):
+            worker = getattr(self, attr, None)
+            if worker is None:
+                continue
+            try:
+                if worker.isRunning():
+                    worker.requestInterruption()
+                    if not worker.wait(max(0, int(timeout_ms))):
+                        worker.terminate()
+                        worker.wait(1200)
+            except RuntimeError:
+                pass
+            setattr(self, attr, None)
+
     def _start_probe(self):
         if self._probe_worker is not None and self._probe_worker.isRunning():
             return
