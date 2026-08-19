@@ -207,19 +207,13 @@ class TransferPipeline:
         cancel_cb=None,
         progress_cb=None,
     ) -> PageProject:
-        """Single-page entry point with a hard-isolated v2.3.4-based Direct lane.
+        """Single-page entry point for all transfer modes.
 
-        Direct is intentionally dispatched *before* the current shared lifecycle.
-        Its runtime keeps the v2.3.4 Direct Contract Guard page-flow and applies
-        only the v2.3.13 strict semantic-mask guard. Other modes retain the current
-        transaction-safe pipeline unchanged.
+        Direct is a first-class Folirina mode and uses the same transaction-safe
+        page lifecycle as Mask/OCR/Reletter/Reveal.  Its renderer and strict
+        semantic support guard remain Direct-owned, but there is no external
+        vendor tree, subprocess, alternate PYTHONPATH, or legacy runtime bridge.
         """
-        if str(self.config.transfer.mode or "") == "direct_patch":
-            from .direct_v234_bridge import run_direct_v234_page
-            return run_direct_v234_page(
-                config=self.config, pair=pair, page_root=page_root, final_path=final_path,
-                page_mark=page_mark, cancel_cb=cancel_cb, progress_cb=progress_cb,
-            )
         return run_page_lifecycle(
             config=self.config, pair=pair, page_root=page_root, final_path=final_path,
             page_mark=page_mark, cancel_cb=cancel_cb, progress_cb=progress_cb, process_impl=self._process_page_impl,

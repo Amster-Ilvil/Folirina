@@ -950,21 +950,40 @@ def build_source_direct_container_plan(
     source_dark = (source_gray < dark_thr).astype(np.uint8) * 255
     source_dark = cv2.morphologyEx(source_dark, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
     contours, _hier = cv2.findContours(source_dark, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    contour_entries: list[tuple[np.ndarray, bool, str]] = [(c, False, "contour") for c in contours]
+    raw_contour_entries: list[tuple[np.ndarray, bool, str]] = [(c, False, "contour") for c in contours]
+    hint_contour_entries: list[tuple[np.ndarray, bool, str]] = []
     source_detector_hint_count = 0
-    # Optional detector/completion masks are SOURCE-ONLY. Keep provenance so
-    # stricter artwork guards can distinguish a text-seeded topology recovery
-    # from an arbitrary closed white artwork contour.
+    # Direct v2.3.13: SOURCE bubble/text-box masks are an authority boundary, not
+    # merely an extra candidate source.  The old v2.3.4 code appended detector
+    # hints to *all* dark contours.  With publication safety relaxed this allowed
+    # a face/hair/panel contour to become an independent Direct candidate.
+    # When semantic hints exist, use them exclusively.  Raw contour discovery is
+    # retained only as a compatibility fallback for pages with zero usable hints.
     if source_hint_bubbles:
         for bubble in source_hint_bubbles:
             mask = bubble.mask
             if mask is None or mask.shape[:2] != source_gray.shape[:2]:
                 continue
-            hint_contours, _ = cv2.findContours((mask > 0).astype(np.uint8) * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            hint_u8 = (mask > 0).astype(np.uint8) * 255
+            hint_contours, _ = cv2.findContours(hint_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             if not hint_contours:
                 continue
-            contour_entries.append((max(hint_contours, key=cv2.contourArea), True, str(bubble.meta.get("backend") or "source_hint")))
+            # A detector mask can contain disconnected dust. Keep every meaningful
+            # component so no bubble/text box is silently lost, but never synthesize
+            # a candidate outside the supplied semantic mask.
+            for hc in hint_contours:
+                if cv2.contourArea(hc) < 24.0:
+                    continue
+                hint_contour_entries.append((hc, True, str(bubble.meta.get("backend") or "source_hint")))
             source_detector_hint_count += 1
+    semantic_hint_lock_enabled = bool(hint_contour_entries)
+    # Strict Direct no longer promotes raw artwork contours into writable masks.
+    # If no bubble/text-box hint exists, fail closed and let the caller keep TARGET
+    # unchanged (or use another mode) instead of guessing a destructive region.
+    raw_contour_suppressed_count = len(raw_contour_entries)
+    if not semantic_hint_lock_enabled:
+        return None
+    contour_entries = hint_contour_entries
 
     # Distance to target dark lines.  Only this scalar score is used for border
     # alignment.  The target/source border pixels themselves are never pasted.
@@ -1879,6 +1898,11 @@ def build_source_direct_container_plan(
         "source_saturation_p90": float(source_sat_p90),
         "candidate_count": int(candidate_count),
         "source_detector_hint_count": int(source_detector_hint_count),
+        "semantic_hint_lock_enabled": bool(semantic_hint_lock_enabled),
+        "raw_contour_candidates_total": int(len(raw_contour_entries)),
+        "raw_contour_candidates_suppressed": int(raw_contour_suppressed_count),
+        "candidate_authority": "source_bubble_or_textbox_hints_only",
+        "strict_direct_support_guard": "fail_closed_exact_semantic_mask",
         "accepted": len(records),
         "accepted_white": int(accepted_white),
         "accepted_colored_spiky": int(accepted_colored),
