@@ -434,6 +434,107 @@ def target_text_mask_in_container(target: np.ndarray, region_mask: np.ndarray) -
 
 
 
+def clear_broad_neutral_paper_components(
+    rendered: np.ndarray,
+    target: np.ndarray,
+    clear_mask: np.ndarray,
+    *,
+    min_paper_ratio: float = 0.62,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    """Handle broad OCR clear regions whose TARGET background is proven paper.
+
+    OCR/reletter clear masks can be *whole text-box rectangles* rather than only
+    Japanese glyph strokes. Passing those rectangles to Telea/AI inpainting lets
+    nearby panel lines and halftone leak into an otherwise white box, producing
+    the grey triangular shadows seen on p-005.  For a connected clear component
+    that is already mostly bright/neutral TARGET paper, the background does not
+    need to be invented at all:
+
+      * mark the whole broad component as handled so no interpolating inpaint sees it;
+      * derive compact TARGET text ink inside that proven paper component;
+      * restore only those ink/fringe pixels to the component's own TARGET paper colour;
+      * preserve all other original TARGET pixels, including scan texture and borders.
+
+    This helper is intentionally generic but callers gate it to OCR modes only.
+    ``handled`` is the broad area removed from later inpaint; ``changed`` is the
+    much smaller set of pixels that were actually rewritten to paper colour.
+    """
+    if rendered.shape != target.shape or clear_mask.shape != target.shape[:2]:
+        raise ValueError("paper-clear inputs must share one TARGET canvas")
+    out = rendered.copy()
+    handled = np.zeros(clear_mask.shape, np.uint8)
+    changed = np.zeros(clear_mask.shape, np.uint8)
+    work = (np.asarray(clear_mask) > 0).astype(np.uint8)
+    if int(np.count_nonzero(work)) == 0:
+        return out, handled, changed, {
+            "broad_paper_components": 0,
+            "broad_paper_handled_pixels": 0,
+            "broad_paper_changed_pixels": 0,
+            "broad_paper_rejected_components": 0,
+            "broad_paper_min_ratio": float(min_paper_ratio),
+        }
+
+    gray = cv2.cvtColor(target, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(target, cv2.COLOR_BGR2HSV)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(work, 8)
+    accepted_rows: list[dict[str, Any]] = []
+    rejected = 0
+    for lab in range(1, count):
+        comp = labels == lab
+        area = int(stats[lab, cv2.CC_STAT_AREA])
+        if area < 12:
+            rejected += 1
+            continue
+        paper_sel = comp & (gray >= 205) & (hsv[..., 1] <= 55)
+        paper_pixels = int(np.count_nonzero(paper_sel))
+        paper_ratio = float(paper_pixels / max(1, area))
+        if paper_pixels < 20 or paper_ratio < float(min_paper_ratio):
+            rejected += 1
+            continue
+        paper_gray = gray[paper_sel]
+        if paper_gray.size == 0 or float(np.median(paper_gray)) < 220.0:
+            rejected += 1
+            continue
+
+        comp_u8 = comp.astype(np.uint8) * 255
+        # Reuse the existing compact-ink selector: unlike a rectangular clear
+        # mask, it rejects long panel/bubble outlines and keeps the actual JP
+        # lettering. A one-pixel expansion absorbs antialias fringes.
+        glyph = target_text_mask_in_container(target, comp_u8)
+        if cv2.countNonZero(glyph) > 0:
+            glyph = cv2.dilate(
+                glyph,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+                iterations=1,
+            )
+            glyph = cv2.bitwise_and(glyph, comp_u8)
+
+        paper = np.median(target[paper_sel], axis=0).astype(np.uint8)
+        if cv2.countNonZero(glyph) > 0:
+            out[glyph > 0] = paper
+            changed[glyph > 0] = 255
+        # Crucial: even unchanged white pixels in the broad rectangle are
+        # removed from downstream inpainting. They are already valid TARGET.
+        handled[comp] = 255
+        x, y, bw, bh = [int(v) for v in stats[lab, :4]]
+        accepted_rows.append({
+            "bbox": [x, y, x + bw, y + bh],
+            "area": area,
+            "paper_ratio": round(paper_ratio, 4),
+            "paper_bgr": [int(x) for x in paper.tolist()],
+            "glyph_clear_pixels": int(cv2.countNonZero(glyph)),
+        })
+
+    return out, handled, changed, {
+        "broad_paper_components": len(accepted_rows),
+        "broad_paper_handled_pixels": int(cv2.countNonZero(handled)),
+        "broad_paper_changed_pixels": int(cv2.countNonZero(changed)),
+        "broad_paper_rejected_components": int(rejected),
+        "broad_paper_min_ratio": float(min_paper_ratio),
+        "broad_paper_regions": accepted_rows,
+    }
+
+
 def clear_to_target_paper(rendered: np.ndarray, target: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """Fill a cleared white-container region with target paper colour, not Telea.
 

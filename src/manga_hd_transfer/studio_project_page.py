@@ -10,7 +10,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QSize, QTimer, Signal
-from PySide6.QtGui import QPixmap, QPainter, QColor, QIcon, QImageReader
+from PySide6.QtGui import QPixmap, QPainter, QColor, QIcon, QImageReader, QActionGroup
 from PySide6.QtWidgets import (
     QWidget, QFrame, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QGridLayout,
     QFormLayout, QStackedWidget, QFileDialog, QMessageBox, QCheckBox,
@@ -28,7 +28,8 @@ QComboBox = StableComboBox
 from .gui_theme import semantic_palette
 from .font_catalog import discover_fonts
 from .io_utils import load_json
-from .direct_patch_status import summarize_direct_patch_payload
+from .direct_patch_status import summarize_direct_patch_payload  # compatibility/public import
+from . import direct_patch_status as _direct_patch_status
 from .pairing import pairing_method
 from .schema_compat import as_dict, normalize_project
 from .workspace import page_id_for_pair, resolve_page_workspace
@@ -406,7 +407,7 @@ class ProjectPage(QWidget):
             self.reletter_font_preset.addItem(label, value)
         self.reletter_font_preset.setMinimumWidth(126)
         rhead = QHBoxLayout(); rhead.setSpacing(7)
-        rtitle = QLabel("高清重排 · 字体与排版"); rtitle.setObjectName("typographyTitle")
+        rtitle = QLabel("OCR重排 · 字体与排版"); rtitle.setObjectName("typographyTitle")
         rhead.addWidget(rtitle); rhead.addStretch(1)
         preset_label = QLabel("预设"); preset_label.setObjectName("quiet")
         rhead.addWidget(preset_label); rhead.addWidget(self.reletter_font_preset)
@@ -441,7 +442,7 @@ class ProjectPage(QWidget):
         self.reletter_line_spacing = QDoubleSpinBox(); self.reletter_line_spacing.setRange(0.0,0.6); self.reletter_line_spacing.setSingleStep(0.02); self.reletter_line_spacing.setDecimals(2); self.reletter_line_spacing.setValue(float(self.window.state.config.lettering.line_spacing_ratio))
         self.reletter_koharu_flow_cells = QCheckBox("联合气泡分区 · Koharu")
         self.reletter_koharu_flow_cells.setChecked(bool(getattr(self.window.state.config.lettering, "koharu_flow_cells_enabled", False)))
-        self.reletter_koharu_flow_cells.setToolTip("仅高清重排：当一个连通气泡包含多段独立对白时，按物理颈部/文字锚点切成互不重叠的排字区。默认关闭，不影响现有结果。")
+        self.reletter_koharu_flow_cells.setToolTip("仅 OCR重排：当一个连通气泡包含多段独立对白时，按物理颈部/文字锚点切成互不重叠的排字区。默认关闭，不影响现有结果。")
 
         layout_grid = QGridLayout(); layout_grid.setContentsMargins(0,0,0,0); layout_grid.setHorizontalSpacing(7); layout_grid.setVerticalSpacing(6)
         layout_grid.addWidget(QLabel("断句"), 0, 0); layout_grid.addWidget(self.reletter_break_mode, 0, 1)
@@ -791,7 +792,12 @@ class ProjectPage(QWidget):
             self.direct_result_status.setText("当前页 Direct 结果：暂无工作区。请先处理当前页。")
             self.direct_result_status.setStyleSheet(self._tone_style("orange"))
             return
-        summary = summarize_direct_patch_payload(page_dir)
+        try:
+            summary = summarize_direct_patch_payload(page_dir)
+        except NameError:
+            # Defensive recovery for mixed/stale GUI modules left by an in-place
+            # source update. Fresh v2.3.10 installs take the normal imported path.
+            summary = _direct_patch_status.summarize_direct_patch_payload(page_dir)
         self.direct_result_status.setVisible(True)
         if not summary.get("payload"):
             self.direct_result_status.setText("当前页 Direct 结果：暂无 direct_patch 产物。请重新处理当前页；已有旧结果不会自动切换到新 Direct 合同。")
@@ -977,7 +983,7 @@ class ProjectPage(QWidget):
     def _save_mode_specific_ui(self, mode: str):
         candidate = self._mode_candidate_config(mode)
         if candidate is not None:
-            if hasattr(candidate, "paired_diff_enabled") and mode in {"mask_replace", "hybrid", "reletter"}:
+            if hasattr(candidate, "paired_diff_enabled") and mode in {"direct_patch", "mask_replace", "hybrid", "reletter"}:
                 candidate.paired_diff_enabled = bool(self.diff_check.isChecked())
             if hasattr(candidate, "exact_identity_copy") and mode in {"direct_patch", "mask_replace", "hybrid"}:
                 candidate.exact_identity_copy = bool(self.exact_check.isChecked())
@@ -1067,7 +1073,7 @@ class ProjectPage(QWidget):
     def _pick_reletter_font(self):
         start = self.reletter_font.text().strip() or str(Path.home())
         path, _ = QFileDialog.getOpenFileName(
-            self, "选择高清重排字体", start,
+            self, "选择 OCR重排字体", start,
             "字体文件 (*.ttf *.ttc *.otf *.otc);;所有文件 (*)",
         )
         if path:
@@ -1100,11 +1106,41 @@ class ProjectPage(QWidget):
         if not rows:
             return
         menu = QMenu(self)
-        title = menu.addAction(f"已选 {len(rows)} 页")
+        menu.setObjectName("pageTypeMenu")
+        # Keep every page-type row on one explicit geometry contract. macOS native
+        # QMenu can otherwise paint the check column and selected background with
+        # slightly different vertical metrics, making the blue row look shifted
+        # relative to its text.
+        menu.setStyleSheet("""
+            QMenu#pageTypeMenu::item {
+                min-height: 22px;
+                padding: 4px 26px 4px 30px;
+                margin: 0px;
+            }
+            QMenu#pageTypeMenu::indicator {
+                width: 14px; height: 14px;
+            }
+            QMenu#pageTypeMenu::separator {
+                height: 1px; margin: 4px 8px;
+            }
+        """)
+        current_types = []
+        for row in rows:
+            if 0 <= row < len(self.window.state.pairs):
+                current_types.append(self.window.page_mark_for_pair(self.window.state.pairs[row]).page_type)
+        unique_types = set(current_types)
+        current_type = next(iter(unique_types)) if len(unique_types) == 1 else None
+        current_label = page_type_label(current_type) if current_type else "多种类型"
+        title = menu.addAction(f"已选 {len(rows)} 页 · 当前：{current_label}")
         title.setEnabled(False)
         menu.addSeparator()
+        type_group = QActionGroup(menu)
+        type_group.setExclusive(True)
         for key in MANUAL_PAGE_TYPES:
             action = menu.addAction(page_type_label(key))
+            action.setCheckable(True)
+            action.setChecked(key == current_type)
+            type_group.addAction(action)
             action.triggered.connect(lambda _checked=False, k=key, r=tuple(rows): self.window.mark_page_rows(list(r), k))
         menu.addSeparator()
         reset_action = menu.addAction("恢复默认正文")
@@ -1202,8 +1238,8 @@ class ProjectPage(QWidget):
     def _sync_detail(self, index: int):
         pairs = self.window.state.pairs
         if not (0 <= index < len(pairs)):
-            self._detail_auto_index = -1
-            self._set_detail_expanded(False)
+            # Expansion state is user-owned. Page changes, empty selection and
+            # preview loading must never open or close the inspector implicitly.
             self.detail_page.setText("未选择页面"); self.detail_badge.setText("—"); self.detail_badge.setStyleSheet("")
             self.detail_view.set_image(None); self.detail_names.setText(""); self.detail_reason.setText(""); self.detail_stats.setText(""); return
         pair = pairs[index]; mark = self.window.page_mark_for_pair(pair)
@@ -1213,13 +1249,9 @@ class ProjectPage(QWidget):
         self.detail_badge.setStyleSheet(f"background:{color};color:white;border-radius:9px;padding:4px 8px;font-weight:700;")
         path = pair.source_path if self._detail_side == "source" else pair.target_path
         preview_path = Path(path)
-        has_preview = bool(self.detail_view.set_image(preview_path))
-        # Auto-open when the user arrives at a page with an actual image.  Track
-        # the page index so a manual collapse remains respected until selection
-        # moves to another page.
-        if has_preview and getattr(self, "_detail_auto_index", -1) != index:
-            self._detail_auto_index = index
-            self._set_detail_expanded(True)
+        # Load/sync the preview even while the inspector is collapsed, but never
+        # change its expansion state. Only the user's 展开/收起 button controls it.
+        self.detail_view.set_image(preview_path)
         names_text = f"旧中文：{Path(pair.source_path).name}\n高清日文：{Path(pair.target_path).name}"
         self.detail_names.setText(names_text); self.detail_names.setToolTip(names_text)
         origin = "手动" if mark.origin == "manual" else "默认"

@@ -35,6 +35,75 @@ from .pipeline_project_assembly import assemble_page_project, finalize_page_proj
 from .pipeline_artifact_export import export_page_artifacts
 
 
+
+
+def _paired_ocr_authority_rescue(mode: str, match, source_unit, target_unit, source_decision, target_decision, registration_confidence: float) -> bool:
+    """Rescue a strong paired OCR match from a one-sided false PROTECT.
+
+    This is intentionally restricted to the two OCR product flows.  It does not
+    weaken Direct, pure Mask or Reveal authority.  The common failure is a
+    target-driven SOURCE crop/text detector covering only the first vertical
+    glyphs of an otherwise valid bubble: Koharu then sees lots of panel area and
+    marks the SOURCE side PROTECT even though the paired TARGET region is an
+    explicit ALLOW.
+    """
+    if str(mode or "") not in {"reletter", "hybrid"}:
+        return False
+    reasons = [str(x or "") for x in (getattr(match, "reasons", None) or [])]
+    if not any(r.startswith("route=paired_id_binding") for r in reasons):
+        return False
+    if float(getattr(match, "confidence", 0.0) or 0.0) < 0.92:
+        return False
+    if float(registration_confidence or 0.0) < 0.70:
+        return False
+    if not str(getattr(source_unit, "bubble_id", "") or "").strip():
+        return False
+    if not str(getattr(target_unit, "bubble_id", "") or "").strip():
+        return False
+
+    source_meta = dict(getattr(source_unit, "meta", {}) or {})
+    source_recovered = bool(source_meta.get("source_crop_recovered"))
+    pairs = ((source_decision, target_decision), (target_decision, source_decision))
+    for protected, supported in pairs:
+        if str(getattr(protected, "state", "")) != "PROTECT" or str(getattr(supported, "state", "")) != "ALLOW":
+            continue
+        if str(getattr(protected, "reason", "")) != "koharu_layout_panel_only_artwork":
+            continue
+        bubble_overlap = float(getattr(protected, "bubble_overlap", 0.0) or 0.0)
+        text_overlap = float(getattr(protected, "text_overlap", 0.0) or 0.0)
+        supported_text = float(getattr(supported, "text_overlap", 0.0) or 0.0)
+        supported_bubble = float(getattr(supported, "bubble_overlap", 0.0) or 0.0)
+        # A recovered SOURCE crop plus positive TARGET semantic support is the
+        # strongest case.  The looser overlap clause is retained for already-
+        # complete paired OCR blocks created before v2.3.16.
+        if source_recovered and supported is target_decision and bubble_overlap >= 0.45:
+            return True
+        if bubble_overlap >= 0.55 and text_overlap >= 0.10 and (supported_text >= 0.35 or supported_bubble >= 0.55):
+            return True
+    return False
+
+def _layout_region_kind_for_unit(unit) -> str:
+    """Map OCR/reletter units to Koharu's bubble vs free-text authority domain.
+
+    Target-driven Reletter regions use geometry=reletter_text_region even when
+    they are narration/speech inside a detected bubble. Treating that geometry
+    as free_text raises the text-overlap threshold and can incorrectly PROTECT
+    a valid matched bubble. Bubble membership and speech/narration semantics are
+    therefore authoritative before the low-level geometry tag.
+    """
+    meta = dict(getattr(unit, "meta", {}) or {})
+    geometry = str(meta.get("geometry") or "").strip().lower()
+    kind = str(getattr(unit, "kind", "") or meta.get("kind") or "").strip().lower()
+    bubble_id = str(getattr(unit, "bubble_id", "") or meta.get("bubble_id") or "").strip()
+    if bubble_id:
+        return "bubble"
+    if geometry == "bubble":
+        return "bubble"
+    if kind in {"speech", "narration", "dialogue", "dialog"}:
+        return "bubble"
+    return "free_text"
+
+
 def run_page_flow(
     *,
     config: PipelineConfig,
@@ -335,22 +404,39 @@ def run_page_flow(
             su = su_by.get(m.source_unit_id); tu = tu_by.get(m.target_unit_id)
             if su is None or tu is None:
                 continue
-            sk = "bubble" if str((su.meta or {}).get("geometry") or "") == "bubble" else "free_text"
-            tk = "bubble" if str((tu.meta or {}).get("geometry") or "") == "bubble" else "free_text"
+            sk = _layout_region_kind_for_unit(su)
+            tk = _layout_region_kind_for_unit(tu)
             sd = classify_layout_authority(src_authority, su, source.shape[:2], region_kind=sk, cfg=config.mask_replace)
             td = classify_layout_authority(tgt_authority, tu, target.shape[:2], region_kind=tk, cfg=config.mask_replace)
             if sd.state == "PROTECT" or td.state == "PROTECT":
+                if _paired_ocr_authority_rescue(
+                    mode, m, su, tu, sd, td, float(registration.confidence)
+                ):
+                    authority_kept.append(m)
+                    authority_rejected.append({
+                        "source_unit_id": su.id, "target_unit_id": tu.id,
+                        "source": sd.to_dict(), "target": td.to_dict(),
+                        "rescued": True,
+                        "reason": "paired_ocr_false_protect_recovered",
+                    })
+                    continue
                 authority_rejected.append({
                     "source_unit_id": su.id, "target_unit_id": tu.id,
                     "source": sd.to_dict(), "target": td.to_dict(),
+                    "rescued": False,
                 })
                 continue
             authority_kept.append(m)
         accepted = authority_kept
         cache_stats["ocr_match_authority"] = "koharu_first"
-        cache_stats["ocr_match_authority_rejected"] = str(len(authority_rejected))
-        if trace is not None and authority_rejected:
-            trace.event("ocr_match_authority_rejected", count=len(authority_rejected), rows=authority_rejected[:12])
+        rejected_rows = [x for x in authority_rejected if not bool(x.get("rescued"))]
+        rescued_rows = [x for x in authority_rejected if bool(x.get("rescued"))]
+        cache_stats["ocr_match_authority_rejected"] = str(len(rejected_rows))
+        cache_stats["ocr_match_authority_rescued"] = str(len(rescued_rows))
+        if trace is not None and rejected_rows:
+            trace.event("ocr_match_authority_rejected", count=len(rejected_rows), rows=rejected_rows[:12])
+        if trace is not None and rescued_rows:
+            trace.event("ocr_match_authority_rescued", count=len(rescued_rows), rows=rescued_rows[:12])
 
     if trace is not None:
         trace.event(

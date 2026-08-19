@@ -56,6 +56,11 @@ from .review_history import record_review_state, undo_review_state, redo_review_
 from .font_catalog import discover_fonts
 from .review_apply import apply_review_page, generate_remove_text_preview, apply_target_layer_erase_review, reset_target_layer_erase_review, apply_target_layer_restore_review, reset_target_layer_restore_review, apply_manual_force_transfer_review, reset_manual_force_transfer_review, manual_force_auto_evidence_masks
 from .manual_effect import map_target_bbox_to_source, build_manual_effect_masks, build_reveal_seed_mask, estimate_source_background, composite_source_text_delta, clean_manual_target_text
+from .ocr_edit_blocks import (
+    is_ocr_edit_mode, ocr_edit_scope, load_ocr_blocks, upsert_ocr_block,
+    delete_ocr_block, save_ocr_blocks, recognize_manual_ocr_block,
+)
+from .ocr_edit_render import apply_ocr_edit_blocks, reset_ocr_edit_blocks
 from .workspace import page_id_for_pair, resolve_page_workspace
 from .workspace_guard import PageRunGuard
 from .workspace_cleanup import cleanup_output_workspace
@@ -759,6 +764,144 @@ class RegionSelectView(QGraphicsView):
         super().mouseReleaseEvent(event)
 
 
+
+class OCRBlockEditorDialog(QDialog):
+    """Manual ROI OCR + per-block typography editor.
+
+    This dialog is hard-gated to the two OCR product flows. It stores its state
+    under ``ocr_edit/mask_ocr`` or ``ocr_edit/ocr_reletter`` and never writes
+    Direct / pure Mask / Reveal artifacts.
+    """
+
+    def __init__(self, page_dir: str | Path, source_path: str | Path, target_path: str | Path,
+                 project: dict[str, Any], config: PipelineConfig, mode: str, parent=None):
+        super().__init__(parent)
+        if not is_ocr_edit_mode(mode):
+            raise ValueError("人工 OCR 文本块只在 精准蒙版+OCR / OCR重排 中可用。")
+        self.page_dir=Path(page_dir); self.source_path=Path(source_path); self.target_path=Path(target_path)
+        self.project=dict(project or {}); self.config=config.model_copy(deep=True); self.mode=str(mode)
+        self._blocks=load_ocr_blocks(self.page_dir,self.mode); self._current_id=""
+        scope=ocr_edit_scope(self.mode)
+        self.setWindowTitle("人工 OCR 文本块 · " + ("精准蒙版+OCR" if scope=="mask_ocr" else "OCR重排"))
+        _configure_responsive_dialog(self,(1560,980),(1040,700))
+        root=QVBoxLayout(self); root.setContentsMargins(12,12,12,12); root.setSpacing(8)
+        hint=QLabel("在右侧 TARGET 上拖框；“重新 OCR”只识别这个 ROI。中文内容从配准后的 SOURCE 区域读取，TARGET OCR 只用于定位需要清除的日文。字体、字号、方向、断句和排版属于当前文本块，不会修改其他模式。")
+        hint.setWordWrap(True); hint.setObjectName("hint"); root.addWidget(hint)
+        top=QHBoxLayout(); self.block_combo=QComboBox(); self.block_combo.addItem("新建 OCR 文本块","")
+        self.new_btn=QPushButton("新建"); self.delete_btn=QPushButton("删除"); self.delete_btn.setObjectName("dangerCompact")
+        top.addWidget(QLabel("文本块")); top.addWidget(self.block_combo,1); top.addWidget(self.new_btn); top.addWidget(self.delete_btn); root.addLayout(top)
+        split=QSplitter(Qt.Orientation.Horizontal)
+        left=QFrame(); left.setObjectName("card"); ll=QVBoxLayout(left); ll.setContentsMargins(8,8,8,8); ll.addWidget(QLabel("SOURCE 中文 · 自动映射 ROI")); self.source_view=RegionSelectView(self.source_path,editable=False,parent=self); ll.addWidget(self.source_view,1)
+        right=QFrame(); right.setObjectName("card"); rl=QVBoxLayout(right); rl.setContentsMargins(8,8,8,8); rl.addWidget(QLabel("TARGET 高清日文 · 拖框选择 / 调整 ROI")); self.target_view=RegionSelectView(self.target_path,editable=True,parent=self); rl.addWidget(self.target_view,1)
+        split.addWidget(left); split.addWidget(right); split.setStretchFactor(0,1); split.setStretchFactor(1,1); root.addWidget(split,1)
+        panel=QFrame(); panel.setObjectName("selectionPanel"); pl=QVBoxLayout(panel); pl.setContentsMargins(10,9,10,9); pl.setSpacing(7)
+        ocrrow=QHBoxLayout(); self.ocr_btn=QPushButton("重新 OCR 当前选框"); self.ocr_btn.setObjectName("softPrimary"); self.ocr_status=QLabel("先框选区域"); self.ocr_status.setObjectName("hint"); ocrrow.addWidget(self.ocr_btn); ocrrow.addWidget(self.ocr_status,1); pl.addLayout(ocrrow)
+        self.text=QPlainTextEdit(); self.text.setPlaceholderText("OCR 结果可直接编辑；重新 OCR 时保留当前字体和排版设置。")
+        self.text.setMaximumHeight(105); pl.addWidget(self.text)
+        r1=QHBoxLayout(); self.orientation=QComboBox(); self.orientation.addItem("自动","auto"); self.orientation.addItem("竖排","vertical"); self.orientation.addItem("横排","horizontal")
+        self.break_mode=QComboBox(); self.break_mode.addItem("智能断句","smart"); self.break_mode.addItem("均衡断句","balanced"); self.break_mode.addItem("保留源换行","source")
+        self.layout_mode=QComboBox(); self.layout_mode.addItem("智能缩放","smart_scaling"); self.layout_mode.addItem("严格字号","strict"); self.layout_mode.addItem("填充文本框","balloon_fill")
+        r1.addWidget(QLabel("方向")); r1.addWidget(self.orientation); r1.addWidget(QLabel("断句")); r1.addWidget(self.break_mode); r1.addWidget(QLabel("排版")); r1.addWidget(self.layout_mode); r1.addStretch(1); pl.addLayout(r1)
+        r2=QHBoxLayout(); self.font=QLineEdit(); self.font.setPlaceholderText("留空使用全局字体；也支持字体链")
+        self.font_pick=QPushButton("选择字体…"); r2.addWidget(QLabel("字体")); r2.addWidget(self.font,1); r2.addWidget(self.font_pick); pl.addLayout(r2)
+        r3=QHBoxLayout(); self.font_size=QSpinBox(); self.font_size.setRange(0,160); self.font_size.setSpecialValueText("自动"); self.font_size.setSuffix(" px")
+        self.columns=QSpinBox(); self.columns.setRange(0,12); self.columns.setSpecialValueText("自动")
+        self.line_spacing=QDoubleSpinBox(); self.line_spacing.setRange(-1.0,0.60); self.line_spacing.setSingleStep(0.02); self.line_spacing.setDecimals(2); self.line_spacing.setSpecialValueText("自动")
+        r3.addWidget(QLabel("字号")); r3.addWidget(self.font_size); r3.addWidget(QLabel("列数")); r3.addWidget(self.columns); r3.addWidget(QLabel("行距")); r3.addWidget(self.line_spacing); r3.addStretch(1); pl.addLayout(r3)
+        root.addWidget(panel)
+        actions=QHBoxLayout(); actions.addStretch(1); cancel=QPushButton("取消"); self.save_btn=QPushButton("保存并应用"); self.save_btn.setObjectName("primary")
+        actions.addWidget(cancel); actions.addWidget(self.save_btn); root.addLayout(actions)
+        cancel.clicked.connect(self.reject); self.save_btn.clicked.connect(self._save); self.ocr_btn.clicked.connect(self._rerun_ocr); self.new_btn.clicked.connect(self._new)
+        self.delete_btn.clicked.connect(self._delete); self.font_pick.clicked.connect(self._pick_font); self.block_combo.currentIndexChanged.connect(self._load_selected)
+        self.target_view.selection_changed.connect(self._target_selection_changed)
+        self._reload_combo()
+
+    def _reload_combo(self, select_id: str=""):
+        self._blocks=load_ocr_blocks(self.page_dir,self.mode)
+        self.block_combo.blockSignals(True); self.block_combo.clear(); self.block_combo.addItem("新建 OCR 文本块","")
+        for i,row in enumerate(self._blocks,1):
+            text=str(row.get("render_text") or row.get("ocr_text") or "").replace("\n"," ").strip()
+            self.block_combo.addItem(f"{i}. {text[:28] or '未识别'}",str(row.get("id") or ""))
+        idx=self.block_combo.findData(select_id) if select_id else 0; self.block_combo.setCurrentIndex(max(0,idx)); self.block_combo.blockSignals(False)
+        self._load_selected()
+
+    def _selected_row(self):
+        bid=str(self.block_combo.currentData() or "")
+        return next((dict(x) for x in self._blocks if str(x.get("id") or "")==bid),None)
+
+    def _set_combo_value(self, combo, value):
+        i=combo.findData(str(value or "")); combo.setCurrentIndex(max(0,i))
+
+    def _load_selected(self,*_):
+        row=self._selected_row(); self._current_id=str(row.get("id") or "") if row else ""
+        if not row:
+            self.target_view.set_box([]); self.source_view.set_box([]); self.text.clear(); self.font.clear(); self.font_size.setValue(0); self.columns.setValue(0); self.line_spacing.setValue(-1.0)
+            self._set_combo_value(self.orientation,"auto"); self._set_combo_value(self.break_mode,"smart"); self._set_combo_value(self.layout_mode,"smart_scaling"); self.ocr_status.setText("新建：请在 TARGET 上拖框"); return
+        tb=list(row.get("target_bbox") or []); sb=list(row.get("source_bbox") or [])
+        self.target_view.set_box(tb); self.source_view.set_box(sb); self.text.setPlainText(str(row.get("render_text") or row.get("ocr_text") or "")); self.font.setText(str(row.get("font_path") or "")); self.font_size.setValue(int(row.get("font_size") or 0)); self.columns.setValue(int(row.get("columns") or 0))
+        spacing=row.get("line_spacing_ratio"); self.line_spacing.setValue(-1.0 if spacing is None else float(spacing)); self._set_combo_value(self.orientation,row.get("orientation") or "auto"); self._set_combo_value(self.break_mode,row.get("line_break_mode") or "smart"); self._set_combo_value(self.layout_mode,row.get("layout_mode") or "smart_scaling")
+        conf=float(row.get("confidence") or 0.0); self.ocr_status.setText(f"OCR 置信度 {conf:.2f}" if conf else "可重新 OCR")
+
+    def _target_selection_changed(self,bbox):
+        if bbox and len(bbox)==4:
+            try: self.source_view.set_box(map_target_bbox_to_source(self.project,list(bbox)))
+            except Exception: self.source_view.set_box([])
+            self.ocr_status.setText("选框已更新 · 可重新 OCR")
+
+    def _current_style(self):
+        return {
+            "id":self._current_id,"render_text":self.text.toPlainText(),"orientation":self.orientation.currentData() or "auto",
+            "line_break_mode":self.break_mode.currentData() or "smart","layout_mode":self.layout_mode.currentData() or "smart_scaling",
+            "font_path":self.font.text().strip(),"font_size":int(self.font_size.value()),"columns":int(self.columns.value()),
+            "line_spacing_ratio":None if float(self.line_spacing.value())<0 else float(self.line_spacing.value()),
+        }
+
+    def _rerun_ocr(self):
+        bbox=self.target_view.box()
+        if len(bbox)!=4:
+            QMessageBox.information(self,"请先框选","请在右侧 TARGET 图上拖出要重新 OCR 的区域。"); return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            seed=self._selected_row() or self._current_style(); seed.update(self._current_style())
+            row=recognize_manual_ocr_block(self.project,self.source_path,self.target_path,bbox,self.config,existing=seed)
+            self._current_id=str(row.get("id") or ""); self.text.setPlainText(str(row.get("render_text") or row.get("ocr_text") or "")); self.source_view.set_box(list(row.get("source_bbox") or []))
+            # Keep the freshly detected TARGET polygons until save.
+            self._pending_ocr=row
+            serr=str(row.get("source_ocr_error") or ""); terr=str(row.get("target_ocr_error") or "")
+            if serr:
+                self.ocr_status.setText("SOURCE OCR 失败，可手动输入文字："+serr[:80])
+            else:
+                suffix="；TARGET 定位失败，将使用保守局部清字" if terr else ""
+                self.ocr_status.setText(f"重新 OCR 完成 · 置信度 {float(row.get('confidence') or 0):.2f}{suffix}")
+        except Exception as exc:
+            QMessageBox.critical(self,"人工 OCR 失败",str(exc))
+        finally: QApplication.restoreOverrideCursor()
+
+    def _save(self):
+        bbox=self.target_view.box(); text=self.text.toPlainText().strip()
+        if len(bbox)!=4:
+            QMessageBox.information(self,"缺少选框","请先在 TARGET 上框选文本区域。"); return
+        if not text:
+            QMessageBox.information(self,"缺少文字","OCR 结果为空时可以手动输入中文，再保存文本块。"); return
+        base=dict(getattr(self,"_pending_ocr",None) or self._selected_row() or {})
+        base.update(self._current_style()); base["target_bbox"]=list(bbox); base["source_bbox"]=map_target_bbox_to_source(self.project,list(bbox)); base["render_text"]=text; base.setdefault("ocr_text",text); base["review_kind"]="manual_ocr"; base["box_locked"]=True; base["manual_override"]=True
+        saved=upsert_ocr_block(self.page_dir,self.mode,base); self._current_id=str(saved.get("id") or ""); self.accept()
+
+    def _new(self):
+        self._current_id=""; self.block_combo.setCurrentIndex(0); self.target_view.set_box([]); self.source_view.set_box([]); self.text.clear(); self.ocr_status.setText("新建：请在 TARGET 上拖框")
+        if hasattr(self,"_pending_ocr"): delattr(self,"_pending_ocr")
+
+    def _delete(self):
+        bid=str(self.block_combo.currentData() or "")
+        if not bid: return
+        if QMessageBox.question(self,"删除 OCR 文本块","删除当前人工 OCR 文本块？") != QMessageBox.StandardButton.Yes: return
+        delete_ocr_block(self.page_dir,self.mode,bid); self._reload_combo(); self.ocr_status.setText("已删除，正在返回并重新合成"); self.accept()
+
+    def _pick_font(self):
+        start=str(Path(self.font.text()).expanduser().parent) if self.font.text().strip() else str(Path.home())
+        path,_=QFileDialog.getOpenFileName(self,"选择当前 OCR 文本块字体",start,"Fonts (*.ttf *.otf *.ttc);;All Files (*)")
+        if path: self.font.setText(path)
+
 def _bbox_iou(a: list[int] | tuple[int, int, int, int], b: list[int] | tuple[int, int, int, int]) -> float:
     if len(a) != 4 or len(b) != 4:
         return 0.0
@@ -1102,7 +1245,7 @@ class WorkbenchPage(QWidget):
         self.blur_guard=QCheckBox("低清文字保护：模糊时禁止直接贴像素"); self.blur_guard.setChecked(True)
         self.blur_guard.setToolTip("摄影模糊、反光或低分辨率旧版先做光照归一化/墨迹重建；精准蒙版模式完全不调用 OCR，不安全区域进入复核。")
         self.preserve_source_layout=QCheckBox("清晰旧中文版保留原字号/分列（推荐）"); self.preserve_source_layout.setChecked(True)
-        self.preserve_source_layout.setToolTip("精准蒙版始终保留旧中文版真实字号/分列/符号，并且完全不调用 OCR。需要 OCR 识别或重新排字时请改用智能混合/高清重排，或手动编辑。")
+        self.preserve_source_layout.setToolTip("精准蒙版始终保留旧中文版真实字号/分列/符号，并且完全不调用 OCR。需要 OCR 识别或重新排字时请改用精准蒙版+OCR / OCR重排，或手动编辑。")
         mode.layout.addWidget(self.publication_safety); mode.layout.addWidget(self.paired); mode.layout.addWidget(self.skip_ocr); mode.layout.addWidget(self.pixel_exact); mode.layout.addWidget(self.full_bubble_patch); mode.layout.addWidget(self.preserve_border); mode.layout.addWidget(self.blur_guard); mode.layout.addWidget(self.preserve_source_layout)
         photo_note=QLabel("当前策略：所有自动路径都以 TARGET 为唯一背景；白底和彩底都只清除日文文字并迁移 SOURCE 中文字形。SOURCE 的白纸、灰阶、肤色或旧背景 RGB 永远不会写进彩图。")
         photo_note.setObjectName("quiet"); photo_note.setWordWrap(True); mode.layout.addWidget(photo_note)
@@ -1183,8 +1326,11 @@ class WorkbenchPage(QWidget):
         self.reprocess_current.setToolTip("处理后的编辑区域也支持人工蒙版。点击后会重新跑当前页自动流程，并自动重新应用本页已有的人工强制迁移蒙版、人工补漏、清除蒙版、TARGET 擦除/恢复等编辑结果。")
         rl.addWidget(qa)
 
-        manual=Card("重排文字编辑 / 待补文字", "高清重排成功后的每个 Region 也可直接修改文字、断句、方向、字体、字号和列数；只重绘当前 Region。低置信候选仍保留接受/还原流程。")
-        self.manual_status=QLabel("当前页没有待复核气泡"); self.manual_status.setObjectName("hint"); self.manual_status.setWordWrap(True); manual.layout.addWidget(self.manual_status)
+        manual=Card("OCR 文本编辑 / 排版", "仅用于“精准蒙版+OCR”和“OCR重排”：可人工框选 ROI 重新 OCR，也可编辑已有自动 Region 的文字、字体、字号、方向、断句与排版。Direct / 纯精准蒙版 / Reveal 不读取这里的文本块。")
+        self.ocr_block_status=QLabel("人工 OCR 文本块：当前模式不可用"); self.ocr_block_status.setObjectName("quiet"); self.ocr_block_status.setWordWrap(True); manual.layout.addWidget(self.ocr_block_status)
+        ocr_actions=QHBoxLayout(); self.open_ocr_block_editor=QPushButton("人工 OCR / 编辑文本块…"); self.open_ocr_block_editor.setObjectName("softPrimary"); self.reset_ocr_blocks=QPushButton("清空人工 OCR")
+        ocr_actions.addWidget(self.open_ocr_block_editor,1); ocr_actions.addWidget(self.reset_ocr_blocks); manual.layout.addLayout(ocr_actions)
+        self.manual_status=QLabel("当前页没有待复核文字区域"); self.manual_status.setObjectName("hint"); self.manual_status.setWordWrap(True); manual.layout.addWidget(self.manual_status)
         self.manual_target=QComboBox(); manual.layout.addWidget(self.manual_target)
         self.manual_text=QPlainTextEdit(); self.manual_text.setPlaceholderText("可直接修改已自动重排成功的中文；保留换行时可手动插入换行符…"); self.manual_text.setMaximumHeight(106); manual.layout.addWidget(self.manual_text)
         mrow=QHBoxLayout(); self.manual_orientation=QComboBox(); self.manual_orientation.addItem("自动排版","auto"); self.manual_orientation.addItem("竖排","vertical"); self.manual_orientation.addItem("横排","horizontal")
@@ -1220,7 +1366,7 @@ class WorkbenchPage(QWidget):
                        self.reset_clear_mask, self.force_transfer_mask, self.reset_force_transfer_mask,
                        self.target_layer_erase, self.reset_target_layer_erase, self.target_layer_restore, self.reset_target_layer_restore,
                        self.add_manual_effect, self.add_manual_effect_candidate, self.undo_manual_effect, self.manual_apply,
-                       self.candidate_accept, self.candidate_restore, self.manual_reset, self.manual_undo, self.manual_redo, self.manual_font_pick, self.reprocess_current]:
+                       self.candidate_accept, self.candidate_restore, self.manual_reset, self.manual_undo, self.manual_redo, self.manual_font_pick, self.open_ocr_block_editor, self.reset_ocr_blocks, self.reprocess_current]:
             button.setMinimumWidth(0)
             button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
@@ -1245,6 +1391,8 @@ class WorkbenchPage(QWidget):
         self.sr_pick.clicked.connect(self._choose_sr_model)
         self.manual_apply.clicked.connect(self._apply_manual_reletter)
         self.manual_reset.clicked.connect(self._reset_manual_reletter)
+        self.open_ocr_block_editor.clicked.connect(self._open_ocr_block_editor)
+        self.reset_ocr_blocks.clicked.connect(self._reset_ocr_blocks)
         self.manual_undo.clicked.connect(lambda: self._review_history_step("undo"))
         self.manual_redo.clicked.connect(lambda: self._review_history_step("redo"))
         self.manual_font_pick.clicked.connect(self._choose_manual_reletter_font); self.manual_font_preset.currentIndexChanged.connect(self._apply_manual_font_preset)
@@ -2047,6 +2195,72 @@ class WorkbenchPage(QWidget):
     def _manual_region_key(row: dict) -> str:
         return str(row.get("target_region_id") or row.get("target_unit_id") or row.get("target_bubble_id") or "")
 
+
+    def _ocr_editor_context(self):
+        ws=self._workspace()
+        if ws is None or ws.page_root is None or not ws.project_path or not ws.project_path.exists():
+            return None
+        try:
+            project=normalize_project(load_json(ws.project_path))
+        except Exception:
+            return None
+        mode=str(as_dict(project.get("meta")).get("transfer_mode") or self.window.state.config.transfer.mode or "").strip().lower()
+        if not is_ocr_edit_mode(mode):
+            return None
+        pair=self.window.current_pair()
+        if pair is None:
+            return None
+        source_path=ws.page_root/"source_original.png"
+        target_path=ws.page_root/"target_original.png"
+        if not source_path.exists(): source_path=Path(pair.source_path)
+        if not target_path.exists(): target_path=Path(pair.target_path)
+        return ws,project,mode,source_path,target_path
+
+    def _open_ocr_block_editor(self):
+        ctx=self._ocr_editor_context()
+        if ctx is None:
+            QMessageBox.information(self,"当前模式不可用","人工 OCR 文本块只属于“精准蒙版+OCR”和“OCR重排”。请先处理当前页并切换到其中一个 OCR 模式。")
+            return
+        ws,project,mode,source_path,target_path=ctx
+        dialog=OCRBlockEditorDialog(ws.page_root,source_path,target_path,project,self.window.state.config,mode,parent=self)
+        if dialog.exec()!=QDialog.DialogCode.Accepted:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            final=apply_ocr_edit_blocks(ws.page_root,project,self.window.state.config.model_copy(deep=True))
+            self.window.state.last_result_path=str(final); self._sync_reviewed_book_final(final)
+            self.current_view="result"
+            for b,k in self.view_buttons: b.setChecked(k=="result")
+            self.window.statusBar().showMessage("人工 OCR 文本块已保存并局部重绘。",4500)
+            self.refresh()
+        except Exception as exc:
+            QMessageBox.critical(self,"应用人工 OCR 失败",str(exc))
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def _reset_ocr_blocks(self):
+        ctx=self._ocr_editor_context()
+        if ctx is None:
+            return
+        ws,project,mode,_source,_target=ctx
+        rows=load_ocr_blocks(ws.page_root,mode)
+        if not rows:
+            self.window.statusBar().showMessage("当前页没有人工 OCR 文本块。",2500); return
+        if QMessageBox.question(self,"清空人工 OCR","清空当前页所有人工 OCR 文本块并恢复进入 OCR 编辑前的结果？") != QMessageBox.StandardButton.Yes:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            save_ocr_blocks(ws.page_root,mode,[])
+            final=reset_ocr_edit_blocks(ws.page_root,project,self.window.state.config.model_copy(deep=True))
+            self.window.state.last_result_path=str(final); self._sync_reviewed_book_final(final)
+            self.current_view="result"
+            for b,k in self.view_buttons: b.setChecked(k=="result")
+            self.window.statusBar().showMessage("已清空人工 OCR 文本块。",3500); self.refresh()
+        except Exception as exc:
+            QMessageBox.critical(self,"清空人工 OCR 失败",str(exc))
+        finally:
+            QApplication.restoreOverrideCursor()
+
     def _manual_selection_changed(self, *_args):
         queue=self._manual_queue(); idx=self.manual_target.currentIndex()
         if idx < 0 or idx >= len(queue):
@@ -2287,6 +2501,17 @@ class WorkbenchPage(QWidget):
         self.page_counter.setText(f"{idx+1} / {total}")
         self.prev_page.setEnabled(idx>0); self.next_page.setEnabled(idx<total-1)
         page_root=ws.page_root if ws else None
+        current_mode=str(((ws.meta or {}).get("transfer_mode") if ws is not None else "") or self.window.state.config.transfer.mode or "").strip().lower()
+        ocr_editor_enabled=bool(page_root and is_ocr_edit_mode(current_mode))
+        if hasattr(self,"open_ocr_block_editor"):
+            self.open_ocr_block_editor.setEnabled(ocr_editor_enabled)
+            rows=load_ocr_blocks(page_root,current_mode) if ocr_editor_enabled else []
+            self.reset_ocr_blocks.setEnabled(bool(rows))
+            if ocr_editor_enabled:
+                scope_label="精准蒙版+OCR" if ocr_edit_scope(current_mode)=="mask_ocr" else "OCR重排"
+                self.ocr_block_status.setText(f"{scope_label} · 人工 OCR 文本块 {len(rows)} 个 · 仅影响当前 OCR 流程")
+            else:
+                self.ocr_block_status.setText("人工 OCR 文本块仅在“精准蒙版+OCR / OCR重排”可用；其他模式完全隔离。")
         if page_root is not None and hasattr(self, "target_erase_mode"):
             settings_path = page_root / "target_layer_erase_settings.json"
             if settings_path.exists():
@@ -2372,7 +2597,7 @@ class WorkbenchPage(QWidget):
             key=self._manual_region_key(row) or "待复核区域"
             tid=str(row.get("target_bubble_id", "")); sides=str(row.get("source_edge_sides", "")); candidate=bool(row.get("candidate_applied",False)); reason=str(row.get("reason", "")); kind=str(row.get("review_kind") or "")
             if kind=="reletter_auto":
-                state="已自动高清重排 · 可直接编辑"
+                state="已自动 OCR重排 · 可直接编辑"
                 has_auto_reletter=True
                 label=f"{key} · {state}"
             elif reason=="photographed_text_without_ocr_reletter":
@@ -2387,7 +2612,7 @@ class WorkbenchPage(QWidget):
             if mi>=0: self.manual_target.setCurrentIndex(mi)
         self.manual_target.blockSignals(False)
         if queue:
-            self.manual_status.setText((f"当前页 {len(queue)} 个高清重排 Region 均可人工修改；修改只重绘当前 Region。" if has_auto_reletter else f"发现 {len(queue)} 个待复核区域；默认先给中文候选。可接受、重新编辑或还原日文。"))
+            self.manual_status.setText((f"当前页 {len(queue)} 个 OCR重排 Region 均可人工修改；修改只重绘当前 Region。" if has_auto_reletter else f"发现 {len(queue)} 个待复核区域；默认先给中文候选。可接受、重新编辑或还原日文。"))
         else:
             self.manual_status.setText("当前页没有可编辑/待复核文字区域")
         enabled=bool(queue)
@@ -2859,8 +3084,12 @@ class StudioWindow(QMainWindow):
             self.load_page_marks()
             warning = f" · 跳过/警告 {len(session.warnings)}" if session.warnings else ""
             self.statusBar().showMessage(f"已恢复 {len(session.pages)} 页已有结果{warning}。可直接继续页面检查或进入替换工作台人工补漏。", 8000)
-            self.project._set_project_files_expanded(False)
+            # Do not collapse 项目文件 while the restored page/pair state is still
+            # being applied. First finish refresh so page rows/thumbnails visibly
+            # settle, then collapse on the next event-loop turn.
             self.refresh_all()
+            if self.state.pairs:
+                QTimer.singleShot(120, lambda: self.project._set_project_files_expanded(False))
         except Exception as exc:
             QMessageBox.critical(self, "读取已有结果失败", str(exc))
         finally:
@@ -2928,6 +3157,10 @@ class StudioWindow(QMainWindow):
         if pair is None:
             QMessageBox.information(self, "没有页面", "请先完成页面配对。"); return
         mark = self.page_mark_for_pair(pair)
+        # The worker must receive exactly the mode currently visible in the UI.
+        # Restored sessions can otherwise retain an older config snapshot until
+        # another control emits a signal.
+        self.project._sync_config()
         self._start_worker(PipelineWorker(
             config=self.state.config.model_copy(deep=True), pair=pair,
             page_mark=mark.to_dict(), output_dir=self._default_output(),
@@ -2950,6 +3183,8 @@ class StudioWindow(QMainWindow):
         if not self.state.pairs:
             QMessageBox.information(self, "没有可处理页面", "没有找到可配对的页面。"); return
 
+        # Flush the current mode/settings into the book worker snapshot too.
+        self.project._sync_config()
         worker_cfg = self.state.config.model_copy(deep=True)
         worker_cfg.batch.resume = bool(resume)
         worker_cfg.batch.skip_completed = bool(resume)

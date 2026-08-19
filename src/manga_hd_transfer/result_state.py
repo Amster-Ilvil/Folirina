@@ -271,6 +271,18 @@ def invalidate_manual_review_state(page_dir: str | Path) -> None:
             (page_dir / name).unlink(missing_ok=True)
         except OSError:
             pass
+    # OCR editor blocks are durable user data, but their cached base/render state
+    # belongs to the previous automatic result. Keep blocks.json and invalidate
+    # only derived images/metadata so a fresh OCR run cannot inherit old shadows.
+    ocr_root = page_dir / "ocr_edit"
+    if ocr_root.exists():
+        for scope in ("mask_ocr", "ocr_reletter"):
+            scope_dir = ocr_root / scope
+            for name in ("base.png", "base_state.json", "render_state.json", "final.png"):
+                try:
+                    (scope_dir / name).unlink(missing_ok=True)
+                except OSError:
+                    pass
 
 
 def _file_sha256(path: Path) -> str:

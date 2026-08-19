@@ -36,6 +36,73 @@ def _noop_cancel(_stage: str) -> None:
     return None
 
 
+def _bbox_intersection_ratio(inner: tuple[int, int, int, int], outer: tuple[int, int, int, int]) -> float:
+    """Return how much of *outer* is covered by *inner*.
+
+    Target-driven OCR uses this to detect a truncated independently-detected
+    SOURCE text subregion.  The TARGET projection is the expected full text
+    envelope; a matched SOURCE subregion that covers only a small fraction of
+    it must not be allowed to crop away glyphs.
+    """
+    ax0, ay0, ax1, ay1 = [int(v) for v in inner]
+    bx0, by0, bx1, by1 = [int(v) for v in outer]
+    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+    inter = max(0, ix1 - ix0) * max(0, iy1 - iy0)
+    area = max(1, (bx1 - bx0) * (by1 - by0))
+    return float(inter) / float(area)
+
+
+def _clamp_bbox_to_image(box: tuple[int, int, int, int], shape: tuple[int, int]) -> tuple[int, int, int, int]:
+    h, w = [int(v) for v in shape]
+    x0, y0, x1, y1 = [int(v) for v in box]
+    x0, x1 = sorted((max(0, min(w, x0)), max(0, min(w, x1))))
+    y0, y1 = sorted((max(0, min(h, y0)), max(0, min(h, y1))))
+    return x0, y0, x1, y1
+
+
+def _recover_source_crop_bbox(
+    matched_bbox: tuple[int, int, int, int] | None,
+    projected_bbox: tuple[int, int, int, int],
+    source_bubble_bbox: tuple[int, int, int, int],
+    source_shape: tuple[int, int],
+) -> tuple[tuple[int, int, int, int], bool, float]:
+    """Choose a complete SOURCE OCR crop for a TARGET-driven text region.
+
+    Independent SOURCE text-region detection is useful when accurate, but on
+    manga it can stop at the first few vertical glyphs.  When that happens the
+    old Reletter path OCRs a visibly truncated crop even though TARGET and the
+    paired SOURCE bubble already provide a complete geometry envelope.
+
+    The projected TARGET region therefore acts as the completion authority.
+    A matched SOURCE region is retained only when it covers at least 78% of the
+    projected envelope.  Otherwise we recover to the projection, lightly padded
+    and bounded to the paired SOURCE bubble.
+    """
+    px0, py0, px1, py1 = [int(v) for v in projected_bbox]
+    cover = 1.0
+    if matched_bbox is not None:
+        cover = _bbox_intersection_ratio(tuple(int(v) for v in matched_bbox), projected_bbox)
+        if cover >= 0.78:
+            return _clamp_bbox_to_image(tuple(int(v) for v in matched_bbox), source_shape), False, cover
+
+    # Recovery path: target-projected geometry plus a small text-safe pad.
+    pw, ph = max(1, px1 - px0), max(1, py1 - py0)
+    pad_x = max(4, int(round(pw * 0.035)))
+    pad_y = max(4, int(round(ph * 0.035)))
+    bx0, by0, bx1, by1 = [int(round(v)) for v in source_bubble_bbox]
+    # Allow a tiny margin outside the detected bubble because detector polygons
+    # often stop exactly on the outermost antialiased glyph/container edge.
+    bubble_pad_x = max(3, int(round(max(1, bx1 - bx0) * 0.025)))
+    bubble_pad_y = max(3, int(round(max(1, by1 - by0) * 0.025)))
+    rx0 = max(bx0 - bubble_pad_x, px0 - pad_x)
+    ry0 = max(by0 - bubble_pad_y, py0 - pad_y)
+    rx1 = min(bx1 + bubble_pad_x, px1 + pad_x)
+    ry1 = min(by1 + bubble_pad_y, py1 + pad_y)
+    recovered = _clamp_bbox_to_image((rx0, ry0, rx1, ry1), source_shape)
+    return recovered, matched_bbox is not None, cover
+
+
 class ReletterExecutor:
     """Execute reletter OCR without owning page orchestration or rendering."""
 
@@ -108,20 +175,33 @@ class ReletterExecutor:
             for region in regions:
                 self.cancel_check("reletter_source_region_ocr")
                 matched_source_region = source_region_map.get(str(region.id))
-                source_crop_route = "normalized_target_projection"
-                if matched_source_region is not None:
-                    sx0, sy0, sx1, sy1 = [int(v) for v in matched_source_region.bbox]
+                projected_bbox = normalized_map_bbox(
+                    region.bbox, tb.bbox, sb.bbox, (sh, sw)
+                )
+                matched_bbox = (
+                    tuple(int(v) for v in matched_source_region.bbox)
+                    if matched_source_region is not None else None
+                )
+                (sx0, sy0, sx1, sy1), recovered_from_truncation, source_projection_coverage = _recover_source_crop_bbox(
+                    matched_bbox, tuple(int(v) for v in projected_bbox), tuple(int(round(v)) for v in sb.bbox), (sh, sw)
+                )
+                if recovered_from_truncation:
+                    source_crop_route = "target_projection_recovered_truncated_source_region"
+                elif matched_source_region is not None:
                     source_crop_route = "paired_source_subregion"
                 else:
-                    sx0, sy0, sx1, sy1 = normalized_map_bbox(
-                        region.bbox, tb.bbox, sb.bbox, (sh, sw)
-                    )
+                    source_crop_route = "normalized_target_projection"
                 if sx1 - sx0 < 4 or sy1 - sy0 < 4:
                     continue
 
                 crop = source[sy0:sy1, sx0:sx1].copy()
                 local_mask = None
-                if matched_source_region is not None and getattr(matched_source_region, "text_mask", None) is not None:
+                # A recovered crop must not reuse the truncated SOURCE text mask;
+                # doing so would whiten the newly recovered lower/right glyphs
+                # before OCR sees them.  The paired bubble mask remains available
+                # below as a broad, safe container constraint.
+                if (not recovered_from_truncation and matched_source_region is not None
+                        and getattr(matched_source_region, "text_mask", None) is not None):
                     sm = matched_source_region.text_mask
                     if sm.shape[:2] == source.shape[:2]:
                         local_mask = sm[sy0:sy1, sx0:sx1]
@@ -206,6 +286,9 @@ class ReletterExecutor:
                             "paired_target_id": tb.id,
                             "source_region_bbox": [sx0, sy0, sx1, sy1],
                             "source_crop_route": source_crop_route,
+                            "source_projected_bbox": [int(v) for v in projected_bbox],
+                            "source_projection_coverage": float(source_projection_coverage),
+                            "source_crop_recovered": bool(recovered_from_truncation),
                             "orientation_hint": orientation,
                             "source_layout_profile": layout_profile,
                             "ocr_normalization": dict(ocr_norm_diag),
@@ -250,6 +333,9 @@ class ReletterExecutor:
                         "component_count": region.component_count,
                         "status": "recognized",
                         "source_crop_route": source_crop_route,
+                        "source_projected_bbox": [int(v) for v in projected_bbox],
+                        "source_projection_coverage": float(source_projection_coverage),
+                        "source_crop_recovered": bool(recovered_from_truncation),
                         "ocr_normalization": dict(ocr_norm_diag),
                         "ocr_route": ocr_route,
                         "source_region_bbox": (

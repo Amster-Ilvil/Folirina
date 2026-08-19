@@ -121,7 +121,7 @@ class ModelPage(QWidget):
         self.pipeline_note.setObjectName("quiet"); self.pipeline_note.setWordWrap(True); pipeline.layout.addWidget(self.pipeline_note)
         root.addWidget(pipeline)
 
-        self.ocr = self._choice_card("OCR", "只负责识别文字内容，不负责页面配准，也不取代 Koharu 布局。仅 Auto / 智能混合 / 高清重排可能调用；安全的视觉路线会自动跳过 OCR。SOURCE 与 TARGET 可单独覆盖。", [
+        self.ocr = self._choice_card("OCR", "只负责识别文字内容，不负责页面配准，也不取代 Koharu 布局。仅 Auto / 精准蒙版+OCR / OCR重排可能调用；安全的视觉路线会自动跳过 OCR。SOURCE 与 TARGET 可单独覆盖。", [
             ("Apple Live Text（推荐）", "apple", "系统 Vision；无需下载本地模型"),
             ("Apple 快捷指令", "apple_shortcut", "直接调用 ExtractText / 从图像中提取文字"),
             ("PaddleOCR v6 Medium", "paddle_v6_medium", "传统 detection + recognition · 质量优先"),
@@ -191,8 +191,8 @@ class ModelPage(QWidget):
         top_cards.setColumnStretch(0, 1); top_cards.setColumnStretch(1, 1)
         root.addLayout(top_cards)
 
-        self._ocr_card_subtitle_enabled = "OCR 只识字，不决定页面布局；Koharu 先给出布局/保护语义。仅 Auto / 智能混合 / 高清重排按需要调用 OCR，SOURCE 与 TARGET 可单独覆盖。"
-        self._ocr_card_subtitle_disabled = "当前迁移方式是 0 OCR 路线：OCR 选项已锁定，历史 OCR 配置不会参与处理，也不会触发 OCR 模型预准备/下载。切回 Auto / 智能混合 / 高清重排后恢复。"
+        self._ocr_card_subtitle_enabled = "OCR 只识字，不决定页面布局；Koharu 先给出布局/保护语义。仅 Auto / 精准蒙版+OCR / OCR重排按需要调用 OCR，SOURCE 与 TARGET 可单独覆盖。"
+        self._ocr_card_subtitle_disabled = "当前迁移方式是 0 OCR 路线：OCR 选项已锁定，历史 OCR 配置不会参与处理，也不会触发 OCR 模型预准备/下载。切回 Auto / 精准蒙版+OCR / OCR重排后恢复。"
         self._ocr_settings_subtitle_enabled = "不知道选哪一个时：普通漫画优先 Apple Live Text 或 PaddleOCR v6 Medium；本机跑不了模型时直接切到“外部 OCR JSON / MD”。"
         self._ocr_settings_subtitle_disabled = "当前迁移方式不使用 OCR：OCR 回填、SOURCE/TARGET 覆盖与 48px 回退均锁定；原有选择只保留配置，不会加载/下载 OCR，切回 OCR 模式后自动恢复。"
         settings = Card("OCR 回填来源与下载设置", self._ocr_settings_subtitle_enabled)
