@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "folirina"
+version = "2.3.8"
+description = "Folirina is a cross-platform manga replacement and translation-transfer studio with registration, safe inpainting, lettering, and QA."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "Amster-Ilvil"}]
+dependencies = [
+  "numpy>=2.0",
+  "opencv-python-headless>=4.10",
+  "Pillow>=11.0",
+  "scipy>=1.13",
+  "pydantic>=2.8",
+  "typer>=0.12",
+]
+
+[project.optional-dependencies]
+ocr = ["paddleocr>=3.7,<4", "paddlepaddle>=3.0,<4"]
+semantic = ["paddlex>=3.3,<4"]
+apple = []
+lightglue = ["torch>=2.2", "kornia>=0.8", "lightglue @ git+https://github.com/cvg/LightGlue.git"]
+bubbles = ["ultralytics>=8.3"]
+rtdetr = ["torch>=2.2", "transformers>=4.48"]
+accel = ["torch>=2.2", "kornia>=0.8", "spandrel>=0.4", "ultralytics>=8.3"]
+review = []
+gui = ["PySide6>=6.7"]
+dev = ["pytest>=8.0", "pytest-cov>=5.0"]
+
+[project.scripts]
+folirina = "manga_hd_transfer.cli:app"
+mhd-transfer = "manga_hd_transfer.cli:app"
+
+[project.gui-scripts]
+folirina-studio = "manga_hd_transfer.launcher:main"
+mhd-transfer-studio = "manga_hd_transfer.launcher:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-ra"
