@@ -6,6 +6,9 @@ __pycache__/
 htmlcov/
 dist/
 build/
+package/
+dmg-stage/
+*.spec
 *.egg-info/
 outputs/
 models/
@@ -19,4 +22,6 @@ results-*/
 SakuraTsushin_*/
 *.zip
 *.app/
+*.dmg
 SHA256SUMS.txt
+BUILD-INFO.txt
