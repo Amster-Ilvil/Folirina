@@ -4,7 +4,7 @@
 
 <h1 align="center">Folirina</h1>
 
-<p align="center">面向漫画本地化与重制流程的桌面文字迁移工具，支持页面配准、文字区域迁移、清理、重排、人工复核与多平台发布。</p>
+<p align="center">面向漫画本地化与重制流程的桌面文字迁移工具，支持页面配准、文字区域迁移、清理、重排、人工复核。</p>
 
 <p align="center">
   <img alt="macOS" src="https://img.shields.io/badge/macOS-Apple%20Silicon%20%2F%20Intel-black?logo=apple">
