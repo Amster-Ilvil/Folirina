@@ -16,7 +16,7 @@
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-MIT-d76aa5"></a>
 </p>
 
-> 本地处理 · 页面配准 · 直接贴图 / 精准蒙版 / 整页对齐显中文 · OCR 与模型中心 · 人工补漏 · 可恢复编辑 · 批量处理 · Windows / macOS / Linux
+> 本地处理 · 页面配准 · 直接贴图 / 精准蒙版 / 整页对齐显中文 · OCR 与模型中心 · 人工补漏 · 可恢复编辑 · 批量处理 ·
 
 ## 下载
 
