@@ -20,3 +20,8 @@ SakuraTsushin_*/
 *.zip
 *.app/
 SHA256SUMS.txt
+
+# Reconstructed release runtime / package outputs
+vendor/
+package/
+*.spec
