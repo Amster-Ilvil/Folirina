@@ -13,14 +13,14 @@
 
 Folirina 的目标不是“重新翻译漫画”，而是解决另一类更实际的问题：
 
-- 你已经有一套低清或较旧的中文汉化版本；
+- 已经有一套低清或较旧的中文汉化版本；
 - 同时拥有同一作品的高清日文原图；
 - 希望尽可能保留现有中文译文、字形和气泡内容；
-- 又不想因为简单缩放、OCR 重排或整块覆盖而破坏高清原图的人物、网点、彩色背景和气泡边缘。
+- 又不希望因为简单缩放、OCR 重排或整块覆盖而破坏高清原图的人物、网点、彩色背景和气泡边缘。
 
-Folirina 会先建立 SOURCE 与 TARGET 的页面对应关系和几何坐标，再根据所选模式决定是直接迁移原中文像素、使用精准蒙版、进行整页透明显中文，还是通过 OCR 重排补漏。
+Folirina 会先建立 SOURCE 与 TARGET 的页面对应关系和几何坐标，再根据所选模式决定是直接迁移原中文像素、使用精准蒙版、进行整页对齐显中文，还是通过 OCR 重排补漏。
 
-### SOURCE 与 TARGET
+### SOURCE / TARGET / OUTPUT
 
 - **SOURCE**：已有中文版本，通常分辨率较低，但中文译文已经存在。
 - **TARGET**：高清日文母版，是最终画面、人物、网点、背景和线条的视觉权威。
@@ -28,27 +28,46 @@ Folirina 会先建立 SOURCE 与 TARGET 的页面对应关系和几何坐标，�
 
 ---
 
-## 2. 核心能力
+## 2. 设计目标
+
+Folirina 重点解决以下问题：
+
+- 尽可能保留既有中文版本中的原始字形；
+- 不把“识别文字”和“迁移像素”强行混成一条路线；
+- 对人物、背景、照片、彩色区域和气泡边缘保持保守策略；
+- 在不同处理模式之间建立明确边界，减少串线；
+- 支持整册处理、断点续跑和页面级人工复核；
+- 对自动化无法可靠处理的页面明确交给 QA 和人工处理；
+- 保持 GUI 与 CLI 使用同一套核心处理逻辑；
+- 允许逐步接入不同的 OCR、布局检测、气泡检测和配准后端。
+
+Folirina 的核心原则是：
+
+> **TARGET 决定最终画面，SOURCE 提供需要迁移的中文内容。**
+
+---
+
+## 3. 核心能力
 
 Folirina 当前包含一套完整的漫画迁移流水线：
 
 - **整册页面配对**：根据页序、图像特征和配置对 SOURCE / TARGET 页面进行匹配。
-- **几何配准**：支持 Auto、OpenCV、LightGlue、LoFTR 等路线，把中文版本映射到高清母版坐标系。
-- **视觉布局证据**：可使用气泡、文字、SFX、页面结构等视觉证据约束自动迁移区域。
-- **多种迁移模式**：Direct、精准蒙版、整页显中文、Hybrid、高清重排彼此隔离。
-- **0 OCR 原字迁移**：Direct 与精准蒙版可以完全不依赖 OCR，直接保存原中文像素形态。
+- **几何配准**：支持 Auto、OpenCV、LightGlue、LoFTR 等路线。
+- **视觉布局证据**：可利用气泡、文字、SFX、页面结构等视觉信息约束自动处理区域。
+- **多种迁移模式**：Direct、精准蒙版、整页对齐显中文、Hybrid、高清重排彼此隔离。
+- **0 OCR 原字迁移**：Direct 与精准蒙版可以完全不依赖 OCR，直接保留原中文像素形态。
 - **OCR 补漏与重排**：Hybrid / Reletter 可在需要时识别文本并重新排版。
 - **人物与背景保护**：优先保护 TARGET 的人物、彩色区域、网点和非文字画面。
-- **人工复核**：页面级工作区、手工蒙版、恢复/擦除、补漏与重新应用复核结果。
-- **断点续跑**：整册处理中断后可继续，避免无意义地从第一页重新计算。
-- **模式隔离**：不同处理模式拥有独立运行契约和产物所有权，减少“选了 A 却跑到 B”的串线问题。
-- **QA 与出版阻断**：处理完成后生成质量检查信息，对高风险页面进行人工复核提示。
-- **工作区清理**：可删除可重复生成的中间诊断文件，同时保留人工编辑所需内容。
-- **跨平台桌面 GUI 与 CLI**：既可以图形界面操作，也可以脚本化批处理。
+- **人工复核**：支持页面级工作区、手工蒙版、恢复/擦除、补漏与重新应用结果。
+- **断点续跑**：整册处理中断后可继续，避免从第一页重新计算。
+- **模式隔离**：不同处理模式拥有独立能力契约和产物所有权。
+- **QA 与出版阻断**：高风险页面可以被标记为必须人工复核。
+- **工作区清理**：可删除能够重新生成的中间诊断文件，同时尽量保留人工编辑所需内容。
+- **跨平台 GUI 与 CLI**：既可以图形界面操作，也可以脚本化批处理。
 
 ---
 
-## 3. 处理模式
+## 4. 处理模式
 
 Folirina 当前 GUI 主流程提供 5 个活动模式。
 
@@ -56,21 +75,30 @@ Folirina 当前 GUI 主流程提供 5 个活动模式。
 |---|---|---:|---|---|
 | 直接贴图 | `direct_patch` | 否 | 中日版气泡和版式高度一致 | SOURCE 在上、TARGET 在下，仅迁移安全的气泡内部中文像素 |
 | 精准蒙版 | `mask_replace` | 否 | 希望最大限度保留原中文字形，同时严格保护边缘 | 基于配准、差异和视觉区域生成精准迁移蒙版 |
-| 整页对齐显中文 | `aligned_overlay_reveal` | 不用于重排正文 | SOURCE/TARGET 整页结构高度一致 | 对齐两页后在受控区域“挖洞/显露”中文内容，并进行画面保护 |
-| 智能组合 | `hybrid` | 是 | 大部分区域可原字迁移，少量区域需要 OCR 补漏 | 原字迁移优先，必要时进入 OCR + Reletter 补漏 |
+| 整页对齐显中文 | `aligned_overlay_reveal` | 不用于正文重排 | SOURCE / TARGET 整页结构高度一致 | 对齐两页后在受控区域显露中文内容，并保护 TARGET 画面 |
+| 智能组合 | `hybrid` | 是 | 大部分区域可原字迁移，少量区域需要 OCR 补漏 | 原字迁移优先，必要时进入 OCR + Reletter |
 | 高清重排 | `reletter` | 是 | 旧中文字质较差、需要重新排字 | OCR 获取文字，再按高清目标区域重新排版 |
 
-### 3.1 直接贴图 `direct_patch`
+### 4.1 直接贴图 `direct_patch`
 
 特点：
 
 - 不依赖 OCR；
 - 优先保留 SOURCE 中现成中文字形；
 - 适用于气泡内部形状高度一致的页面；
-- 对候选区域进行安全约束，避免整块贴图覆盖人物或复杂背景；
-- 主要产物包括 `direct_patch_layer.png`、`direct_patch_regions.png`、`direct_patch.json` 等。
+- 对候选区域进行安全约束；
+- 避免整块贴图覆盖人物或复杂背景；
+- 适合结构几乎一致的中日版本。
 
-### 3.2 精准蒙版 `mask_replace`
+主要产物通常包括：
+
+```text
+direct_patch_layer.png
+direct_patch_regions.png
+direct_patch.json
+```
+
+### 4.2 精准蒙版 `mask_replace`
 
 这是 Folirina 中最强调“原字保真”的路线之一。
 
@@ -78,35 +106,52 @@ Folirina 当前 GUI 主流程提供 5 个活动模式。
 
 - **0 OCR**；
 - 使用视觉候选、配准与蒙版完成原中文字迁移；
-- SOURCE 中文像素是迁移内容权威，TARGET 是背景与画面权威；
-- 重点避免破坏气泡边框、人物、照片和彩色区域；
+- SOURCE 中文像素是迁移内容权威；
+- TARGET 是背景与画面权威；
+- 重点保护气泡边框、人物、照片和彩色区域；
 - 支持 paired-diff 等精细视觉路线；
-- 主要产物包括 `mask_transfer_layer.png`、`mask_transfer_mask.png`、`mask_transfer.json` 等。
+- 适合希望尽量原样保留旧汉化文字的页面。
 
-### 3.3 整页对齐显中文 `aligned_overlay_reveal`
+主要产物通常包括：
+
+```text
+mask_transfer_layer.png
+mask_transfer_mask.png
+mask_transfer.json
+```
+
+### 4.3 整页对齐显中文 `aligned_overlay_reveal`
 
 适合 SOURCE 与 TARGET 几乎是同一版式、但需要更大范围对齐处理的场景。
 
 特点：
 
-- 先整页配准，再规划允许擦除/显露的区域；
+- 先整页配准，再规划允许处理的区域；
 - 通过 hole / erase / source-ink 等蒙版控制实际写入；
 - 不使用 OCR 去重新生成正文；
-- 可结合布局/存在性证据限制高风险区域；
-- 对彩色 TARGET 具有额外的画面保护逻辑；
-- 主要产物包括 `aligned_overlay_reveal_layer.png`、`aligned_overlay_reveal_mask.png`、`aligned_overlay_reveal_erase_mask.png` 等。
+- 可以结合布局或存在性证据限制高风险区域；
+- 对彩色 TARGET 使用额外画面保护逻辑；
+- 更适合两版图像结构高度一致的情况。
 
-### 3.4 智能组合 `hybrid`
+主要产物通常包括：
+
+```text
+aligned_overlay_reveal_layer.png
+aligned_overlay_reveal_mask.png
+aligned_overlay_reveal_erase_mask.png
+```
+
+### 4.4 智能组合 `hybrid`
 
 特点：
 
 - 原中文字迁移优先；
 - 允许 OCR；
-- 当视觉迁移不足时，才由 Hybrid 自己管理 Reletter 补漏；
-- 不允许随意跨到其他模式的旧产物；
+- 当视觉迁移不足时，再由 Hybrid 自己管理 Reletter 补漏；
+- 不允许随意消费其他模式的旧产物；
 - 适合整册自动化后再人工复核。
 
-### 3.5 高清重排 `reletter`
+### 4.5 高清重排 `reletter`
 
 特点：
 
@@ -116,20 +161,22 @@ Folirina 当前 GUI 主流程提供 5 个活动模式。
 - 适合 SOURCE 字体质量较差、无法直接保留原字的页面；
 - 提供人工 Reletter 编辑能力。
 
-### 3.6 兼容模式
+### 4.6 兼容模式
 
 代码仍保留：
 
-- `auto`
-- `transparent_bubble_reveal`
+```text
+auto
+transparent_bubble_reveal
+```
 
-它们属于兼容/旧路线，不是当前 GUI 的主要推荐入口。新项目建议优先明确选择上面的 5 个活动模式，以便获得更稳定的模式隔离和可预测行为。
+它们属于兼容/旧路线，不是当前 GUI 的主要推荐入口。新项目建议优先明确选择 5 个活动模式，以获得更稳定的模式隔离和可预测行为。
 
 ---
 
-## 4. 处理流程
+## 5. 一页漫画如何处理
 
-一页漫画通常会经过以下步骤：
+典型处理流程：
 
 ```text
 SOURCE 中文页 ─┐
@@ -153,20 +200,28 @@ TARGET 日文页 ─┘
       最终输出
 ```
 
-Folirina 的设计原则是：**共享底层几何能力，但隔离不同 Renderer 与人工复核状态。** 这样修改某一个模式时，不应悄悄改变另一个已经稳定的模式。
+Folirina 的架构原则是：
+
+**共享底层几何能力，但隔离不同 Renderer 与人工复核状态。**
+
+这样修改某一个模式时，不应悄悄改变另一个已经稳定的模式。
 
 ---
 
-## 5. 平台支持
+## 6. 平台支持
 
 ### macOS
+
+支持：
 
 - CPU
 - Apple Silicon MPS（可选）
 - Apple Live Text / 本地相关能力（视系统与配置而定）
-- LightGlue / 其他深度模型可按环境安装
+- LightGlue / 其他深度模型按需安装
 
 ### Windows
+
+支持：
 
 - CPU
 - NVIDIA CUDA（可选）
@@ -175,24 +230,26 @@ Folirina 的设计原则是：**共享底层几何能力，但隔离不同 Rende
 
 ### Linux
 
+支持：
+
 - CPU
 - NVIDIA CUDA（可选）
 - PaddleOCR（可选）
-- 适合 CLI、批处理和服务器环境
+- CLI、批处理和服务器环境
 
-基础图像处理依赖 OpenCV、NumPy、Pillow、SciPy 等；深度模型并不是启动 Folirina 的强制条件。
+基础图像处理依赖 OpenCV、NumPy、Pillow、SciPy 等。深度模型并不是启动 Folirina 的强制条件。
 
 ---
 
-## 6. 安装
+## 7. 安装
 
-### 6.1 环境要求
+### 7.1 环境要求
 
 - Python **3.11 或更高版本**
 - 建议使用虚拟环境
 - GUI 需要 PySide6
 
-### 6.2 从源码安装 GUI
+### 7.2 macOS / Linux
 
 ```bash
 git clone https://github.com/Amster-Ilvil/Folirina.git
@@ -205,7 +262,7 @@ python -m pip install --upgrade pip
 pip install -e ".[gui]"
 ```
 
-Windows PowerShell：
+### 7.3 Windows PowerShell
 
 ```powershell
 git clone https://github.com/Amster-Ilvil/Folirina.git
@@ -218,13 +275,15 @@ python -m pip install --upgrade pip
 pip install -e ".[gui]"
 ```
 
-启动 GUI：
+### 7.4 启动 GUI
+
+安装后：
 
 ```bash
 folirina-studio
 ```
 
-也可以在源码目录直接运行：
+也可以在源码目录运行：
 
 ```bash
 python run_gui.py
@@ -232,9 +291,9 @@ python run_gui.py
 
 ---
 
-## 7. 可选依赖
+## 8. 可选依赖
 
-`pyproject.toml` 将重型运行时拆成可选依赖，建议按实际需要安装，而不是一开始全部堆在同一个环境里。
+`pyproject.toml` 将较重的运行时拆成可选依赖，建议按实际需要安装。
 
 | Extra | 用途 |
 |---|---|
@@ -259,23 +318,23 @@ pip install -e ".[gui,lightglue]"
 pip install -e ".[gui,ocr]"
 ```
 
-Paddle OCR 与文档/版面运行时在 Folirina 中可以使用独立环境管理。遇到 Paddle 依赖冲突时，优先使用 GUI 的模型/运行时管理能力，而不是强行把所有 Paddle 组件安装到主 Python 环境。
+Paddle OCR 与文档/版面运行时可以使用独立环境管理。遇到 Paddle 依赖冲突时，优先使用 GUI 的模型/运行时管理能力，而不是强行把所有 Paddle 组件安装到主 Python 环境。
 
 ---
 
-## 8. GUI 推荐工作流
+## 9. GUI 推荐工作流
 
 ### 第一步：准备图片
 
-建议分别准备两个目录：
+建议准备两个目录：
 
 ```text
 book/
-├─ zh_source/      # 已有中文版本
+├─ zh_source/
 │  ├─ 001.png
 │  ├─ 002.png
 │  └─ ...
-└─ jp_target/      # 高清日文母版
+└─ jp_target/
    ├─ 001.png
    ├─ 002.png
    └─ ...
@@ -296,13 +355,13 @@ book/
 
 ### 第三步：选择处理模式
 
-优先按照目标选择：
+可以按照目标选择：
 
 - 想最大程度保留旧中文字：`mask_replace`
-- 气泡高度一致、希望最快直接迁移：`direct_patch`
-- 两张整页高度一致、需要透明显露：`aligned_overlay_reveal`
+- 气泡高度一致、希望直接迁移：`direct_patch`
+- 两张整页高度一致、希望对齐显露中文：`aligned_overlay_reveal`
 - 希望自动迁移并让 OCR 补漏：`hybrid`
-- 希望彻底重新排字：`reletter`
+- 希望重新排字：`reletter`
 
 ### 第四步：检查配准与模型
 
@@ -338,9 +397,9 @@ Folirina 支持断点续跑。默认批处理会尝试复用已经完成且配�
 
 ---
 
-## 9. 命令行使用
+## 10. 命令行使用
 
-安装后可使用：
+安装后：
 
 ```bash
 folirina --help
@@ -352,25 +411,25 @@ folirina --help
 mhd-transfer --help
 ```
 
-### 9.1 生成完整配置
+### 10.1 生成完整配置
 
 ```bash
 folirina init-config config.json
 ```
 
-之后：
+然后：
 
 ```bash
 folirina run ./zh_source ./jp_target ./output --config config.json
 ```
 
-### 9.2 只检查页面配对
+### 10.2 只检查页面配对
 
 ```bash
 folirina pair ./zh_source ./jp_target
 ```
 
-### 9.3 处理整册
+### 10.3 处理整册
 
 ```bash
 folirina run ./zh_source ./jp_target ./output \
@@ -387,8 +446,8 @@ mask_replace
 aligned_overlay_reveal
 hybrid
 reletter
-auto                       # legacy
-transparent_bubble_reveal  # legacy
+auto
+transparent_bubble_reveal
 ```
 
 设备：
@@ -417,23 +476,23 @@ sidecar
 none
 ```
 
-注意：是否真的允许 OCR，最终仍受当前模式契约限制。`direct_patch` 和 `mask_replace` 不会因为你在配置里选择了 OCR 就自动跨模式调用 OCR。
+是否真正允许 OCR，最终仍受当前模式契约限制。`direct_patch` 和 `mask_replace` 不会因为配置里选择了 OCR 就自动跨模式调用 OCR。
 
-### 9.4 禁用断点续跑
+### 10.4 禁用断点续跑
 
 ```bash
 folirina run ./zh_source ./jp_target ./output --no-resume
 ```
 
-### 9.5 检查运行环境
+### 10.5 检查运行环境
 
 ```bash
 folirina doctor
 ```
 
-会检查 OpenCV、SIFT、Paddle 运行时、LightGlue、Kornia、ImageMagick、Spandrel、Ultralytics、字体和设备状态等。
+用于检查 OpenCV、SIFT、Paddle 运行时、LightGlue、Kornia、ImageMagick、Spandrel、Ultralytics、字体和设备状态等。
 
-### 9.6 启动复核编辑器
+### 10.6 启动复核编辑器
 
 ```bash
 folirina review ./output
@@ -445,7 +504,7 @@ folirina review ./output
 127.0.0.1:8765
 ```
 
-如果明确需要远程访问，必须显式启用：
+如果明确需要远程访问：
 
 ```bash
 folirina review ./output --host 0.0.0.0 --allow-remote
@@ -453,21 +512,21 @@ folirina review ./output --host 0.0.0.0 --allow-remote
 
 远程绑定属于安全敏感操作，不建议在不可信网络中直接暴露。
 
-### 9.7 应用单页复核结果
+### 10.7 应用单页复核结果
 
 ```bash
 folirina apply-review ./output/pages/001
 ```
 
-### 9.8 清理工作区
+### 10.8 清理工作区
 
 ```bash
 folirina cleanup-workspace ./output
 ```
 
-该命令用于删除可重复生成的页面诊断数据，并尽量保留 GUI / 人工恢复所需文件。
+用于删除可重复生成的页面诊断数据，并尽量保留 GUI / 人工恢复所需文件。
 
-### 9.9 内置自检
+### 10.9 内置自检
 
 ```bash
 folirina selftest
@@ -475,7 +534,7 @@ folirina selftest
 
 用于运行离线合成出版流水线验收。
 
-### 9.10 架构隔离检查
+### 10.10 架构隔离检查
 
 ```bash
 folirina architecture-audit
@@ -491,9 +550,9 @@ folirina architecture-audit
 
 ---
 
-## 10. 输出目录
+## 11. 输出目录
 
-实际文件会根据模式和配置变化，但典型结构类似：
+实际文件会根据模式和配置变化，典型结构类似：
 
 ```text
 output/
@@ -519,11 +578,11 @@ output/
 - 人工蒙版：由复核界面生成并在后续应用中复用；
 - `final/`：整册最终页输出位置之一。
 
-不要依赖某个中间文件名作为长期 API。需要自动化集成时，优先读取 `project.json` 中的 artifacts / meta。
+不要依赖某个中间文件名作为长期 API。需要自动化集成时，优先读取 `project.json` 中的 `artifacts` / `meta`。
 
 ---
 
-## 11. 模式切换与旧结果
+## 12. 模式切换与旧结果
 
 Folirina 会尽量避免不同模式互相污染。
 
@@ -534,11 +593,11 @@ Folirina 会尽量避免不同模式互相污染。
 - 用户编辑内容会尽量归档到 `review_archive/<old>_to_<new>/`；
 - 新模式只允许消费自己契约中允许的子系统。
 
-这意味着：如果你曾经用 Mask 处理一页，之后切换到 Reletter，不应该因为目录中遗留 `mask_transfer_layer.png` 就偷偷继续使用旧 Mask 结果。
+例如：如果先用 Mask 处理一页，之后切换到 Reletter，不应该因为目录中遗留 `mask_transfer_layer.png` 就继续使用旧 Mask 结果。
 
 ---
 
-## 12. 断点续跑与缓存
+## 13. 断点续跑与缓存
 
 Folirina 的批处理支持 resume。
 
@@ -548,7 +607,7 @@ Folirina 的批处理支持 resume。
 - 配置发生真正相关变化时重新处理；
 - 不相关模式的参数变化不应让所有旧页面失效；
 - 中间阶段可以使用自己的缓存键；
-- 模型和模式发生实质变化时应重新计算对应阶段。
+- 模型和模式发生实质变化时重新计算对应阶段。
 
 如果怀疑缓存污染，可以：
 
@@ -559,7 +618,7 @@ Folirina 的批处理支持 resume。
 
 ---
 
-## 13. QA 与人工复核原则
+## 14. QA 与人工复核原则
 
 Folirina 的自动化目标是减少人工工作量，而不是声称任何漫画都可以 100% 无人值守。
 
@@ -578,70 +637,6 @@ Folirina 的自动化目标是减少人工工作量，而不是声称任何漫�
 
 ---
 
-## 14. 日志与故障排查
-
-Folirina 会在 GUI 启动前初始化应用日志，并捕获 Python / Qt 相关启动异常。
-
-默认日志位置：
-
-### macOS
-
-```text
-~/Library/Logs/Folirina/
-```
-
-### Windows
-
-```text
-%LOCALAPPDATA%\Folirina\logs\
-```
-
-### Linux
-
-```text
-$XDG_STATE_HOME/folirina/logs/
-```
-
-若未设置 `XDG_STATE_HOME`：
-
-```text
-~/.local/state/folirina/logs/
-```
-
-主要文件：
-
-```text
-folirina.log
-crash.log
-runtime_info.json
-```
-
-也可以通过环境变量覆盖日志目录：
-
-```text
-FOLIRINA_LOG_DIR
-```
-
-兼容：
-
-```text
-MHD_LOG_DIR
-```
-
-### 隐私提醒
-
-`runtime_info.json` 和错误日志可能记录：
-
-- Python 可执行文件路径；
-- 本机日志路径；
-- 系统与硬件信息；
-- 处理过程中涉及的本地文件路径；
-- 异常堆栈。
-
-因此，**在公开 Issue、论坛或 GitHub 上传日志前，请先检查其中是否包含用户名、本地目录名、作品文件名或其他不希望公开的信息。**
-
----
-
 ## 15. 仓库隐私与安全
 
 本仓库只应保存运行所需源码与公开文档，不应提交：
@@ -653,25 +648,20 @@ MHD_LOG_DIR
 - `.env`；
 - API Key / Token / 密码；
 - 私钥 / 证书；
-- 本机日志和 crash dump；
 - 带有个人绝对路径的运行时配置；
-- 打包 ZIP / `.app`。
+- 打包 ZIP / `.app`；
+- 其他只属于本机的临时文件或敏感数据。
 
-`.gitignore` 已对常见本地敏感文件、日志、模型、缓存、输出目录和打包产物进行拦截，但 `.gitignore` 不能替代提交前检查。
+`.gitignore` 已对常见本地敏感文件、模型、缓存、输出目录和打包产物进行拦截，但 `.gitignore` 不能替代提交前检查。
 
-推荐在发布前至少执行：
+发布前建议至少执行：
 
 ```bash
 git status
-```
-
-并检查：
-
-```bash
 git diff --cached
 ```
 
-如果 Token、密码或私钥曾经真正提交到 Git 历史中，仅删除当前文件并不足够：应立即撤销/轮换凭据，并清理 Git 历史。
+如果 Token、密码或私钥曾经真正提交到 Git 历史中，仅删除当前文件并不足够：应立即撤销或轮换凭据，并清理 Git 历史。
 
 ---
 
@@ -730,7 +720,7 @@ auto / cpu
 
 ### 为什么工作区很大
 
-图像处理会生成蒙版、图层、QA 和诊断文件。处理完成并确认无需进一步调试后，可运行：
+图像处理会生成蒙版、图层、QA 和诊断文件。处理完成并确认无需进一步调试后，可以运行：
 
 ```bash
 folirina cleanup-workspace ./output
@@ -750,7 +740,7 @@ src/manga_hd_transfer/
 
 ```text
 cli.py                         CLI 入口
-launcher.py                    GUI 启动与启动级日志
+launcher.py                    GUI 启动入口
 config.py                      全局配置模型
 pairing.py / page_pairing.py   页面配对
 registration.py                基础配准
@@ -768,12 +758,11 @@ workspace.py                   页面工作区解析
 workspace_cleanup.py           工作区清理
 runtime*.py                    设备与可选运行时
 model_downloads.py             模型下载管理
-app_logging.py                 全局日志与 crash 捕获
 selftest.py                    离线合成自检
 architecture_audit.py          架构/模式隔离检查
 ```
 
-`pipeline.py` 只负责组织主流程，具体职责逐步拆分到 `pipeline_*` 模块，目的是降低主 Pipeline 的耦合度，同时不随意重写已经稳定的 Direct / Mask / Reletter Renderer。
+`pipeline.py` 主要负责组织主流程，具体职责逐步拆分到 `pipeline_*` 模块，以降低主 Pipeline 的耦合度，同时避免随意重写已经稳定的 Direct / Mask / Reletter Renderer。
 
 ---
 
@@ -792,7 +781,7 @@ folirina architecture-audit
 pip install -e ".[dev]"
 ```
 
-如果当前分支包含 pytest 测试，可运行：
+如果当前分支包含 pytest 测试：
 
 ```bash
 python -m pytest
@@ -801,7 +790,7 @@ python -m pytest
 对图像算法的修改还应使用真实代表性页面做回归，重点比较：
 
 - 最终像素是否发生非预期变化；
-- 人物/彩色背景保护是否退化；
+- 人物或彩色背景保护是否退化；
 - 模式是否串线；
 - 旧项目是否仍能恢复；
 - GUI 与 CLI 的行为是否一致。
@@ -824,7 +813,7 @@ Folirina 使用 **MIT License**。
 
 ---
 
-## 21. 项目地址
+## 21. 项目地址与反馈
 
 GitHub：
 
@@ -832,7 +821,7 @@ GitHub：
 https://github.com/Amster-Ilvil/Folirina
 ```
 
-如果遇到问题，建议提交 Issue 时附上：
+提交 Issue 时建议提供：
 
 - Folirina 版本；
 - 操作系统与 Python 版本；
@@ -840,4 +829,4 @@ https://github.com/Amster-Ilvil/Folirina
 - 配准后端；
 - `folirina doctor` 的相关结果；
 - 可复现步骤；
-- **已去除私人路径和素材信息的日志片段**。
+- 必要且已经脱敏的截图或最小复现素材说明。
