@@ -1,22 +1,64 @@
+# Python bytecode / caches
 __pycache__/
 *.py[cod]
-.venv/
+*.so
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
+.coverage.*
 htmlcov/
-dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Packaging / build output
 build/
+dist/
 *.egg-info/
+
+# IDE / OS metadata
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+secrets*.json
+config.local*.json
+config_mac_*.json
+
+# Application logs / crash snapshots
+*.log
+logs/
+crash.log
+runtime_info.json
+run_trace.jsonl
+
+# Folirina local runtime data, models, caches and generated workspaces
 outputs/
 models/
-.DS_Store
-
-# Local/private runtime data and generated QA artifacts
-config_mac_*.json
-TEST_REPORT_*.md
+cache/
+.folirina/
+workspaces/
+pages/
+final/
 qa-*/
 results-*/
-SakuraTsushin_*/
+review_archive/
+
+# Generated reports / distributables
+TEST_REPORT_*.md
+SHA256SUMS.txt
 *.zip
 *.app/
-SHA256SUMS.txt
