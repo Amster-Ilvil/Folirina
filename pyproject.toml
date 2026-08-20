@@ -45,4 +45,4 @@ testpaths = ["tests"]
 addopts = "-ra"
 
 [tool.setuptools.package-data]
-manga_hd_transfer = ["*.png"]
+manga_hd_transfer = ["*.png", "*.icns"]
