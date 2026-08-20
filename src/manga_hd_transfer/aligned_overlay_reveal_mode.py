@@ -11,8 +11,10 @@ import numpy as np
 
 from .aligned_overlay_reveal_validator import validate_aligned_overlay_reveal
 from .aligned_overlay_reveal_core import AlignedOverlayPlan, AlignedOverlayRegion, AlignedOverlayResult
+from .bubbles import detect_target_colored_containers, detect_unseeded_white_containers
 from .config import AlignedOverlayRevealConfig, BubbleConfig
 from .models import BubbleInstance, RegistrationResult
+from .modes.aligned_overlay_reveal.container_detector import detect_text_barrier_containers
 from .pipeline_bubble_service import primary_bubbles_cached
 
 
@@ -100,6 +102,59 @@ def _mask_iou(a: np.ndarray, b: np.ndarray) -> float:
     return inter / union if union else 0.0
 
 
+def _mask_overlap_fraction(a: np.ndarray, b: np.ndarray) -> float:
+    inter = int(np.count_nonzero((a > 0) & (b > 0)))
+    denom = min(int(np.count_nonzero(a > 0)), int(np.count_nonzero(b > 0)))
+    return inter / denom if denom else 0.0
+
+
+def _collect_target_container_candidates(
+    target: np.ndarray,
+    bubble_cfg: BubbleConfig,
+    cfg: AlignedOverlayRevealConfig,
+    primary_candidates: Sequence[BubbleInstance] | None,
+) -> list[BubbleInstance]:
+    min_conf = float(getattr(cfg, "target_bubble_min_confidence", 0.70))
+    supplemental_min_conf = float(getattr(cfg, "target_container_min_confidence", 0.55))
+    dedupe_iou = float(getattr(cfg, "target_container_dedupe_iou", 0.60))
+    dedupe_cover = float(getattr(cfg, "target_container_dedupe_cover", 0.82))
+    out: list[BubbleInstance] = []
+
+    def _add(rows: Sequence[BubbleInstance], *, source: str) -> None:
+        for cand in rows:
+            conf = float(getattr(cand, "confidence", 0.0))
+            if conf < (min_conf if source == "primary" else supplemental_min_conf):
+                continue
+            mask = _bubble_mask_from_instance(cand, target.shape[:2])
+            if int(cv2.countNonZero(mask)) <= 0:
+                continue
+            dup = False
+            for old in out:
+                old_mask = _bubble_mask_from_instance(old, target.shape[:2])
+                if _mask_iou(mask, old_mask) >= dedupe_iou or _mask_overlap_fraction(mask, old_mask) >= dedupe_cover:
+                    dup = True
+                    break
+            if dup:
+                continue
+            meta = dict(getattr(cand, "meta", {}) or {})
+            meta["aligned_hole_candidate_source"] = source
+            out.append(BubbleInstance(
+                id=str(cand.id), polygon=list(cand.polygon), confidence=conf,
+                kind=str(getattr(cand, "kind", "bubble") or "bubble"),
+                block_ids=list(getattr(cand, "block_ids", []) or []),
+                mask=None if getattr(cand, "mask", None) is None else cand.mask.copy(),
+                safe_mask=None if getattr(cand, "safe_mask", None) is None else cand.safe_mask.copy(),
+                meta=meta,
+            ))
+
+    _add(list(primary_candidates or []), source="primary")
+    _add(detect_unseeded_white_containers(target, bubble_cfg, prefix="aligned-hole-white"), source="supplemental_white")
+    _add(detect_text_barrier_containers(target, cfg, existing=out), source="supplemental_text_barrier")
+    _add(detect_target_colored_containers(target, prefix="aligned-hole-color"), source="supplemental_colored")
+    out.sort(key=lambda b: (b.bbox[1], b.bbox[0]))
+    return out
+
+
 def _load_registration(page_dir: Path) -> Tuple[np.ndarray, Dict[str, Any]]:
     reg = _load_json(page_dir / ".cache" / "registration.json")["payload"]
     matrix = np.array(reg["matrix"], dtype=np.float32)
@@ -137,6 +192,66 @@ def _bubble_appearance(target: np.ndarray, mask: np.ndarray) -> Tuple[float, flo
     hsv = cv2.cvtColor(target, cv2.COLOR_BGR2HSV)
     idx = mask > 0
     return float(np.mean(gray[idx] >= 215)), float(np.mean(hsv[..., 1][idx]))
+
+
+def _registered_translation_evidence(
+    aligned_source: np.ndarray,
+    target: np.ndarray,
+    region_mask: np.ndarray,
+    cfg: AlignedOverlayRevealConfig,
+) -> dict[str, float | bool | str]:
+    """Require real SOURCE/TARGET ink change for geometry-only supplements.
+
+    Primary semantic bubble detections remain authoritative.  Supplemental white
+    geometry must additionally behave like translated text after page registration,
+    otherwise white clothes/panels/windows can become accidental SOURCE holes.
+    """
+    m=(region_mask>0).astype(np.uint8)*255
+    pixels=int(cv2.countNonZero(m))
+    if pixels<=0:
+        return {"passed":False,"reason":"empty_mask","change_score":0.0}
+    inner=cv2.erode(m,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(5,5)))
+    if cv2.countNonZero(inner)<24:
+        inner=m
+    sg=cv2.cvtColor(aligned_source,cv2.COLOR_BGR2GRAY) if aligned_source.ndim==3 else aligned_source
+    tg=cv2.cvtColor(target,cv2.COLOR_BGR2GRAY) if target.ndim==3 else target
+    thr=int(getattr(cfg,"supplemental_ink_threshold",190))
+    s=((sg<thr)&(inner>0)).astype(np.uint8)*255
+    t=((tg<thr)&(inner>0)).astype(np.uint8)*255
+    area=max(1,int(cv2.countNonZero(inner)))
+    sc=int(cv2.countNonZero(s)); tc=int(cv2.countNonZero(t))
+    sdens=float(sc/area); tdens=float(tc/area)
+    tol=max(1,int(getattr(cfg,"supplemental_ink_match_tolerance_px",2)))
+    k=cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(tol*2+1,tol*2+1))
+    sd=cv2.dilate(s,k); td=cv2.dilate(t,k)
+    smatch=float(np.count_nonzero((s>0)&(td>0))/max(1,sc)) if sc else 0.0
+    tmatch=float(np.count_nonzero((t>0)&(sd>0))/max(1,tc)) if tc else 0.0
+    identity=float(np.clip(0.5*(smatch+tmatch),0.0,1.0))
+    change=float(np.clip(1.0-identity,0.0,1.0))
+    min_sd=float(getattr(cfg,"supplemental_min_source_ink_density",0.012))
+    min_td=float(getattr(cfg,"supplemental_min_target_ink_density",0.008))
+    min_change=float(getattr(cfg,"supplemental_min_ink_change_score",0.12))
+    target_text_pixels=int(cv2.countNonZero(_target_jp_text_mask(target, m)))
+    source_text_pixels=int(cv2.countNonZero(_source_glyph_mask(aligned_source, m, colored=False)))
+    min_target_text=int(getattr(cfg,"supplemental_min_target_text_pixels",25))
+    min_source_text=int(getattr(cfg,"supplemental_min_source_text_pixels",25))
+    text_ok=bool(target_text_pixels>=min_target_text and source_text_pixels>=min_source_text)
+    passed=bool(sdens>=min_sd and tdens>=min_td and change>=min_change and text_ok)
+    if not text_ok:
+        reason="missing_text_components"
+    elif change<min_change or sdens<min_sd or tdens<min_td:
+        reason="insufficient_translation_change"
+    else:
+        reason="ok"
+    return {
+        "passed":passed,"reason":reason,
+        "source_ink_density":sdens,"target_ink_density":tdens,
+        "target_text_pixels":target_text_pixels,"source_text_pixels":source_text_pixels,
+        "min_target_text_pixels":min_target_text,"min_source_text_pixels":min_source_text,
+        "source_ink_match":smatch,"target_ink_match":tmatch,
+        "ink_identity_overlap":identity,"change_score":change,
+        "min_source_ink_density":min_sd,"min_target_ink_density":min_td,"min_change_score":min_change,
+    }
 
 
 def _filter_text_components(binary: np.ndarray, region_mask: np.ndarray, *, max_dim: int = 90) -> np.ndarray:
@@ -666,8 +781,8 @@ def _empty_production_result(
         full_raster_mask=empty.copy(),
         regions=[],
         diagnostics={
-            "engine": "aligned_hole_v2.2.2",
-            "contract": "target_upper_layer__bubble_holes__registered_cn_lower_layer",
+            "engine": "aligned_hole_v2.3.38",
+            "contract": "target_upper_layer__bubble_or_textbox_holes__registered_cn_lower_layer",
             "reason": reason,
         },
     )
@@ -738,11 +853,9 @@ def build_production_aligned_hole_result(
             stats=stats,
         )
 
-    min_conf = float(getattr(cfg, "target_bubble_min_confidence", 0.70))
-    candidates = [b for b in list(target_bubbles or []) if float(getattr(b, "confidence", 0.0)) >= min_conf]
-    candidates.sort(key=lambda b: (b.bbox[1], b.bbox[0]))
+    candidates = _collect_target_container_candidates(target, bubble_cfg, cfg, list(target_bubbles or []))
     if not candidates:
-        return _empty_production_result(source, target, registration, "no_target_bubble_candidates")
+        return _empty_production_result(source, target, registration, "no_target_container_candidates")
 
     cleaned_target = target.copy()
     lower_rgba = np.zeros((h, w, 4), dtype=np.uint8)
@@ -753,6 +866,8 @@ def build_production_aligned_hole_result(
     allowed_change_mask = np.zeros(shape, dtype=np.uint8)
     overlay = target.copy()
     regions: list[AlignedOverlayRegion] = []
+    supplemental_filtered_count = 0
+    supplemental_filter_reasons: dict[str, int] = {}
 
     for idx, bubble in enumerate(candidates):
         mask = _bubble_mask_from_instance(bubble, shape)
@@ -760,6 +875,17 @@ def build_production_aligned_hole_result(
         if area <= 0:
             continue
         area_ratio = area / float(max(1, h * w))
+        candidate_source = str((bubble.meta or {}).get("aligned_hole_candidate_source", "primary"))
+        is_supplemental = candidate_source.startswith("supplemental_")
+        supplemental_max_area = float(getattr(cfg, "supplemental_max_area_ratio", 0.04))
+        translation_diag = _registered_translation_evidence(aligned, target, mask, cfg) if is_supplemental else {"passed": True, "reason": "primary_semantic_authority"}
+        if is_supplemental and area_ratio > supplemental_max_area:
+            translation_diag = {**translation_diag, "passed": False, "reason": "supplemental_area_cap", "area_ratio": area_ratio, "max_area_ratio": supplemental_max_area}
+        if is_supplemental and not bool(translation_diag.get("passed", False)):
+            supplemental_filtered_count += 1
+            filter_reason = str(translation_diag.get("reason", "supplemental_translation_gate"))
+            supplemental_filter_reasons[filter_reason] = int(supplemental_filter_reasons.get(filter_reason, 0)) + 1
+            continue
         if area_ratio > float(cfg.max_single_region_area_ratio):
             regions.append(AlignedOverlayRegion(
                 id=f"aligned_hole_{idx:03d}", target_bbox=tuple(map(int, bubble.bbox)),
@@ -789,6 +915,10 @@ def build_production_aligned_hole_result(
             local_source_ink = _source_glyph_mask(aligned, local_hole, colored=False)
             if int(cv2.countNonZero(local_source_ink)) < 25:
                 reason = "insufficient_registered_source_ink"
+                if is_supplemental:
+                    supplemental_filtered_count += 1
+                    supplemental_filter_reasons[reason] = int(supplemental_filter_reasons.get(reason, 0)) + 1
+                    continue
                 triage = "REJECT"
             else:
                 triage = "SAFE"
@@ -803,6 +933,10 @@ def build_production_aligned_hole_result(
             cn_mask = _source_glyph_mask(aligned, mask, colored=True)
             if int(cv2.countNonZero(jp_mask)) < 25 or int(cv2.countNonZero(cn_mask)) < 25:
                 reason = "insufficient_colored_text_masks"
+                if is_supplemental:
+                    supplemental_filtered_count += 1
+                    supplemental_filter_reasons[reason] = int(supplemental_filter_reasons.get(reason, 0)) + 1
+                    continue
                 triage = "REJECT"
             else:
                 triage = "SAFE"
@@ -834,9 +968,9 @@ def build_production_aligned_hole_result(
             source_ink_pixels=int(cv2.countNonZero(local_source_ink)),
             target_ink_pixels=int(cv2.countNonZero(local_erase)), border_guard_px=0,
             diagnostics={
-                "engine": "aligned_hole_v2.2.2", "candidate_source": "primary_target_bubble",
+                "engine": "aligned_hole_v2.3.38", "candidate_source": candidate_source,
                 "confidence": float(bubble.confidence), "backend": str(bubble.meta.get("backend", "")),
-                "saturation_mean": float(saturation_mean),
+                "saturation_mean": float(saturation_mean), "translation_evidence": translation_diag,
             },
         ))
 
@@ -868,8 +1002,8 @@ def build_production_aligned_hole_result(
         full_raster_mask=hole_mask.copy(),
         regions=regions,
         diagnostics={
-            "engine": "aligned_hole_v2.2.2",
-            "contract": "target_upper_layer__bubble_holes__registered_cn_lower_layer",
+            "engine": "aligned_hole_v2.3.38",
+            "contract": "target_upper_layer__bubble_or_textbox_holes__registered_cn_lower_layer",
             "candidate_count": len(candidates),
             "applied_region_count": sum(1 for r in regions if r.triage != "REJECT"),
             "full_bubble_holes": sum(1 for r in regions if r.triage != "REJECT" and r.composite_mode == "full_bubble_hole"),
@@ -878,7 +1012,12 @@ def build_production_aligned_hole_result(
             "allowed_change_pixels": int(cv2.countNonZero(allowed_change_mask)),
             "changed_pixels": changed_pixels,
             "outside_mask_unchanged": outside_unchanged,
-            "primary_target_bubbles": len(candidates),
+            "primary_target_bubbles": sum(1 for b in candidates if str((b.meta or {}).get("aligned_hole_candidate_source", "primary")) == "primary"),
+            "supplemental_white_candidates": sum(1 for b in candidates if str((b.meta or {}).get("aligned_hole_candidate_source", "")) == "supplemental_white"),
+            "supplemental_text_barrier_candidates": sum(1 for b in candidates if str((b.meta or {}).get("aligned_hole_candidate_source", "")) == "supplemental_text_barrier"),
+            "supplemental_colored_candidates": sum(1 for b in candidates if str((b.meta or {}).get("aligned_hole_candidate_source", "")) == "supplemental_colored"),
+            "supplemental_filtered_count": int(supplemental_filtered_count),
+            "supplemental_filter_reasons": dict(supplemental_filter_reasons),
             "cache_primary_target": str(stats.get("primary_detector_target", "")),
         },
     )

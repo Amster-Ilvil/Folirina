@@ -7,8 +7,8 @@ from typing import Any
 
 import numpy as np
 
-from .aligned_overlay_reveal import apply_detector_policy_guard, build_aligned_overlay_plan, execute_aligned_overlay
-from .aligned_overlay_reveal_mode import build_production_aligned_hole_result
+from .modes.aligned_overlay_reveal.renderer import apply_detector_policy_guard, build_aligned_overlay_plan, execute_aligned_overlay
+from .modes.aligned_overlay_reveal.hole_renderer import build_production_aligned_hole_result
 from .config import PipelineConfig
 from .models import PagePair, PageProject, QAItem, RegistrationResult
 from .page_management import PageMark

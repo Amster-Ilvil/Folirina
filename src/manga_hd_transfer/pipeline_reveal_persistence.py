@@ -13,7 +13,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .aligned_overlay_reveal import AlignedOverlayResult
+from .modes.aligned_overlay_reveal.core import AlignedOverlayResult
 from .transparent_bubble_reveal import TransparentBubbleResult
 from .layout_evidence import collect_koharu_layout_evidence_cached
 from .debug import mask_overlay

@@ -32,8 +32,10 @@ from .models import (
 )
 from .schema_compat import as_dict, as_dict_rows
 from .mode_contracts import mode_scoped_config_payload
+from .layout_evidence_models import LayoutEvidence, LayoutEvidenceItem
 
 CACHE_SCHEMA = "mhd-cache-v2"
+RESUME_SCHEMA = "folirina-page-resume-v3"
 
 _FILE_SIGNATURE_CACHE: OrderedDict[tuple[str, int, int, int, int], str] = OrderedDict()
 _FILE_SIGNATURE_LOCK = threading.RLock()
@@ -78,6 +80,42 @@ def file_signature(path: str | Path, sample_bytes: int = 65536) -> str:
         for pos in sorted(set(positions)):
             f.seek(pos)
             h.update(f.read(sample_bytes))
+    value = h.hexdigest()[:24]
+    with _FILE_SIGNATURE_LOCK:
+        _FILE_SIGNATURE_CACHE[key] = value
+        _FILE_SIGNATURE_CACHE.move_to_end(key)
+        while len(_FILE_SIGNATURE_CACHE) > _FILE_SIGNATURE_CACHE_MAX:
+            _FILE_SIGNATURE_CACHE.popitem(last=False)
+    return value
+
+
+def file_content_signature(path: str | Path, chunk_bytes: int = 1024 * 1024) -> str:
+    """Exact content signature that deliberately ignores the filename.
+
+    Resume mirrors often store the exact same PNG as ``pages/<id>/final.png`` and
+    ``final/<page-name>.png``. ``file_signature`` includes the basename by design
+    for cache identity, so it must not be used for mirror equality. New Folirina
+    outputs normally hit the cheaper ``os.path.samefile`` path first; this full
+    digest is the correctness fallback for legacy/cross-device copies.
+    """
+    p = Path(path)
+    st = p.stat()
+    try:
+        resolved = str(p.resolve())
+    except OSError:
+        resolved = str(p.absolute())
+    chunk = max(64 * 1024, int(chunk_bytes))
+    key = ("content-exact:" + resolved, int(st.st_size), int(st.st_mtime_ns), int(getattr(st, 'st_ctime_ns', 0)), chunk)
+    with _FILE_SIGNATURE_LOCK:
+        cached = _FILE_SIGNATURE_CACHE.get(key)
+        if cached is not None:
+            _FILE_SIGNATURE_CACHE.move_to_end(key)
+            return cached
+    h = hashlib.sha256()
+    h.update(str(int(st.st_size)).encode("ascii"))
+    with p.open("rb") as f:
+        for block in iter(lambda: f.read(chunk), b""):
+            h.update(block)
     value = h.hexdigest()[:24]
     with _FILE_SIGNATURE_LOCK:
         _FILE_SIGNATURE_CACHE[key] = value
@@ -162,7 +200,9 @@ def page_job_fingerprint(pair: PagePair, config: Any) -> str:
     # invalidate Mask pages. Low-level stage caches keep their own signatures.
     cfg = mode_scoped_config_payload(config)
     payload = {
-        "schema": CACHE_SCHEMA,
+        # Completion identity intentionally has its own schema. Stage cache bundles
+        # remain CACHE_SCHEMA=v2 and can still be reused after this safety upgrade.
+        "schema": RESUME_SCHEMA,
         "source": file_signature(pair.source_path),
         "target": file_signature(pair.target_path),
         "config": cfg,
@@ -355,7 +395,6 @@ class PageStageCache:
         if not meta or meta.get("schema") != CACHE_SCHEMA or meta.get("signature") != signature or not npz_path.exists():
             return None
         try:
-            from .layout_evidence import LayoutEvidence, LayoutEvidenceItem
             with np.load(npz_path, allow_pickle=False) as arrays:
                 if not _cache_bundle_matches(arrays, signature, self._path(f"layout_{role}.json"), npz_path):
                     return None
@@ -622,6 +661,17 @@ def blocks_signature(blocks: list[TextBlock]) -> str:
 
 
 def load_completed_page(page_dir: str | Path, pair: PagePair, config: Any, final_path: str | Path) -> PageProject | None:
+    """Load a completed page only when its *mode-scoped* execution identity matches.
+
+    v2.3.19 deliberately fails closed. Older code treated "same SOURCE/TARGET files"
+    as sufficient compatibility after any job-fingerprint mismatch. That let a page
+    completed in another mode, or with stale OCR/font/detector settings, be resumed
+    as if it belonged to the newly selected mode. It could also publish the old
+    page-local final into the book output *before* validating that fingerprint.
+
+    Stage caches are still independently reusable; only the already-published
+    completed-page shortcut is strict.
+    """
     page_dir = Path(page_dir)
     project_path = page_dir / "project.json"
     final_path = Path(final_path)
@@ -630,38 +680,61 @@ def load_completed_page(page_dir: str | Path, pair: PagePair, config: Any, final
     obj = as_dict(_load_json(project_path))
     if not obj:
         return None
-    if not final_path.exists():
-        artifacts = as_dict(obj.get("artifacts"))
-        candidates = []
-        for key in ("final", "final_reviewed"):
-            val = str(artifacts.get(key, "") or "").strip()
-            if val:
-                candidates.append(Path(val))
-        candidates.extend([page_dir / "final_reviewed.png", page_dir / "final_auto.png", page_dir / "final.png"])
-        chosen = next((c for c in candidates if c.exists() and c.is_file()), None)
-        if chosen is None:
-            return None
+
+    expected = page_job_fingerprint(pair, config)
+    meta0 = as_dict(obj.get("meta"))
+    requested_mode = str(getattr(getattr(config, "transfer", None), "mode", "") or "").strip().lower()
+    saved_mode = str(meta0.get("transfer_mode") or "").strip().lower()
+
+    # Never resume across an explicit mode boundary. Legacy pages with no mode or
+    # with an old resume fingerprint simply rebuild once, after which they carry
+    # the v3 resume contract.
+    if saved_mode and requested_mode and saved_mode != requested_mode:
+        return None
+    if str(meta0.get("job_fingerprint") or "") != expected:
+        return None
+
+    # Only after identity validation may the book-level final be synchronized.
+    # Prefer the page-local reviewed/automatic result over persisted absolute
+    # artifact paths: an older project may point ``artifacts.final`` at the book
+    # output itself, which is exactly the file we are trying to verify/repair.
+    artifacts = as_dict(obj.get("artifacts"))
+    candidates = [page_dir / "final_reviewed.png", page_dir / "final_auto.png", page_dir / "final.png"]
+    for key in ("final_reviewed", "final"):
+        val = str(artifacts.get(key, "") or "").strip()
+        if val:
+            candidates.append(Path(val))
+    chosen = next((c for c in candidates if c.exists() and c.is_file() and c != final_path), None)
+    if chosen is None and final_path.exists() and final_path.is_file():
+        chosen = final_path
+    if chosen is None:
+        return None
+    need_sync = not final_path.exists()
+    if not need_sync and chosen != final_path:
+        try:
+            # Hard-linked mirrors are already identical even though their names
+            # differ; otherwise compare bytes without basename-sensitive cache IDs.
+            if os.path.samefile(chosen, final_path):
+                need_sync = False
+            else:
+                need_sync = file_content_signature(chosen) != file_content_signature(final_path)
+        except OSError:
+            need_sync = True
+    if need_sync:
         final_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             import shutil
             shutil.copy2(chosen, final_path)
         except OSError:
             return None
-        artifacts["final"] = str(final_path)
-        obj["artifacts"] = artifacts
-        try:
-            _save_json(project_path, obj)
-        except Exception:
-            pass
-    if not obj:
-        return None
-    expected = page_job_fingerprint(pair, config)
-    meta0 = as_dict(obj.get("meta"))
-    if meta0.get("job_fingerprint") != expected:
-        # Compatibility for projects produced before pair indexes were removed
-        # from the fingerprint. Re-pairing the same files must remain resumable.
-        if not _same_paired_files(obj.get("pair"), pair):
-            return None
+    # ``final`` remains the page-local artifact; the book mirror has its own key.
+    artifacts["book_final"] = str(final_path)
+    obj["artifacts"] = artifacts
+    try:
+        _write_json(project_path, obj)
+    except Exception:
+        pass
+
     try:
         regp = as_dict(obj.get("registration"))
         reg = RegistrationResult(
@@ -691,3 +764,4 @@ def load_completed_page(page_dir: str | Path, pair: PagePair, config: Any, final
         )
     except Exception:
         return None
+

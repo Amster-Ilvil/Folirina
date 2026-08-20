@@ -20,7 +20,7 @@ import subprocess
 import time
 from typing import Callable
 
-from .model_downloads import model_home
+from .storage_paths import model_home
 from .paddle_runtime import (
     PaddleRuntimeStatus,
     _emit,

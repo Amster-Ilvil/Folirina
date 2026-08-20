@@ -274,7 +274,13 @@ def _apply_manual_reletters(rendered: np.ndarray, target: np.ndarray, page_dir: 
     bubbles_by_id = {b.id: b for b in target_bubbles}
     meta = _dict_or_empty(project.get("meta"))
     direct_meta = _route_meta(meta, "direct_patch")
-    active_meta = direct_meta if bool(direct_meta.get("used")) else _route_meta(meta, "mask_replace")
+    project_mode = str(meta.get("transfer_mode", "") or "").strip().lower()
+    if bool(direct_meta.get("used")):
+        active_meta = direct_meta
+    elif project_mode == "hybrid":
+        active_meta = _route_meta(meta, "hybrid")
+    else:
+        active_meta = _route_meta(meta, "mask_replace")
     manual_queue = _dict_rows(active_meta.get("manual_reletter_required"))
     queue_by_target = {str(x.get("target_bubble_id", "")): x for x in manual_queue if x.get("target_bubble_id")}
     out = rendered.copy()
@@ -796,7 +802,9 @@ def rerun_page_with_force(page_dir: str | Path, mode: str, config: PipelineConfi
     for name in (
         "direct_patch_layer.png", "direct_patch_regions.png", "direct_patch.json",
         "mask_transfer_layer.png", "mask_transfer_mask.png", "mask_transfer.json",
-        "direct_patch_layer_reviewed.png", "mask_transfer_layer_reviewed.png",
+        "hybrid_transfer_layer.png", "hybrid_transfer_mask.png", "hybrid_transfer.json", "hybrid_text_layer.png",
+        "reletter_text_layer.png", "reletter.json",
+        "direct_patch_layer_reviewed.png", "mask_transfer_layer_reviewed.png", "hybrid_transfer_layer_reviewed.png", "hybrid_text_layer_reviewed.png", "reletter_text_layer_reviewed.png",
         "final_reviewed.png",
     ):
         path = page_dir / name
@@ -861,7 +869,7 @@ def apply_review_page(page_dir: str | Path, config: PipelineConfig | None = None
         )
         if not reletter_unit_override:
             return _commit_reviewed_result(page_dir, _apply_reletter_review(page_dir, project, overrides, cfg))
-    if manual_force_present and project_mode in {"auto", "direct_patch", "mask_replace", "hybrid"} and not ((page_dir / "direct_patch_layer.png").exists() or (page_dir / "mask_transfer_layer.png").exists()):
+    if manual_force_present and project_mode in {"auto", "direct_patch", "mask_replace", "hybrid"} and not ((page_dir / "direct_patch_layer.png").exists() or (page_dir / "mask_transfer_layer.png").exists() or (page_dir / "hybrid_transfer_layer.png").exists()):
         return apply_manual_force_transfer_review(page_dir, cfg)
     # Manual omission repair is an additive overlay.  When it is the only
     # visual review operation, never rebuild the whole page from a single
@@ -869,7 +877,7 @@ def apply_review_page(page_dir: str | Path, config: PipelineConfig | None = None
     if manual_effect_rows and (
         _manual_effect_can_overlay_final(page_dir, overrides)
         or bool(meta.get("passthrough"))
-        or not ((page_dir / "direct_patch_layer.png").exists() or (page_dir / "mask_transfer_layer.png").exists())
+        or not ((page_dir / "direct_patch_layer.png").exists() or (page_dir / "mask_transfer_layer.png").exists() or (page_dir / "hybrid_transfer_layer.png").exists())
     ):
         return _commit_reviewed_result(page_dir, _apply_manual_effect_only_review(page_dir, project, overrides, cfg))
     # Raster-review is the fast/default route for Auto/Mask/Direct pages, but an

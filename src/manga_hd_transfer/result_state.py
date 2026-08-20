@@ -27,10 +27,14 @@ class ResultState:
 # has fully succeeded.  Snapshot them so a failed run can restore the previous
 # known-good page instead of leaving a half-cleared workspace visible in the GUI.
 _RUN_SNAPSHOT_FILES = (
+    "run_receipt.json", "project.json", "qa.json", "transfer_audit.json",
+    "page_management.json", "last_run_state.json",
     "final.png", "final_reviewed.png", "final_auto.png", "manual_effect_base.png",
     "review_applied.json", "review_base.png", "review_preview.png", "review_sync.json",
     "text_layer.png", "text_layer_reviewed.png", "chinese_transfer_layer.png",
     "mask_transfer_layer.png", "mask_transfer_layer_reviewed.png", "mask_transfer_mask.png", "mask_transfer.json",
+    "hybrid_transfer_layer.png", "hybrid_transfer_layer_reviewed.png", "hybrid_transfer_mask.png", "hybrid_transfer.json",
+    "hybrid_text_layer.png", "hybrid_text_layer_reviewed.png", "reletter_text_layer.png", "reletter_text_layer_reviewed.png", "reletter.json",
     "direct_patch_layer.png", "direct_patch_layer_reviewed.png", "direct_patch_regions.png", "direct_patch.json",
     "aligned_overlay_reveal.json", "aligned_overlay_reveal_layer.png", "aligned_overlay_reveal_mask.png",
     "transparent_bubble_reveal.json", "final_rgba.png", "jp_layer_rgba.png", "cn_layer_rgb.png",

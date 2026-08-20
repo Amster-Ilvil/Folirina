@@ -11,6 +11,8 @@ import gc
 import os
 import platform
 import threading
+import sys
+import importlib.util
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,6 +22,9 @@ import cv2
 _ACCELERATOR_LOCK = threading.RLock()
 _CONFIGURED = False
 _LAST_POLICY: dict[str, Any] = {}
+_LAST_THREADS = 1
+_LAST_MPS_MEMORY_FRACTION = 0.82
+_TORCH_POLICY_APPLIED = False
 
 
 @dataclass(slots=True)
@@ -52,6 +57,36 @@ class DeviceInfo:
         }
 
 
+def _apply_torch_policy(torch) -> None:
+    """Apply the already-computed runtime policy to a lazily imported Torch.
+
+    OpenCV-only Direct/Mask runs should not pay Torch's multi-second import cost.
+    When a Torch-backed detector/registration model is actually requested, this
+    helper applies the same thread and MPS-memory limits immediately after import.
+    """
+    global _TORCH_POLICY_APPLIED
+    if _TORCH_POLICY_APPLIED:
+        return
+    try:
+        torch.set_num_threads(max(1, int(_LAST_THREADS)))
+    except Exception:
+        pass
+    try:
+        torch.set_num_interop_threads(max(1, min(2, int(_LAST_THREADS))))
+    except RuntimeError:
+        pass
+    except Exception:
+        pass
+    if _mps_available(torch):
+        fraction = float(_LAST_MPS_MEMORY_FRACTION)
+        if 0.10 <= fraction <= 1.0 and hasattr(torch.mps, "set_per_process_memory_fraction"):
+            try:
+                torch.mps.set_per_process_memory_fraction(fraction)
+            except Exception:
+                pass
+    _TORCH_POLICY_APPLIED = True
+
+
 def _import_torch():
     # CPU-only runs must remain usable when an optional/broken Torch build is
     # installed. OpenCV/CPU transfer routes do not require Torch.
@@ -59,6 +94,7 @@ def _import_torch():
         return None
     try:
         import torch
+        _apply_torch_policy(torch)
         return torch
     except Exception:
         return None
@@ -71,7 +107,7 @@ def configure_runtime(config=None) -> dict[str, Any]:
     this mixed I/O + CV + GPU workload and makes the Qt UI stutter.  The policy is
     deliberately idempotent and can be called from CLI, GUI and tests.
     """
-    global _CONFIGURED, _LAST_POLICY
+    global _CONFIGURED, _LAST_POLICY, _LAST_THREADS, _LAST_MPS_MEMORY_FRACTION, _TORCH_POLICY_APPLIED
 
     ratio = float(getattr(config, "cpu_thread_ratio", 0.50) if config is not None else 0.50)
     min_threads = int(getattr(config, "min_cpu_threads", 1) if config is not None else 1)
@@ -92,28 +128,15 @@ def configure_runtime(config=None) -> dict[str, Any]:
     except Exception:
         pass
 
-    torch = None if str(getattr(config, "device", "auto") or "auto").lower() == "cpu" else _import_torch()
-    if torch is not None:
-        try:
-            torch.set_num_threads(threads)
-        except Exception:
-            pass
-        try:
-            # Inter-op parallelism has high overhead for our page-at-a-time jobs.
-            torch.set_num_interop_threads(max(1, min(2, threads)))
-        except RuntimeError:
-            # PyTorch only allows this before parallel work starts.
-            pass
-        except Exception:
-            pass
-
-        if _mps_available(torch):
-            fraction = float(getattr(config, "mps_memory_fraction", 0.82) if config is not None else 0.82)
-            if 0.10 <= fraction <= 1.0 and hasattr(torch.mps, "set_per_process_memory_fraction"):
-                try:
-                    torch.mps.set_per_process_memory_fraction(fraction)
-                except Exception:
-                    pass
+    _LAST_THREADS = int(threads)
+    _LAST_MPS_MEMORY_FRACTION = float(getattr(config, "mps_memory_fraction", 0.82) if config is not None else 0.82)
+    # Do not import Torch just to configure a run that may stay entirely on
+    # OpenCV/CPU. If Torch was already loaded by a requested model, refresh its
+    # limits; otherwise _import_torch() applies them lazily on first real use.
+    loaded_torch = sys.modules.get("torch")
+    if loaded_torch is not None:
+        _TORCH_POLICY_APPLIED = False
+        _apply_torch_policy(loaded_torch)
 
     _CONFIGURED = True
     _LAST_POLICY = {
@@ -159,7 +182,17 @@ def torch_device(preferred: str = "auto"):
     return torch.device(select_device(preferred))
 
 
-def device_info(preferred: str = "auto") -> DeviceInfo:
+def device_info(preferred: str = "auto", *, probe_torch: bool = True) -> DeviceInfo:
+    preferred = (preferred or "auto").lower().strip()
+    if preferred == "cpu":
+        installed = importlib.util.find_spec("torch") is not None
+        return DeviceInfo(preferred, "cpu", True, "CPU", installed, note="CPU 模式。")
+    if not probe_torch and "torch" not in sys.modules:
+        installed = importlib.util.find_spec("torch") is not None
+        return DeviceInfo(
+            preferred, "cpu", True, "CPU", installed,
+            note="Torch 未加载；本次当前路径保持 OpenCV/CPU，未为设备探测额外加载 Torch。",
+        )
     torch = _import_torch()
     if torch is None:
         return DeviceInfo(preferred, "cpu", True, "CPU", False, note="PyTorch 未安装；仅使用 OpenCV/CPU。")
@@ -214,6 +247,11 @@ def accelerator_lock():
 
 
 def synchronize(preferred: str = "auto") -> None:
+    # Synchronization is meaningful only after a Torch-backed operation actually
+    # loaded Torch. Do not import a multi-hundred-MB optional backend just to ask
+    # an unused accelerator to synchronize.
+    if "torch" not in sys.modules:
+        return
     torch = _import_torch()
     if torch is None:
         return
@@ -229,6 +267,11 @@ def synchronize(preferred: str = "auto") -> None:
 
 def empty_accelerator_cache(preferred: str = "auto") -> None:
     gc.collect()
+    # Same lazy rule as synchronize(): if Torch was never used there is no Torch
+    # cache to release, and importing it here would create the very memory/cost we
+    # are trying to avoid every N pages.
+    if "torch" not in sys.modules:
+        return
     torch = _import_torch()
     if torch is None:
         return
@@ -242,7 +285,7 @@ def empty_accelerator_cache(preferred: str = "auto") -> None:
         pass
 
 
-def runtime_summary(preferred: str = "auto") -> dict[str, Any]:
+def runtime_summary(preferred: str = "auto", *, probe_torch: bool = False) -> dict[str, Any]:
     if not _CONFIGURED:
         configure_runtime(None)
-    return {"policy": dict(_LAST_POLICY), "device": device_info(preferred).to_dict()}
+    return {"policy": dict(_LAST_POLICY), "device": device_info(preferred, probe_torch=probe_torch).to_dict()}

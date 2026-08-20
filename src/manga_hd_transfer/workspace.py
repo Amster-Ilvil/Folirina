@@ -155,6 +155,7 @@ def resolve_page_workspace(
     artifacts.update(as_dict(memory_project.get("artifacts")))
     meta = as_dict(disk_project.get("meta"))
     meta.update(as_dict(memory_project.get("meta")))
+    transfer_mode = str(meta.get("transfer_mode", "") or "").strip().lower()
 
     result_path = ""
     review_path = ""
@@ -173,20 +174,32 @@ def resolve_page_workspace(
             artifacts.get("review_preview"),
             result_path,
         )
-        mask_path = _existing_path(
-            root / "manual_transfer_mask.png",
-            root / "mask_transfer_mask.png",
-            artifacts.get("mask_transfer_mask"),
-            root / "clear_mask.png",
-            artifacts.get("clear_mask"),
-        )
+        if transfer_mode == "hybrid":
+            mask_path = _existing_path(
+                root / "manual_transfer_mask.png",
+                root / "hybrid_transfer_mask.png",
+                artifacts.get("hybrid_transfer_mask"),
+                root / "clear_mask.png",
+                artifacts.get("clear_mask"),
+            )
+        else:
+            mask_path = _existing_path(
+                root / "manual_transfer_mask.png",
+                root / "mask_transfer_mask.png",
+                artifacts.get("mask_transfer_mask"),
+                root / "clear_mask.png",
+                artifacts.get("clear_mask"),
+            )
         qa_data = _safe_json(root / "qa.json")
         if isinstance(qa_data.get("summary"), dict):
             qa_summary = dict(qa_data["summary"])
     else:
         result_path = _existing_path(artifacts.get("final"), artifacts.get("book_final"))
         review_path = _existing_path(artifacts.get("review_preview"), result_path)
-        mask_path = _existing_path(artifacts.get("mask_transfer_mask"), artifacts.get("clear_mask"))
+        mask_path = _existing_path(
+            artifacts.get("hybrid_transfer_mask") if transfer_mode == "hybrid" else artifacts.get("mask_transfer_mask"),
+            artifacts.get("clear_mask"),
+        )
 
     direct_meta = normalize_route_meta(meta.get("direct_patch"))
     aligned_meta = normalize_route_meta(meta.get("aligned_overlay_reveal"))
@@ -208,12 +221,16 @@ def resolve_page_workspace(
         mm = aligned_meta
     elif direct_used:
         mm = direct_meta
+    elif transfer_mode == "hybrid":
+        mm = normalize_route_meta(meta.get("hybrid"))
+    elif transfer_mode == "reletter":
+        mm = normalize_route_meta(meta.get("reletter"))
     else:
         mm = normalize_route_meta(meta.get("mask_replace"))
     # Reletter review is region-centric rather than bubble-candidate-centric.
     # Successful automatic regions are intentionally editable too; keep this
     # isolated from Direct/Mask review queues.
-    if str(meta.get("transfer_mode", "")) == "reletter":
+    if transfer_mode == "reletter":
         review_regions = as_dict_rows(as_dict(meta.get("reletter")).get("editable_regions"))
     else:
         review_regions = as_dict_rows(mm.get("review_regions") or mm.get("manual_reletter_required"))
@@ -249,6 +266,16 @@ def resolve_page_workspace(
         candidates = [artifacts.get("direct_patch_regions")]
         if root is not None:
             candidates[:0] = [root / "manual_direct_patch_regions.png", root / "direct_patch_regions.png"]
+        mask_path = _existing_path(*candidates)
+    elif transfer_mode == "hybrid":
+        candidates = [artifacts.get("hybrid_transfer_mask")]
+        if root is not None:
+            candidates[:0] = [root / "manual_transfer_mask.png", root / "hybrid_transfer_mask.png"]
+        mask_path = _existing_path(*candidates)
+    elif transfer_mode == "mask_replace":
+        candidates = [artifacts.get("mask_transfer_mask")]
+        if root is not None:
+            candidates[:0] = [root / "manual_transfer_mask.png", root / "mask_transfer_mask.png"]
         mask_path = _existing_path(*candidates)
 
     return PageWorkspace(

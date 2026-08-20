@@ -185,6 +185,27 @@ def primary_bubbles_cached(
         )
         hit = cache.load_bubbles(cache_role, sig)
         if hit is not None:
+            # v2.3.22: an empty Koharu primary-bubble cache must not outrank a
+            # positive canonical LayoutEvidence cache for the exact same page.
+            # A transient/older primary stage could persist [] while the shared
+            # SOURCE/TARGET layout cache already contains valid bubble geometry.
+            # Direct used to consume that poisoned empty result, drop to a partial
+            # pseudo-text fallback, and leave Japanese pixels in otherwise known
+            # text boxes. Reconcile only this contradictory state; a genuinely
+            # textless page (LayoutEvidence also has zero bubbles) remains empty.
+            if primary == "koharu_layout" and len(hit) == 0:
+                preferred = _preferred_koharu_bubbles(
+                    role, image, [], image_path, bubble_config=bubble_config,
+                    cache=cache,
+                    cache_enabled=cache_enabled and bool(getattr(bubble_config, "koharu_layout_cache_enabled", True)),
+                    stats=stats,
+                )
+                preferred_rows = _retag_role(list(preferred or []), role, [])
+                if preferred_rows:
+                    cache.save_bubbles(cache_role, sig, preferred_rows)
+                    stats[f"primary_detector_{role}"] = f"recovered_layout:{primary}:{len(preferred_rows)}"
+                    stats[f"primary_detector_{role}_cache_reconciled"] = "empty_primary_to_positive_layout"
+                    return preferred_rows
             stats[f"primary_detector_{role}"] = f"hit:{primary}:{len(hit)}"
             return _retag_role(hit, role, [])
     rows = _detect_policy_provider(

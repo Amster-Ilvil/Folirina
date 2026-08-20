@@ -559,6 +559,51 @@ class ProjectPage(QWidget):
         dcn = QLabel("以上 4 项属于 Direct 默认合同；除非明确修改 Direct 模式，否则不得改变。")
         dcn.setObjectName("quiet"); dcn.setWordWrap(True); dcl.addWidget(dcn)
         mode.layout.addWidget(self.direct_contract_box)
+
+        self.direct_clarity_box = QFrame(); self.direct_clarity_box.setObjectName("cardBlue")
+        dql = QVBoxLayout(self.direct_clarity_box); dql.setContentsMargins(9,8,9,8); dql.setSpacing(5)
+        dqt = QLabel("白气泡 Direct 清晰增强"); dqt.setStyleSheet("font-weight:650;"); dql.addWidget(dqt)
+        self.direct_white_clarity_enabled = QCheckBox("启用漂白清底 + 中文文字掩膜清晰化")
+        self.direct_white_clarity_enabled.setToolTip("参考夸克类净页思路：对白气泡区域先漂白清底、去灰底、压噪点，再保留 SOURCE 中文黑字。对白气泡场景下的 Direct / 精准蒙版 / 精准蒙版+OCR 生效：先漂白清底、去灰底、压噪点，再保留 SOURCE 中文黑字；彩页与非白气泡仍走原有安全路径。")
+        dql.addWidget(self.direct_white_clarity_enabled)
+        dqh = QLabel("仅用于白气泡 Direct：清理低清中文版带来的灰底与噪点，同时适度增强黑字字芯，减少贴到高清日文页后发糊、发灰的感觉。")
+        dqh.setObjectName("quiet"); dqh.setWordWrap(True); dql.addWidget(dqh)
+        self.direct_clarity_summary = QLabel("")
+        self.direct_clarity_summary.setObjectName("hint"); self.direct_clarity_summary.setWordWrap(True); dql.addWidget(self.direct_clarity_summary)
+        dqf = QFormLayout(); dqf.setContentsMargins(0,0,0,0); dqf.setSpacing(6)
+        self.direct_white_clarity_alpha_gamma = QDoubleSpinBox(); self.direct_white_clarity_alpha_gamma.setDecimals(2); self.direct_white_clarity_alpha_gamma.setRange(0.40, 1.20); self.direct_white_clarity_alpha_gamma.setSingleStep(0.02)
+        self.direct_white_clarity_alpha_gamma.setToolTip("文字边缘灰阶曲线。1.00 保留中文版原始圆润抗锯齿；小于 1.00 才会主动加硬。默认 1.00。")
+        self.direct_white_clarity_black_boost = QSpinBox(); self.direct_white_clarity_black_boost.setRange(0, 48); self.direct_white_clarity_black_boost.setSingleStep(1)
+        self.direct_white_clarity_black_boost.setToolTip("黑字强化。0 表示不改变中文版原字灰阶；仅在确有需要时手动增加。默认 0。")
+        self.direct_white_clarity_pure_white_floor = QSpinBox(); self.direct_white_clarity_pure_white_floor.setRange(235, 255); self.direct_white_clarity_pure_white_floor.setSingleStep(1)
+        self.direct_white_clarity_pure_white_floor.setToolTip("白底最低亮度。数值越高，背景越接近纯白。默认 248。")
+        self.direct_white_clarity_min_text_pixels = QSpinBox(); self.direct_white_clarity_min_text_pixels.setRange(1, 400); self.direct_white_clarity_min_text_pixels.setSingleStep(1)
+        self.direct_white_clarity_min_text_pixels.setToolTip("最小文字像素门槛。过小区域不做增强，避免误对白纸块做无意义处理。默认 18。")
+        _dcfg = self.window.state.config.direct_patch
+        self.direct_white_clarity_enabled.setChecked(bool(getattr(_dcfg, "direct_white_clarity_enhance_enabled", True)))
+        self.direct_white_clarity_alpha_gamma.setValue(float(getattr(_dcfg, "direct_white_clarity_alpha_gamma", 1.0)))
+        self.direct_white_clarity_black_boost.setValue(int(getattr(_dcfg, "direct_white_clarity_black_boost", 0)))
+        self.direct_white_clarity_pure_white_floor.setValue(int(getattr(_dcfg, "direct_white_clarity_pure_white_floor", 248)))
+        self.direct_white_clarity_min_text_pixels.setValue(int(getattr(_dcfg, "direct_white_clarity_min_text_pixels", 18)))
+        dqf.addRow("字边清晰", self.direct_white_clarity_alpha_gamma)
+        dqf.addRow("黑字强化", self.direct_white_clarity_black_boost)
+        dqf.addRow("白底亮度", self.direct_white_clarity_pure_white_floor)
+        dqf.addRow("最小文字像素", self.direct_white_clarity_min_text_pixels)
+        dql.addLayout(dqf)
+        mode.layout.addWidget(self.direct_clarity_box)
+
+        self.hybrid_ocr_contract_box = QFrame(); self.hybrid_ocr_contract_box.setObjectName("cardBlue")
+        hol = QVBoxLayout(self.hybrid_ocr_contract_box); hol.setContentsMargins(9,8,9,8); hol.setSpacing(4)
+        hot = QLabel("精准蒙版+OCR · OCR 固定合同"); hot.setStyleSheet("font-weight:650;"); hol.addWidget(hot)
+        self.hybrid_ocr_mask_claim = QCheckBox("有任何精准蒙版候选 → 禁止自动 OCR")
+        self.hybrid_ocr_uncovered_only = QCheckBox("完全无蒙版覆盖 → 才允许自动 OCR")
+        self.hybrid_ocr_manual_force = QCheckBox("人工 OCR 框选 → 按用户要求强制 OCR")
+        for _w in (self.hybrid_ocr_mask_claim, self.hybrid_ocr_uncovered_only, self.hybrid_ocr_manual_force):
+            _w.setChecked(True); _w.setEnabled(False); hol.addWidget(_w)
+        hon = QLabel("蒙版结果即使进入 REVIEW 或回滚 TARGET，也仍然拥有该区域；系统不会擅自用 OCR 覆盖。需要 OCR 时可在人工 OCR 编辑器中手动框选。")
+        hon.setObjectName("quiet"); hon.setWordWrap(True); hol.addWidget(hon)
+        mode.layout.addWidget(self.hybrid_ocr_contract_box)
+
         self.diff_check = QCheckBox("优先使用成对差异提取中文气泡/文本框"); self.diff_check.setChecked(True)
         self.exact_check = QCheckBox("同源页面启用像素级精确覆盖"); self.exact_check.setChecked(True)
         mode.layout.addWidget(self.diff_check); mode.layout.addWidget(self.exact_check)
@@ -663,6 +708,8 @@ class ProjectPage(QWidget):
         self.detail_target_btn.clicked.connect(lambda: self._set_detail_side("target")); self.detail_source_btn.clicked.connect(lambda: self._set_detail_side("source"))
         self.open_preview_btn.clicked.connect(lambda: self.open_preview(self.window.state.selected_index)); self.go_workbench_btn.clicked.connect(self._go_workbench)
         self.mode.currentIndexChanged.connect(self._on_mode_changed); self.show_experimental.toggled.connect(self._set_experimental_visible); self.diff_check.toggled.connect(self._sync_config); self.exact_check.toggled.connect(self._sync_config)
+        self.direct_white_clarity_enabled.toggled.connect(self._sync_config); self.direct_white_clarity_enabled.toggled.connect(self._update_direct_clarity_controls)
+        self.direct_white_clarity_alpha_gamma.valueChanged.connect(self._sync_config); self.direct_white_clarity_black_boost.valueChanged.connect(self._sync_config); self.direct_white_clarity_pure_white_floor.valueChanged.connect(self._sync_config); self.direct_white_clarity_min_text_pixels.valueChanged.connect(self._sync_config)
         self.reletter_font.textChanged.connect(self._sync_config); self.reletter_min_font.valueChanged.connect(self._sync_config); self.reletter_max_font.valueChanged.connect(self._sync_config); self.reletter_line_spacing.valueChanged.connect(self._sync_config); self.reletter_break_mode.currentIndexChanged.connect(self._sync_config); self.reletter_layout_mode.currentIndexChanged.connect(self._sync_config); self.reletter_koharu_flow_cells.toggled.connect(self._sync_config)
         self.reletter_font_pick.clicked.connect(self._pick_reletter_font); self.reletter_font_default.clicked.connect(self._clear_reletter_font)
         self.reletter_font_preset.currentIndexChanged.connect(self._apply_reletter_font_preset)
@@ -918,6 +965,11 @@ class ProjectPage(QWidget):
             self.reletter_box.setVisible(mode in {"reletter", "hybrid"})
         if hasattr(self, "direct_contract_box"):
             self.direct_contract_box.setVisible(mode == "direct_patch")
+        if hasattr(self, "direct_clarity_box"):
+            self.direct_clarity_box.setVisible(mode in {"direct_patch", "mask_replace", "hybrid"})
+            self._update_direct_clarity_controls()
+        if hasattr(self, "hybrid_ocr_contract_box"):
+            self.hybrid_ocr_contract_box.setVisible(mode == "hybrid")
         transparent_active = mode == "transparent_bubble_reveal"
         if hasattr(self, "transparent_box"):
             self.transparent_box.setVisible(transparent_active)
@@ -935,6 +987,29 @@ class ProjectPage(QWidget):
             self.actions_card.updateGeometry()
         if hasattr(self, "detail_card"):
             self.detail_card.updateGeometry()
+
+    def _update_direct_clarity_controls(self):
+        active = str(self.mode.currentData() or "direct_patch") in {"direct_patch", "mask_replace", "hybrid"}
+        enabled = bool(self.direct_white_clarity_enabled.isChecked()) if hasattr(self, "direct_white_clarity_enabled") else False
+        for widget in (
+            getattr(self, "direct_white_clarity_alpha_gamma", None),
+            getattr(self, "direct_white_clarity_black_boost", None),
+            getattr(self, "direct_white_clarity_pure_white_floor", None),
+            getattr(self, "direct_white_clarity_min_text_pixels", None),
+        ):
+            if widget is not None:
+                widget.setEnabled(active and enabled)
+        if hasattr(self, "direct_clarity_summary"):
+            if not active:
+                self.direct_clarity_summary.setText("当前仅在 Direct / 精准蒙版 / 精准蒙版+OCR 模式下可用。")
+            elif enabled:
+                self.direct_clarity_summary.setText(
+                    f"已启用：字边清晰 {self.direct_white_clarity_alpha_gamma.value():.2f} · "
+                    f"黑字强化 {int(self.direct_white_clarity_black_boost.value())} · "
+                    f"白底亮度 {int(self.direct_white_clarity_pure_white_floor.value())}"
+                )
+            else:
+                self.direct_clarity_summary.setText("已关闭：白气泡将沿用当前模式原始像素贴图，不做漂白清底与字边增强。")
 
     def _refresh_reletter_font_catalog(self):
         if not hasattr(self,"reletter_font_catalog"):
@@ -987,6 +1062,17 @@ class ProjectPage(QWidget):
                 candidate.paired_diff_enabled = bool(self.diff_check.isChecked())
             if hasattr(candidate, "exact_identity_copy") and mode in {"direct_patch", "mask_replace", "hybrid"}:
                 candidate.exact_identity_copy = bool(self.exact_check.isChecked())
+            if mode in {"direct_patch", "mask_replace", "hybrid"}:
+                if hasattr(candidate, "direct_white_clarity_enhance_enabled"):
+                    candidate.direct_white_clarity_enhance_enabled = bool(self.direct_white_clarity_enabled.isChecked())
+                if hasattr(candidate, "direct_white_clarity_alpha_gamma"):
+                    candidate.direct_white_clarity_alpha_gamma = float(self.direct_white_clarity_alpha_gamma.value())
+                if hasattr(candidate, "direct_white_clarity_black_boost"):
+                    candidate.direct_white_clarity_black_boost = int(self.direct_white_clarity_black_boost.value())
+                if hasattr(candidate, "direct_white_clarity_pure_white_floor"):
+                    candidate.direct_white_clarity_pure_white_floor = int(self.direct_white_clarity_pure_white_floor.value())
+                if hasattr(candidate, "direct_white_clarity_min_text_pixels"):
+                    candidate.direct_white_clarity_min_text_pixels = int(self.direct_white_clarity_min_text_pixels.value())
         lettering = self._mode_lettering_config(mode)
         if lettering is not None:
             lettering.font_path = (self.reletter_font.text().strip() or None)
@@ -1000,12 +1086,18 @@ class ProjectPage(QWidget):
     def _load_mode_specific_ui(self, mode: str):
         candidate = self._mode_candidate_config(mode)
         lettering = self._mode_lettering_config(mode)
-        widgets = [self.diff_check, self.exact_check, self.reletter_font, self.reletter_break_mode, self.reletter_layout_mode, self.reletter_min_font, self.reletter_max_font, self.reletter_line_spacing, self.reletter_koharu_flow_cells]
+        widgets = [self.diff_check, self.exact_check, self.direct_white_clarity_enabled, self.direct_white_clarity_alpha_gamma, self.direct_white_clarity_black_boost, self.direct_white_clarity_pure_white_floor, self.direct_white_clarity_min_text_pixels, self.reletter_font, self.reletter_break_mode, self.reletter_layout_mode, self.reletter_min_font, self.reletter_max_font, self.reletter_line_spacing, self.reletter_koharu_flow_cells]
         for widget in widgets: widget.blockSignals(True)
         try:
             if candidate is not None:
                 self.diff_check.setChecked(bool(getattr(candidate, "paired_diff_enabled", True)))
                 self.exact_check.setChecked(bool(getattr(candidate, "exact_identity_copy", True)))
+                if mode in {"direct_patch", "mask_replace", "hybrid"}:
+                    self.direct_white_clarity_enabled.setChecked(bool(getattr(candidate, "direct_white_clarity_enhance_enabled", True)))
+                    self.direct_white_clarity_alpha_gamma.setValue(float(getattr(candidate, "direct_white_clarity_alpha_gamma", 1.0)))
+                    self.direct_white_clarity_black_boost.setValue(int(getattr(candidate, "direct_white_clarity_black_boost", 0)))
+                    self.direct_white_clarity_pure_white_floor.setValue(int(getattr(candidate, "direct_white_clarity_pure_white_floor", 248)))
+                    self.direct_white_clarity_min_text_pixels.setValue(int(getattr(candidate, "direct_white_clarity_min_text_pixels", 18)))
             if lettering is not None:
                 current_font = str(lettering.font_path or "")
                 self.reletter_font.setText(current_font)
@@ -1018,6 +1110,7 @@ class ProjectPage(QWidget):
                 self.reletter_koharu_flow_cells.setChecked(bool(getattr(lettering, "koharu_flow_cells_enabled", False)))
         finally:
             for widget in widgets: widget.blockSignals(False)
+        self._update_direct_clarity_controls()
 
     def _ensure_legacy_mode_item(self, stored_mode: str):
         if not is_legacy_mode(stored_mode): return

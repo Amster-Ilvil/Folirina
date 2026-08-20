@@ -14,7 +14,7 @@ from typing import Any
 
 import numpy as np
 
-from .direct_containers import build_source_direct_container_plan
+from .modes.direct_patch.container_renderer import build_source_direct_container_plan
 from .dual_source import build_direct_source_evidence, select_direct_source_candidate
 from .io_utils import read_image
 from .pipeline_registration_service import register_page, verify_same_page_strict

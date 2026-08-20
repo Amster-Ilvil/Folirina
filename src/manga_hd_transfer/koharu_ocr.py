@@ -21,7 +21,7 @@ from .geometry import bbox_polygon
 from .io_utils import write_image
 from .model_downloads import discovered_model_path
 from .models import TextBlock
-from .ocr import OCRBackend
+from .ocr_base import OCRBackend
 
 
 class KoharuCropOCRBackend(OCRBackend):

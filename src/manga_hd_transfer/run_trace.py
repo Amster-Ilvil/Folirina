@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -54,25 +55,35 @@ class PageRunTrace:
         self.jsonl_path = self.root / "run_trace.jsonl"
         self.text_path = self.root / "run.log"
         self._lock = threading.Lock()
+        self._started_perf = time.perf_counter()
+        self._sequence = 0
 
     @staticmethod
     def _now() -> str:
         return datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds")
 
     def event(self, stage: str, /, **payload: Any) -> None:
-        row = {
-            "timestamp": self._now(),
-            "run_id": self.run_id,
-            "mode": self.mode,
-            "stage": str(stage),
-            **{str(k): _json_safe(v) for k, v in payload.items()},
-        }
+        safe_payload = {str(k): _json_safe(v) for k, v in payload.items()}
         try:
-            encoded = json.dumps(row, ensure_ascii=False, separators=(",", ":"))
             message = payload.get("message") or payload.get("reason") or ""
             detail = f" · {message}" if message else ""
-            human = f"[{row['timestamp']}] [{self.run_id}] [{stage}]{detail}\n"
+            # Sequence and monotonic elapsed time make the stage order explicit
+            # even when wall-clock time changes (NTP/time-zone adjustment). Keep
+            # both values inside the writer lock so concurrent diagnostics can
+            # never publish duplicate/out-of-order sequence numbers.
             with self._lock:
+                self._sequence += 1
+                row = {
+                    "timestamp": self._now(),
+                    "run_id": self.run_id,
+                    "mode": self.mode,
+                    "sequence": int(self._sequence),
+                    "elapsed_ms": round((time.perf_counter() - self._started_perf) * 1000.0, 3),
+                    "stage": str(stage),
+                    **safe_payload,
+                }
+                encoded = json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+                human = f"[{row['timestamp']}] [{self.run_id}] [{stage}]{detail}\n"
                 with self.jsonl_path.open("a", encoding="utf-8") as fh:
                     fh.write(encoded + "\n")
                     fh.flush()

@@ -22,6 +22,41 @@ class ModuleContract:
 
 MODULE_CONTRACTS: tuple[ModuleContract, ...] = (
     ModuleContract(
+        "layout_evidence_models", "domain-model",
+        ("pipeline", "gui_qt", "review_apply", "mask_transfer", "cache", "layout_evidence", "model_downloads"),
+        "Renderer-neutral Koharu layout evidence dataclasses and semantic mask operations without cache/runtime ownership",
+    ),
+    ModuleContract(
+        "ocr_base", "domain-protocol",
+        ("pipeline", "gui_qt", "review_apply", "mask_transfer", "ocr", "koharu_ocr", "model_downloads"),
+        "Minimal OCR backend protocol shared by OCR factories and crop recognizers without backend-factory cycles",
+    ),
+    ModuleContract(
+        "storage_paths", "infrastructure",
+        ("pipeline", "gui_qt", "review_apply", "mask_transfer", "model_downloads", "paddle_runtime", "paddle_doc_runtime", "standalone_python"),
+        "Stable user model/runtime roots independent from download and isolated-runtime installers",
+    ),
+    ModuleContract(
+        "cache", "infrastructure-cache",
+        ("pipeline", "gui_qt", "review_apply", "mask_transfer", "layout_evidence"),
+        "Stage cache persistence that may deserialize domain models but never imports the layout adapter/runtime",
+    ),
+    ModuleContract(
+        "koharu_ocr", "ocr-backend",
+        ("pipeline", "gui_qt", "review_apply", "mask_transfer", "ocr"),
+        "Koharu crop OCR backend depending only on the OCR protocol, not the OCR factory",
+    ),
+    ModuleContract(
+        "paddle_runtime", "runtime",
+        ("pipeline", "gui_qt", "review_apply", "mask_transfer", "model_downloads", "paddle_doc_runtime"),
+        "Classic Paddle OCR runtime; document parser dispatch is call-time only and storage roots are dependency-free",
+    ),
+    ModuleContract(
+        "source_detectors", "domain-service",
+        ("pipeline", "gui_qt", "review_apply", "mask_transfer", "pipeline_bubble_service"),
+        "SOURCE detector chain reads canonical primary cache directly and never imports page-level bubble orchestration",
+    ),
+    ModuleContract(
         "pipeline_page_flow", "application-page-orchestration",
         ("pipeline", "gui_qt", "review_apply", "mask_transfer"),
         "Single-page stage sequencing between preparation, route, OCR, matching, render composition and persistence",
@@ -57,9 +92,34 @@ MODULE_CONTRACTS: tuple[ModuleContract, ...] = (
         "Side-effect-free desktop platform labels and capability hints",
     ),
     ModuleContract(
+        "pipeline_pixel_transfer_stage", "application-pixel-stage",
+        ("pipeline", "gui_qt", "review_apply", "pipeline_ocr_cleanup", "inpainting", "qa"),
+        "Thin dispatcher only: routes each active mode into its private pixel_stage without owning renderer sequencing",
+    ),
+    ModuleContract(
+        "pipeline_ocr_cleanup", "application-ocr-cleanup",
+        ("pipeline", "gui_qt", "review_apply", "direct_containers", "mask_transfer", "pipeline_pixel_transfer_stage", "qa"),
+        "OCR-only paper-first background cleanup that cannot call pixel renderers or final QA",
+    ),
+    ModuleContract(
+        "pipeline_transfer_authority", "application-evidence-boundary",
+        ("pipeline", "gui_qt", "review_apply", "mask_transfer", "direct_containers", "pipeline_transfer_execution"),
+        "Read-only semantic authority collection/classification for destructive completion decisions",
+    ),
+    ModuleContract(
+        "pipeline_transfer_qa", "application-qa-boundary",
+        ("pipeline", "gui_qt", "review_apply", "mask_transfer", "direct_containers", "inpainting", "lettering"),
+        "Post-render semantic/evidence QA that cannot mutate pixels or invoke renderers",
+    ),
+    ModuleContract(
+        "gui_processing_policy", "ui-policy-headless",
+        ("gui_qt", "pipeline", "review_apply", "mask_transfer", "PySide6"),
+        "Qt-free busy/progress/config-snapshot/completion policy shared by the Studio controller and CI tests",
+    ),
+    ModuleContract(
         "pipeline_transfer_execution", "application-render-orchestration",
         ("pipeline", "gui_qt", "review_apply"),
-        "Stable Direct/Mask/Reletter renderer sequencing, completion/fallback coordination, inpaint and mode QA",
+        "Thin dispatcher only: routes each active mode into its private execution_stage; no renderer/cleanup/lettering ownership",
     ),
     ModuleContract(
         "pipeline_transfer_composition", "application-composition",

@@ -64,10 +64,14 @@ def _identity_like(registration: RegistrationResult, cfg: MaskReplaceConfig) -> 
     )
 
 def _bbox_from_mask(mask: np.ndarray) -> tuple[int, int, int, int] | None:
-    ys, xs = np.where(mask > 0)
-    if len(xs) == 0:
+    """Fast non-zero bounding box without materialising two full coordinate arrays."""
+    arr = np.asarray(mask)
+    binary = arr if arr.dtype == np.uint8 else (arr > 0).astype(np.uint8)
+    nz = cv2.findNonZero(binary)
+    if nz is None:
         return None
-    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+    x, y, w, h = cv2.boundingRect(nz)
+    return int(x), int(y), int(x + w), int(y + h)
 
 def _mask_iou(a: np.ndarray, b: np.ndarray) -> float:
     aa, bb = a > 0, b > 0

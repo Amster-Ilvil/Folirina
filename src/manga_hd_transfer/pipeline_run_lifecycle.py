@@ -5,6 +5,7 @@ from typing import Callable
 import inspect
 
 from .config import PipelineConfig
+from .cache import RESUME_SCHEMA
 from .io_utils import save_json
 from .mode_contracts import clear_stale_mode_outputs
 from .models import PagePair, PageProject, QAItem
@@ -14,6 +15,7 @@ from .result_state import (
     restore_run_snapshot,
 )
 from .run_trace import PageRunTrace
+from .run_receipt import write_run_receipt
 from .workspace_guard import PageRunGuard, cleanup_orphan_temp_files
 from .workspace_integrity import validate_page_workspace
 
@@ -107,39 +109,68 @@ def run_page_lifecycle(
                 })
                 raise
 
-            selected_strategy = _selected_strategy(project)
-            integrity = validate_page_workspace(root, project, mode, selected_strategy=selected_strategy)
-            project.meta["workspace_integrity"] = integrity
-            if not integrity.get("pass"):
-                existing = {q.code for q in project.qa}
-                if "workspace_integrity_failed" not in existing:
-                    project.qa.append(QAItem(
-                        "workspace_integrity_failed", "error",
-                        "Page workspace failed post-run integrity validation.",
-                        meta={"issues": list(integrity.get("issues") or []), "mode": mode},
-                    ))
-            project.meta["qa_summary"] = qa_summary(project.qa)
-            save_json(root / "qa.json", {"summary": qa_summary(project.qa), "issues": [x.to_dict() for x in project.qa]})
-            save_json(root / "project.json", project.to_dict())
-            reletter_meta = (project.meta or {}).get("reletter") or {}
-            trace.event(
-                "run_success", selected_strategy=selected_strategy,
-                successful_regions=int(reletter_meta.get("successful_regions") or 0),
-                failed_regions=int(reletter_meta.get("failed_regions") or 0),
-                qa_pass=bool((project.meta.get("qa_summary") or {}).get("pass", False)),
-                workspace_integrity=bool(integrity.get("pass")),
-            )
-            save_json(root / "last_run_state.json", {
-                "schema": "manga_hd_translation_transfer.run_state.v2",
-                "status": "success" if integrity.get("pass") else "integrity_failed",
-                "mode": mode,
-                "run_id": trace.run_id,
-                "selected_strategy": selected_strategy,
-                "workspace_integrity": integrity,
-                "run_log": str(trace.text_path),
-                "run_trace": str(trace.jsonl_path),
-                "orphan_temp_cleanup": orphan_cleanup,
-            })
+            try:
+                # The transaction does not end when the pixel renderer returns.
+                # Receipt/integrity/project publication can also fail (disk full,
+                # permission loss, malformed plugin metadata). Keep the previous
+                # coherent page snapshot until every common commit step succeeds.
+                selected_strategy = _selected_strategy(project)
+                project.meta["resume_contract"] = RESUME_SCHEMA
+                project.meta["run_receipt"] = write_run_receipt(
+                    root, project, requested_mode=mode, selected_strategy=selected_strategy, run_id=trace.run_id,
+                )
+                integrity = validate_page_workspace(root, project, mode, selected_strategy=selected_strategy)
+                project.meta["workspace_integrity"] = integrity
+                if not integrity.get("pass"):
+                    existing = {q.code for q in project.qa}
+                    if "workspace_integrity_failed" not in existing:
+                        project.qa.append(QAItem(
+                            "workspace_integrity_failed", "error",
+                            "Page workspace failed post-run integrity validation.",
+                            meta={"issues": list(integrity.get("issues") or []), "mode": mode},
+                        ))
+                project.meta["qa_summary"] = qa_summary(project.qa)
+                save_json(root / "qa.json", {"summary": qa_summary(project.qa), "issues": [x.to_dict() for x in project.qa]})
+                save_json(root / "project.json", project.to_dict())
+                reletter_meta = (project.meta or {}).get("reletter") or {}
+                trace.event(
+                    "run_success", selected_strategy=selected_strategy,
+                    successful_regions=int(reletter_meta.get("successful_regions") or 0),
+                    failed_regions=int(reletter_meta.get("failed_regions") or 0),
+                    qa_pass=bool((project.meta.get("qa_summary") or {}).get("pass", False)),
+                    workspace_integrity=bool(integrity.get("pass")),
+                )
+                save_json(root / "last_run_state.json", {
+                    "schema": "manga_hd_translation_transfer.run_state.v2",
+                    "status": "success" if integrity.get("pass") else "integrity_failed",
+                    "mode": mode,
+                    "run_id": trace.run_id,
+                    "selected_strategy": selected_strategy,
+                    "workspace_integrity": integrity,
+                    "run_log": str(trace.text_path),
+                    "run_trace": str(trace.jsonl_path),
+                    "orphan_temp_cleanup": orphan_cleanup,
+                })
+            except Exception as exc:
+                try:
+                    clear_stale_mode_outputs(root)
+                    invalidate_manual_review_state(root)
+                except Exception:
+                    pass
+                restored = restore_run_snapshot(root, snapshot)
+                trace.exception("run_commit_failed", exc, previous_result_restore=restored)
+                try:
+                    save_json(root / "last_run_state.json", {
+                        "schema": "manga_hd_translation_transfer.run_state.v2",
+                        "status": "failed", "stage": "commit", "mode": mode,
+                        "run_id": trace.run_id, "error_type": type(exc).__name__, "error": str(exc),
+                        "previous_result_restored": restored,
+                        "run_log": str(trace.text_path), "run_trace": str(trace.jsonl_path),
+                        "orphan_temp_cleanup": orphan_cleanup,
+                    })
+                except Exception:
+                    pass
+                raise
             discard_run_snapshot(snapshot)
             return project
     finally:

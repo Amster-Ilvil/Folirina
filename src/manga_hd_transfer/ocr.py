@@ -8,7 +8,6 @@ import subprocess
 import tempfile
 import threading
 import time
-from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
@@ -19,36 +18,9 @@ from .config import OCRConfig
 from .model_downloads import discovered_paddle_model_dirs
 from .geometry import bbox_polygon, polygon_centroid
 from .models import TextBlock
+from .ocr_base import OCRBackend
 
 logger = logging.getLogger(__name__)
-
-
-class OCRBackend(ABC):
-    # Capability flags let the pipeline choose the correct OCR route without
-    # hard-coding backend class names. Coordinate-bound external/sidecar results
-    # must never be fed a rectified temporary image, while local OCR engines can
-    # safely recognize arbitrary crops.
-    supports_crop_recognition: bool = True
-    supports_region_query: bool = False
-    supports_rectified_input: bool = True
-    retry_crops: bool = False
-
-    @abstractmethod
-    def recognize(self, image: np.ndarray, *, image_path: str | Path | None = None) -> list[TextBlock]:
-        raise NotImplementedError
-
-    def recognize_region(
-        self,
-        page_image: np.ndarray,
-        bbox: tuple[int, int, int, int],
-        *,
-        image_path: str | Path | None = None,
-    ) -> list[TextBlock]:
-        if not self.supports_crop_recognition:
-            raise RuntimeError(f"{type(self).__name__} 不支持局部 OCR。")
-        x0, y0, x1, y1 = [int(v) for v in bbox]
-        crop = page_image[max(0,y0):max(0,y1), max(0,x0):max(0,x1)]
-        return self.recognize(crop, image_path=None)
 
 
 class NullOCRBackend(OCRBackend):

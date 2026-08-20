@@ -171,7 +171,7 @@ def doctor_cmd():
         "imagemagick": __import__("shutil").which("magick") is not None,
         "spandrel_installed": importlib.util.find_spec("spandrel") is not None,
         "ultralytics_installed": importlib.util.find_spec("ultralytics") is not None,
-        "runtime": runtime_summary("auto"),
+        "runtime": runtime_summary("auto", probe_torch=True),
     }
     try:
         status["font"] = find_default_font()

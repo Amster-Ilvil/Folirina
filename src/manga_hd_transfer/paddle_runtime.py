@@ -23,7 +23,7 @@ import threading
 import time
 from typing import Callable, Iterable
 
-from .model_downloads import model_home
+from .storage_paths import model_home
 from .tls_support import apply_runtime_tls_environment, ssl_failure_hint
 
 ProgressFn = Callable[[str], None]
@@ -471,7 +471,11 @@ def ensure_pipeline_dependencies(pipeline: str, progress: ProgressFn | None = No
     name = str(pipeline or "ocr").strip().lower()
     if name not in {"vl", "structure"}:
         return ensure_runtime(progress)
-    from .paddle_doc_runtime import ensure_runtime as ensure_doc_runtime
+    # Import at call time only.  ``paddle_doc_runtime`` reuses the classic
+    # runtime's install primitives, so a module-level/static import here would
+    # recreate a paddle_runtime <-> paddle_doc_runtime cycle.
+    import importlib
+    ensure_doc_runtime = importlib.import_module(f"{__package__}.paddle_doc_runtime").ensure_runtime
     return ensure_doc_runtime(progress, force_repair=force_repair)
 
 

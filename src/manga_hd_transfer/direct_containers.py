@@ -28,8 +28,9 @@ from .mask_geometry import BubblePatchMatch
 from .mask_transfer_models import MaskTransferRecord, MaskTransferResult
 from .models import BubbleInstance, RegistrationResult
 from .plugins import REGISTRY as PROVIDER_REGISTRY
-from .text_only_transfer import transfer_text_only, target_container_border_mask
+from .text_only_transfer import transfer_text_only, target_container_border_mask, target_text_mask_in_container
 from .modes.direct_patch.overlay import compose_direct_overlay
+from .mask_content_audit import _evaluate_content_completeness
 
 
 @dataclass(slots=True)
@@ -853,6 +854,122 @@ def _constrain_direct_write_to_target_border(
     }
 
 
+def _restore_damaged_target_structural_lines(
+    candidate: np.ndarray,
+    target_before: np.ndarray,
+    clear_geometry: np.ndarray,
+    cfg,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Restore TARGET balloon/rule pixels that a white-container clear damaged.
+
+    The ordinary pre-write border detector is intentionally conservative so it
+    does not mistake edge-adjacent Japanese punctuation for a balloon outline.
+    That can miss a broken/partial oval segment.  This post-pass has a stronger
+    fact available: it only inspects TARGET dark pixels that the candidate has
+    *actually lightened*.  Within a narrow outer strip of the registered clear
+    geometry it restores long/thin structural components byte-exact from TARGET.
+
+    Central Japanese text is excluded by the outer-strip gate, while a missing
+    left/right/top/bottom bubble edge remains recoverable even when the source
+    edition does not contain that exact line segment.
+    """
+    geom = (np.asarray(clear_geometry) > 0).astype(np.uint8)
+    empty = np.zeros(geom.shape, np.uint8)
+    diag = {
+        "enabled": bool(getattr(cfg, "direct_post_structural_restore_enabled", True)),
+        "candidate_lost_dark_pixels": 0,
+        "restored_components": 0,
+        "restored_core_pixels": 0,
+        "restored_pixels": 0,
+        "reason": "ok",
+    }
+    if not diag["enabled"]:
+        diag["reason"] = "disabled"
+        return candidate, empty, diag
+    if candidate.shape != target_before.shape or candidate.shape[:2] != geom.shape or not np.any(geom):
+        diag["reason"] = "shape_or_geometry_invalid"
+        return candidate, empty, diag
+
+    tg = cv2.cvtColor(target_before, cv2.COLOR_BGR2GRAY) if target_before.ndim == 3 else target_before.astype(np.uint8)
+    cg = cv2.cvtColor(candidate, cv2.COLOR_BGR2GRAY) if candidate.ndim == 3 else candidate.astype(np.uint8)
+    changed = np.any(candidate != target_before, axis=2) if candidate.ndim == 3 else (candidate != target_before)
+    dark_max = int(getattr(cfg, "direct_post_structural_restore_target_dark_max", 205))
+    lighten = int(getattr(cfg, "direct_post_structural_restore_min_lighten", 18))
+    lost_dark = changed & (tg <= dark_max) & ((cg.astype(np.int16) - tg.astype(np.int16)) >= lighten)
+    diag["candidate_lost_dark_pixels"] = int(np.count_nonzero(lost_dark))
+    if not np.any(lost_dark):
+        diag["reason"] = "no_lost_target_dark_pixels"
+        return candidate, empty, diag
+
+    nz = cv2.findNonZero(geom * 255)
+    if nz is None:
+        diag["reason"] = "empty_geometry"
+        return candidate, empty, diag
+    gx, gy, gw, gh = [int(v) for v in cv2.boundingRect(nz)]
+    # Outer strips are defined in the *registered container* coordinate frame,
+    # not the image crop frame. This is what rejects central Japanese lettering.
+    x_margin = max(6, int(round(gw * float(getattr(cfg, "direct_post_structural_restore_edge_ratio_x", 0.16)))))
+    y_margin = max(6, int(round(gh * float(getattr(cfg, "direct_post_structural_restore_edge_ratio_y", 0.12)))))
+    yy, xx = np.indices(geom.shape)
+    edge_strip = geom.astype(bool) & (
+        (xx <= gx + x_margin)
+        | (xx >= gx + gw - 1 - x_margin)
+        | (yy <= gy + y_margin)
+        | (yy >= gy + gh - 1 - y_margin)
+    )
+
+    # Also stay near the geometry boundary. Broken oval segments can sit a few
+    # pixels inward because the clear mask describes the paper interior rather
+    # than the line centre itself.
+    boundary = cv2.morphologyEx(geom * 255, cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8)) > 0
+    band_px = max(2, int(getattr(cfg, "direct_post_structural_restore_boundary_band_px", 6)))
+    band = cv2.dilate(
+        boundary.astype(np.uint8),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * band_px + 1, 2 * band_px + 1)),
+        iterations=1,
+    ) > 0
+    core_candidates = lost_dark & edge_strip & band
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(core_candidates.astype(np.uint8), 8)
+    restore_core = np.zeros(geom.shape, np.uint8)
+    min_area = max(3, int(getattr(cfg, "direct_post_structural_restore_min_area_px", 10)))
+    for lab in range(1, n):
+        x, y, bw, bh, area = [int(v) for v in stats[lab]]
+        if area < min_area:
+            continue
+        comp = labels == lab
+        span_x = bw / max(1.0, float(gw))
+        span_y = bh / max(1.0, float(gh))
+        fill = area / max(1.0, float(bw * bh))
+        near_lr = x <= gx + x_margin or (x + bw - 1) >= gx + gw - 1 - x_margin
+        near_tb = y <= gy + y_margin or (y + bh - 1) >= gy + gh - 1 - y_margin
+        vertical_line = near_lr and bh >= max(10, int(round(bw * 1.8))) and span_y >= 0.12
+        horizontal_line = near_tb and bw >= max(10, int(round(bh * 1.8))) and span_x >= 0.12
+        curved_outline = (near_lr or near_tb) and (span_x >= 0.16 or span_y >= 0.16) and fill <= 0.46
+        if vertical_line or horizontal_line or curved_outline:
+            restore_core[comp] = 255
+            diag["restored_components"] += 1
+
+    core_n = int(cv2.countNonZero(restore_core))
+    diag["restored_core_pixels"] = core_n
+    if core_n <= 0:
+        diag["reason"] = "no_structural_component"
+        return candidate, empty, diag
+
+    # Restore the anti-aliased fringe of accepted line cores as well, but only
+    # pixels that truly changed and were non-paper in TARGET.
+    fringe_px = max(0, int(getattr(cfg, "direct_post_structural_restore_fringe_px", 1)))
+    restore = restore_core > 0
+    if fringe_px > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * fringe_px + 1, 2 * fringe_px + 1))
+        halo = cv2.dilate(restore_core, k, iterations=1) > 0
+        restore |= halo & changed & (tg <= int(getattr(cfg, "direct_post_structural_restore_fringe_gray_max", 238)))
+    restore_u8 = restore.astype(np.uint8) * 255
+    out = candidate.copy()
+    out[restore] = target_before[restore]
+    diag["restored_pixels"] = int(cv2.countNonZero(restore_u8))
+    return out, restore_u8, diag
+
+
 def _publication_safety_enabled(cfg) -> bool:
     """Legacy compatibility shim: publication blocking was removed in v1.0.6.
 
@@ -889,6 +1006,32 @@ def _source_direct_registration_gate(
         and float(getattr(registration, "spatial_coverage", 0.0)) >= float(getattr(cfg, "source_direct_cross_rendition_min_spatial_coverage", 0.55))
     )
     return accepted, accepted
+
+def _refine_direct_source_hint_mask(
+    source_gray: np.ndarray,
+    filled: np.ndarray,
+    inset: int,
+    cfg,
+    *,
+    is_source_hint: bool,
+    hint_backend: str,
+) -> tuple[np.ndarray, int, dict]:
+    """Return the Direct transfer interior for one accepted SOURCE candidate.
+
+    A pseudo-text-barrier hint is already a reconstructed semantic *interior*;
+    applying the generic progressive border erosion again clips boundary-adjacent
+    translated columns. All other providers keep the v2.3.17 refiner unchanged.
+    """
+    pseudo_semantic_interior=bool(is_source_hint and str(hint_backend)=="pseudo_text_barrier")
+    if pseudo_semantic_interior:
+        return filled.copy(),0,{
+            "provider_semantic_interior":True,
+            "estimated_border_px":0,
+            "selected_inset_px":0,
+        }
+    mask_refiner=PROVIDER_REGISTRY.get("mask_refiner","progressive_border") or _progressive_transfer_mask
+    return mask_refiner(source_gray,filled,inset,cfg)
+
 
 def build_source_direct_container_plan(
     source: np.ndarray,
@@ -1108,8 +1251,15 @@ def build_source_direct_container_plan(
 
         filled = np.zeros_like(source_gray)
         cv2.drawContours(filled, [contour], -1, 255, cv2.FILLED)
-        mask_refiner = PROVIDER_REGISTRY.get("mask_refiner", "progressive_border") or _progressive_transfer_mask
-        inner, selected_inset, mask_fit_diag = mask_refiner(source_gray, filled, inset, cfg)
+        # pseudo_text_barrier already returns a recovered *interior* semantic
+        # container.  Re-running the generic progressive border erosion on it
+        # double-insets the authority and can clip the first/last translated
+        # column.  Keep the v2.3.17 Direct renderer unchanged and skip only this
+        # provider-specific second erosion; TARGET border protection and the
+        # renderer's own border guard still apply later in the Direct pipeline.
+        inner, selected_inset, mask_fit_diag = _refine_direct_source_hint_mask(
+            source_gray,filled,inset,cfg,is_source_hint=is_source_hint,hint_backend=hint_backend,
+        )
         inner_px = int(cv2.countNonZero(inner))
         if inner_px < 150:
             continue
@@ -1624,6 +1774,20 @@ def build_source_direct_container_plan(
                 clear_dilate_px=max(0, int(getattr(cfg, "source_direct_colored_clear_dilate_px", 1))),
                 inpaint_radius=float(getattr(cfg, "source_direct_colored_inpaint_radius", 2.5)),
                 target_clear_region_mask=local_target_clear_geometry.astype(np.uint8) * 255 if white_mode else None,
+                white_source_clarity_enabled=bool(getattr(cfg, "direct_white_clarity_enhance_enabled", True)),
+                white_source_clarity_alpha_gamma=float(getattr(cfg, "direct_white_clarity_alpha_gamma", 1.0)),
+                white_source_clarity_black_boost=int(getattr(cfg, "direct_white_clarity_black_boost", 0)),
+                white_source_clarity_pure_white_floor=int(getattr(cfg, "direct_white_clarity_pure_white_floor", 248)),
+                white_source_clarity_min_text_pixels=int(getattr(cfg, "direct_white_clarity_min_text_pixels", 18)),
+                post_structural_restore_enabled=bool(getattr(cfg, "direct_post_structural_restore_enabled", True)),
+                post_structural_restore_target_dark_max=int(getattr(cfg, "direct_post_structural_restore_target_dark_max", 205)),
+                post_structural_restore_min_lighten=int(getattr(cfg, "direct_post_structural_restore_min_lighten", 18)),
+                post_structural_restore_edge_ratio_x=float(getattr(cfg, "direct_post_structural_restore_edge_ratio_x", 0.16)),
+                post_structural_restore_edge_ratio_y=float(getattr(cfg, "direct_post_structural_restore_edge_ratio_y", 0.12)),
+                post_structural_restore_boundary_band_px=int(getattr(cfg, "direct_post_structural_restore_boundary_band_px", 6)),
+                post_structural_restore_min_area_px=int(getattr(cfg, "direct_post_structural_restore_min_area_px", 10)),
+                post_structural_restore_fringe_px=int(getattr(cfg, "direct_post_structural_restore_fringe_px", 1)),
+                post_structural_restore_fringe_gray_max=int(getattr(cfg, "direct_post_structural_restore_fringe_gray_max", 238)),
             )
         else:
             candidate_region, local_write_mask, local_source_text_mask, colored_transfer_diag = transfer_text_only(
@@ -1681,10 +1845,29 @@ def build_source_direct_container_plan(
             changed_after_restore = int(np.count_nonzero(
                 np.any(candidate_region[local_target_border_protected] != target_region_before[local_target_border_protected], axis=1)
             ))
+        post_structural_restore_diag = dict(colored_transfer_diag.get("post_structural_restore") or {"enabled": False, "restored_pixels": 0})
+        # The borderless Direct overlay owns the post-clear structural restore so
+        # it can update its own clear/source-text masks atomically.  Retain this
+        # local fallback only for the legacy non-borderless transfer path; running
+        # both passes needlessly repeats connected-components work and can make
+        # diagnostics ambiguous.
+        if (
+            not bool(getattr(cfg, "direct_borderless_overlay_enabled", False))
+            and white_mode
+            and bool(colored_transfer_diag.get("white_full_clear_applied", False))
+        ):
+            candidate_region, post_restore_mask, post_structural_restore_diag = _restore_damaged_target_structural_lines(
+                candidate_region, target_region_before, local_target_clear_geometry, cfg
+            )
+            if int(cv2.countNonZero(post_restore_mask)) > 0:
+                local_source_text_mask[post_restore_mask > 0] = 0
+                changed_now = np.any(candidate_region != target_region_before, axis=2)
+                local_write_mask = changed_now.astype(np.uint8) * 255
         target_border_diag.update({
             "exact_restore_enabled": bool(getattr(cfg, "source_direct_exact_target_border_restore", True)),
             "changed_before_restore": int(changed_before_restore),
             "changed_after_restore": int(changed_after_restore),
+            "post_structural_restore": post_structural_restore_diag,
         })
         colored_transfer_diag["source_ink_pixels"] = int(cv2.countNonZero(local_source_text_mask))
         colored_transfer_diag["write_pixels"] = int(cv2.countNonZero(local_write_mask))
@@ -1847,10 +2030,50 @@ def build_source_direct_container_plan(
         rec.ink_ratio = float(source_ink_pixels / target_mask_pixels)
         rec.source_bbox = _mask_bbox(source_full_mask)
         rec.target_bbox = _mask_bbox(target_full_mask)
-        rec.content_check = "checked_borderless_source_overlay_target_underlay"
-        rec.source_ink_coverage = 1.0
-        rec.target_residual_ratio = 0.0
-        rec.content_complete = True
+        # Independent content verification.  ``applied`` only means pixels were
+        # written; it must never be treated as proof that all Chinese survived or
+        # all Japanese disappeared.  Audit the actual final local raster against
+        # complete SOURCE/TARGET compact ink evidence.
+        target_audit_region = (local_target_clear_geometry.astype(np.uint8) * 255)
+        # Completeness QA must judge lettering, not the balloon outline/tail.
+        # Direct's target-clear geometry deliberately reaches the container edge
+        # so it can erase Japanese glyphs, but compact dark edge fragments can
+        # otherwise be misclassified as residual text.  Audit only a shallow
+        # interior of the same trusted container; rendering/clearing itself is
+        # unchanged.
+        audit_guard_px = 3
+        audit_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (audit_guard_px * 2 + 1, audit_guard_px * 2 + 1)
+        )
+        target_audit_region = cv2.erode(target_audit_region, audit_kernel, iterations=1)
+        target_audit_mask = target_text_mask_in_container(target_region_before, target_audit_region)
+        clarity_audit_diag = colored_transfer_diag.get("white_source_clarity") or {}
+        source_fidelity_audit = bool(
+            clarity_audit_diag.get("source_raster_fidelity_lock", False)
+            or clarity_audit_diag.get("source_text_mask_is_gate_only", False)
+        )
+        # The source-faithful route publishes the continuous SOURCE raster, while
+        # the audit mask is a thresholded compact-ink approximation. Subpixel
+        # resampling can therefore score ~0.93-0.94 despite every glyph component
+        # being visibly present. Keep the normal 0.94 gate elsewhere, but use a
+        # still-conservative 0.92 floor for this explicitly fidelity-locked path.
+        audit_min_source_coverage = max(
+            0.92 if source_fidelity_audit else 0.94,
+            float(getattr(cfg, "content_completeness_min_source_coverage", 0.90)),
+        )
+        _evaluate_content_completeness(
+            rec, local_source_text_mask, target_audit_mask, dst_region, cfg,
+            tolerance_px=max(2, int(getattr(cfg, "content_completeness_tolerance_px", 2))),
+            min_source_coverage=audit_min_source_coverage,
+            max_target_residual=min(0.06, float(getattr(cfg, "content_completeness_max_target_residual", 0.10))),
+        )
+        rec.meta["content_audit_min_source_coverage"] = float(audit_min_source_coverage)
+        rec.meta["source_raster_fidelity_audit"] = bool(source_fidelity_audit)
+        if not bool(rec.content_complete):
+            rec.review_required = True
+            rec.review_reason = "direct_content_incomplete_after_render"
+            rec.restorable = True
+            rec.editable = True
         rec.clarity_mode = "direct-borderless-source-overlay"
         matches.append(match); records.append(rec)
         accepted_boundary_scores.append(float(best_score))
@@ -1902,7 +2125,7 @@ def build_source_direct_container_plan(
         "raw_contour_candidates_total": int(len(raw_contour_entries)),
         "raw_contour_candidates_suppressed": int(raw_contour_suppressed_count),
         "candidate_authority": "source_bubble_or_textbox_hints_only",
-        "strict_direct_support_guard": "fail_closed_exact_semantic_mask",
+        "strict_direct_support_guard": "bounded_semantic_support_tolerance",
         "accepted": len(records),
         "accepted_white": int(accepted_white),
         "accepted_colored_spiky": int(accepted_colored),

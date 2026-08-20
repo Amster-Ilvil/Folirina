@@ -83,10 +83,12 @@ def _polygon_to_mask(shape: Tuple[int, int], polygon: Sequence[Sequence[float]])
 
 
 def _mask_bbox(mask: np.ndarray) -> List[int]:
-    ys, xs = np.where(mask > 0)
-    if xs.size == 0:
+    binary = mask if mask.dtype == np.uint8 else (mask > 0).astype(np.uint8)
+    nz = cv2.findNonZero(binary)
+    if nz is None:
         return [0, 0, 0, 0]
-    return [int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1]
+    x, y, w, h = cv2.boundingRect(nz)
+    return [int(x), int(y), int(x + w), int(y + h)]
 
 
 def _mask_iou(a: np.ndarray, b: np.ndarray) -> float:

@@ -160,6 +160,32 @@ class SettingsPage(QWidget):
     def is_updating(self) -> bool:
         return bool(self._install_worker is not None and self._install_worker.isRunning())
 
+    @property
+    def is_checking_updates(self) -> bool:
+        return bool(self._check_worker is not None and self._check_worker.isRunning())
+
+    def shutdown_background_workers(self, timeout_ms: int = 1800) -> bool:
+        """Request a safe stop before QApplication tears down QThread wrappers.
+
+        Update installation is transactional and must never be force-terminated;
+        if it cannot finish promptly the main window simply refuses to close and
+        the user can retry after completion.  The update-check thread is read-only
+        but follows the same non-destructive policy.
+        """
+        all_stopped = True
+        for worker in (self._check_worker, self._install_worker):
+            try:
+                if worker is None or not worker.isRunning():
+                    continue
+                worker.requestInterruption()
+                worker.wait(max(0, int(timeout_ms)))
+                if worker.isRunning():
+                    all_stopped = False
+            except Exception:
+                logger.debug("settings worker shutdown failed", exc_info=True)
+                all_stopped = False
+        return all_stopped
+
     def sync_theme(self) -> None:
         index = self.theme_combo.findData(self.window.theme_name) if hasattr(self, "theme_combo") else -1
         if index >= 0 and self.theme_combo.currentIndex() != index:

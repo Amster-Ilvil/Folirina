@@ -25,6 +25,7 @@ import shutil
 import subprocess
 
 from .config import PipelineConfig
+from .storage_paths import model_home
 
 logger = logging.getLogger(__name__)
 
@@ -78,28 +79,6 @@ def _open_url(req: Request, *, timeout: float):
         return build_opener(*handlers).open(req, timeout=timeout)
     # Default urllib opener respects the user's existing system/environment proxy.
     return urlopen(req, timeout=timeout)
-
-
-def model_home() -> Path:
-    override = str(os.environ.get("FOLIRINA_MODEL_HOME", "") or os.environ.get("MHD_MODEL_HOME", "") or "").strip()
-    if override:
-        return Path(override).expanduser().resolve()
-    home = Path.home()
-    system = platform.system()
-    if system == "Darwin":
-        preferred = home / "Library" / "Application Support" / "Folirina" / "models"
-        legacy = home / "Library" / "Application Support" / "Manga HD Transfer Studio" / "models"
-    elif system == "Windows":
-        local = Path(os.environ.get("LOCALAPPDATA", str(home / "AppData" / "Local")))
-        preferred = local / "Folirina" / "models"
-        legacy = local / "MangaHDTransfer" / "models"
-    else:
-        preferred = home / ".local" / "share" / "folirina" / "models"
-        legacy = home / ".local" / "share" / "manga-hd-transfer" / "models"
-    # Do not force existing users to re-download large models after the rename.
-    if not preferred.exists() and legacy.exists():
-        return legacy
-    return preferred
 
 
 def torch_checkpoint_dir() -> Path:

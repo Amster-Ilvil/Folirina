@@ -34,12 +34,18 @@ MODE_DERIVED_ARTIFACTS: dict[str, tuple[str, ...]] = {
 # Derived artifacts are safe to delete before a fresh automatic pass. Manual
 # *input* files are intentionally absent from this list. Ownership comes from mode specs.
 COMMON_DERIVED_ARTIFACTS = (
+    "run_receipt.json", "transfer_audit.json", "qa.json",
+    "clear_mask.png", "target_clear_mask.png",
     "final_reviewed.png", "review_applied.json", "review_base.png",
     "review_preview.png", "editable_reviewed.ora", "editable_reviewed.psd",
     "editable.ora", "editable.psd", "inpainted.png",
     "text_layer.png", "text_layer_reviewed.png", "chinese_transfer_layer.png",
     "review_overrides.template.json", "removed_text_preview.png", "remove_text_stage.json",
 )
+
+# Generated evidence bundles that belong to the last automatic pass.  Manual
+# OCR editor state lives under ``ocr_edit`` and is intentionally not included.
+COMMON_DERIVED_DIRECTORIES = ("replace_translation",)
 
 
 def clear_stale_mode_outputs(page_root: str | Path) -> dict[str, int]:
@@ -68,7 +74,22 @@ def clear_stale_mode_outputs(page_root: str | Path) -> dict[str, int]:
                     removed += 1
             except OSError:
                 pass
-    return {"removed": removed}
+    removed_dirs = 0
+    for name in COMMON_DERIVED_DIRECTORIES:
+        path = root / name
+        if not path.exists():
+            continue
+        try:
+            import shutil
+            if path.is_dir():
+                shutil.rmtree(path)
+                removed_dirs += 1
+            else:
+                path.unlink()
+                removed += 1
+        except OSError:
+            pass
+    return {"removed": removed, "removed_dirs": removed_dirs}
 
 
 def artifact_ownership_snapshot(page_root: str | Path) -> dict[str, list[str]]:
@@ -100,7 +121,10 @@ def mode_artifact_violations(mode: str, page_root: str | Path, *, selected_strat
         else:
             allowed = {"mask_replace"}
     elif key == "hybrid":
-        allowed = {"mask_replace", "reletter"}
+        # Hybrid owns its own mask/text artifacts. It may *execute* a private
+        # mask-first + OCR fallback pipeline, but must never publish Mask or
+        # Reletter-owned files into the same workspace.
+        allowed = {"hybrid"}
     elif key == "aligned_overlay_reveal":
         allowed = {"aligned_overlay_reveal"}
     else:

@@ -49,23 +49,53 @@ def _nearest_white_seed(mask: np.ndarray, x: int, y: int, radius: int) -> tuple[
 
 
 def _safe_mask(component: np.ndarray, seed: tuple[int, int], margin: int) -> np.ndarray:
-    binary = (component > 0).astype(np.uint8)
-    dist = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
-    safe = (dist >= max(1, margin)).astype(np.uint8) * 255
-    if not np.any(safe):
+    """Return the connected safe interior while avoiding full-page transforms.
+
+    Most bubble/container masks occupy only a small part of a manga page.  Older
+    code ran ``distanceTransform`` and connected-components on the entire page for
+    every candidate, which made OCR-free completion disproportionately expensive.
+    This ROI implementation preserves the old edge semantics: sides that touch the
+    real image boundary are *not* padded with synthetic zeros, while interior sides
+    receive a one-pixel zero guard just as the surrounding page did.
+    """
+    mask = (component > 0).astype(np.uint8)
+    nz = cv2.findNonZero(mask)
+    if nz is None:
+        return component.copy()
+    x, y, w, h = cv2.boundingRect(nz)
+    H, W = mask.shape
+    x0 = max(0, x - (1 if x > 0 else 0))
+    y0 = max(0, y - (1 if y > 0 else 0))
+    x1 = min(W, x + w + (1 if x + w < W else 0))
+    y1 = min(H, y + h + (1 if y + h < H else 0))
+    roi = mask[y0:y1, x0:x1]
+
+    dist = cv2.distanceTransform(roi, cv2.DIST_L2, 5)
+    threshold = max(1, int(margin))
+    safe_roi = (dist >= threshold).astype(np.uint8) * 255
+    if not np.any(safe_roi):
         # Relax instead of returning an unusable region.
-        safe = (dist >= max(1, margin // 2)).astype(np.uint8) * 255
-    if not np.any(safe):
+        safe_roi = (dist >= max(1, int(margin) // 2)).astype(np.uint8) * 255
+    if not np.any(safe_roi):
         return component.copy()
 
-    count, labels, stats, _ = cv2.connectedComponentsWithStats((safe > 0).astype(np.uint8), 8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats((safe_roi > 0).astype(np.uint8), 8)
     sx, sy = seed
-    wanted = labels[int(np.clip(sy, 0, labels.shape[0] - 1)), int(np.clip(sx, 0, labels.shape[1] - 1))]
+    lx = int(np.clip(int(sx) - x0, 0, labels.shape[1] - 1))
+    ly = int(np.clip(int(sy) - y0, 0, labels.shape[0] - 1))
+    wanted = int(labels[ly, lx])
     if wanted == 0:
         if count <= 1:
-            return safe
-        wanted = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    return (labels == wanted).astype(np.uint8) * 255
+            chosen_roi = safe_roi
+        else:
+            wanted = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+            chosen_roi = (labels == wanted).astype(np.uint8) * 255
+    else:
+        chosen_roi = (labels == wanted).astype(np.uint8) * 255
+
+    out = np.zeros_like(component, dtype=np.uint8)
+    out[y0:y1, x0:x1] = chosen_roi
+    return out
 
 
 def detect_seeded_white_bubbles(
@@ -195,22 +225,32 @@ def detect_unseeded_white_containers(
         aspect = max(bw / max(1.0, bh), bh / max(1.0, bw))
         if aspect > max_aspect:
             continue
-        raw = (labels == label).astype(np.uint8) * 255
-        contours, _ = cv2.findContours(raw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Work inside the connected-component bbox until a candidate has passed
+        # all cheap content gates.  Building a full-page boolean mask for every
+        # label was a major cost on 2K/4K manga pages and produced identical data
+        # outside this bbox (all zeros).
+        pad = 3  # matches the radius of the 7x7 erosion used below
+        rx0, ry0 = max(0, x - pad), max(0, y - pad)
+        rx1, ry1 = min(w, x + bw + pad), min(h, y + bh + pad)
+        label_roi = labels[ry0:ry1, rx0:rx1]
+        raw_roi = (label_roi == label).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(raw_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             continue
-        outer = max(contours, key=cv2.contourArea)
-        component = np.zeros_like(raw); cv2.drawContours(component, [outer], -1, 255, cv2.FILLED)
-        bx, by, cw, ch = cv2.boundingRect(outer)
-        fill_ratio = float(cv2.countNonZero(component) / max(1, cw * ch))
+        outer_roi = max(contours, key=cv2.contourArea)
+        component_roi = np.zeros_like(raw_roi); cv2.drawContours(component_roi, [outer_roi], -1, 255, cv2.FILLED)
+        bx, by, cw, ch = cv2.boundingRect(outer_roi)
+        fill_ratio = float(cv2.countNonZero(component_roi) / max(1, cw * ch))
         if fill_ratio < min_fill:
             continue
-        inner = cv2.erode(component, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
-        inner_sel = inner > 0
-        vals = gray[inner_sel]
+        inner_roi = cv2.erode(component_roi, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+        inner_sel = inner_roi > 0
+        gray_roi = gray[ry0:ry1, rx0:rx1]
+        sat_roi = sat[ry0:ry1, rx0:rx1]
+        vals = gray_roi[inner_sel]
         if vals.size < 24:
             continue
-        sat_vals = sat[inner_sel]
+        sat_vals = sat_roi[inner_sel]
         dark_ratio = float(np.mean(vals < 190))
         white_ratio = float(np.mean(vals > 225))
         saturation_median = float(np.median(sat_vals)) if sat_vals.size else 0.0
@@ -220,20 +260,21 @@ def detect_unseeded_white_containers(
         # Require at least a little compact character-like ink. This removes many
         # empty white architecture patches while keeping punctuation and short
         # speech. Large/long components are ignored as panel rules or artwork.
-        dark = ((gray < 190) & (inner > 0)).astype(np.uint8)
+        dark = ((gray_roi < 190) & (inner_roi > 0)).astype(np.uint8)
         cc, _labs, ccstats, _ = cv2.connectedComponentsWithStats(dark, 8)
         compact = 0
         compact_area = 0
+        inner_pixels = max(1, cv2.countNonZero(inner_roi))
         for j in range(1, cc):
             _x, _y, ww, hh, aa = [int(v) for v in ccstats[j]]
-            if aa < 2 or aa > max(600, int(0.03 * max(1, cv2.countNonZero(inner)))):
+            if aa < 2 or aa > max(600, int(0.03 * inner_pixels)):
                 continue
             if ww > 0.34 * cw or hh > 0.34 * ch:
                 continue
             if max(ww / max(1.0, hh), hh / max(1.0, ww)) > 10.0:
                 continue
             compact += 1; compact_area += aa
-        compact_density = compact_area / max(1, cv2.countNonZero(inner))
+        compact_density = compact_area / inner_pixels
         # A very short vertical narration may be only one glyph plus a long dash.
         # Old code required >=2 compact components and silently missed such boxes.
         # Rescue only strong neutral rectangular containers; later registered
@@ -248,13 +289,15 @@ def detect_unseeded_white_containers(
         )
         if compact < 2 and compact_density < 0.004 and not short_rect:
             continue
+        component = np.zeros_like(gray, dtype=np.uint8)
+        component[ry0:ry1, rx0:rx1] = component_roi
         polygon = mask_to_largest_polygon(component)
         if len(polygon) < 3:
             continue
         margin = max(1, min(cfg.safe_margin_px, max(1, int(min(cw, ch) * 0.025))))
         # Seed with the centre; _safe_mask falls back to largest inner component.
-        safe = _safe_mask(component, (bx + cw // 2, by + ch // 2), margin)
-        approx = cv2.approxPolyDP(outer, 0.02 * (cw + ch), True)
+        safe = _safe_mask(component, (rx0 + bx + cw // 2, ry0 + by + ch // 2), margin)
+        approx = cv2.approxPolyDP(outer_roi, 0.02 * (cw + ch), True)
         kind = "narration" if len(approx) <= 5 and fill_ratio > 0.82 else "speech"
         confidence = float(np.clip(0.55 + 0.25 * white_ratio + 0.12 * min(1.0, compact / 8.0), 0.0, 0.96))
         bubble = BubbleInstance(
@@ -297,19 +340,26 @@ def detect_target_colored_containers(image: np.ndarray, *, prefix: str = "color"
         aspect = max(bw / max(1, bh), bh / max(1, bw))
         if aspect > 4.5:
             continue
-        raw = (labels == label).astype(np.uint8) * 255
-        contours, _ = cv2.findContours(raw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        pad = 3  # matches the radius of the 7x7 erosion used below
+        rx0, ry0 = max(0, x - pad), max(0, y - pad)
+        rx1, ry1 = min(w, x + bw + pad), min(h, y + bh + pad)
+        label_roi = labels[ry0:ry1, rx0:rx1]
+        raw_roi = (label_roi == label).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(raw_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             continue
-        contour = max(contours, key=cv2.contourArea)
-        mask = np.zeros_like(raw); cv2.drawContours(mask, [contour], -1, 255, cv2.FILLED)
-        inner = cv2.erode(mask, np.ones((5, 5), np.uint8))
-        if cv2.countNonZero(inner) < 30:
+        contour_roi = max(contours, key=cv2.contourArea)
+        mask_roi = np.zeros_like(raw_roi); cv2.drawContours(mask_roi, [contour_roi], -1, 255, cv2.FILLED)
+        inner_roi = cv2.erode(mask_roi, np.ones((5, 5), np.uint8))
+        if cv2.countNonZero(inner_roi) < 30:
             continue
-        dark_ratio = float(np.mean(gray[inner > 0] < 175))
-        sat_median = float(np.median(hsv[..., 1][inner > 0]))
+        gray_roi = gray[ry0:ry1, rx0:rx1]
+        sat_roi = hsv[ry0:ry1, rx0:rx1, 1]
+        dark_ratio = float(np.mean(gray_roi[inner_roi > 0] < 175))
+        sat_median = float(np.median(sat_roi[inner_roi > 0]))
         if sat_median < 70 or dark_ratio < 0.006:
             continue
+        mask = np.zeros_like(gray, dtype=np.uint8); mask[ry0:ry1, rx0:rx1] = mask_roi
         poly = mask_to_largest_polygon(mask)
         if len(poly) < 3:
             continue

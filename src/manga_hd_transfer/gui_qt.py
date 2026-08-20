@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+import numpy as np
+
 from PySide6.QtCore import Qt, QSize, QThread, QTimer, Signal, QRectF, QSettings, QUrl
 from PySide6.QtGui import QPixmap, QPainter, QColor, QFont, QImageReader, QImage, QIcon, QPen, QDesktopServices
 from PySide6.QtWidgets import (
@@ -51,16 +53,88 @@ from .model_downloads import apply_config_updates, model_home, model_local_paths
 from .dependency_install import missing_dependency_modules, dependency_summary
 from .paddle_profiles import PADDLE_MODEL_PROFILES, profile_label, backend_profile_key
 from .runtime_preflight import plan_runtime_requirements, pending_model_requirements
+from .gui_processing_policy import (
+    compute_busy_state, classify_progress_state, worker_config_snapshot, completion_message,
+)
 from .io_utils import load_json, save_json, write_image
 from .review_history import record_review_state, undo_review_state, redo_review_state, review_history_counts
 from .font_catalog import discover_fonts
 from .review_apply import apply_review_page, generate_remove_text_preview, apply_target_layer_erase_review, reset_target_layer_erase_review, apply_target_layer_restore_review, reset_target_layer_restore_review, apply_manual_force_transfer_review, reset_manual_force_transfer_review, manual_force_auto_evidence_masks
 from .manual_effect import map_target_bbox_to_source, build_manual_effect_masks, build_reveal_seed_mask, estimate_source_background, composite_source_text_delta, clean_manual_target_text
-from .ocr_edit_blocks import (
-    is_ocr_edit_mode, ocr_edit_scope, load_ocr_blocks, upsert_ocr_block,
-    delete_ocr_block, save_ocr_blocks, recognize_manual_ocr_block,
-)
-from .ocr_edit_render import apply_ocr_edit_blocks, reset_ocr_edit_blocks
+from .modes.reletter import ocr_edit_blocks as _reletter_ocr_edit_blocks
+from .modes.reletter import ocr_edit_render as _reletter_ocr_edit_render
+from .modes.hybrid import ocr_edit_blocks as _hybrid_ocr_edit_blocks
+from .modes.hybrid import ocr_edit_render as _hybrid_ocr_edit_render
+
+
+def _ocr_mode_modules(mode: str):
+    key = str(mode or "").strip().lower()
+    if key == "hybrid":
+        return _hybrid_ocr_edit_blocks, _hybrid_ocr_edit_render
+    if key == "reletter":
+        return _reletter_ocr_edit_blocks, _reletter_ocr_edit_render
+    return None, None
+
+
+def is_ocr_edit_mode(mode: str) -> bool:
+    blocks, _ = _ocr_mode_modules(mode)
+    return blocks is not None and bool(blocks.is_ocr_edit_mode(mode))
+
+
+def ocr_edit_scope(mode: str):
+    blocks, _ = _ocr_mode_modules(mode)
+    return blocks.ocr_edit_scope(mode) if blocks is not None else ""
+
+
+def load_ocr_blocks(page_dir, mode: str):
+    blocks, _ = _ocr_mode_modules(mode)
+    return blocks.load_ocr_blocks(page_dir, mode) if blocks is not None else []
+
+
+def upsert_ocr_block(page_dir, mode: str, row):
+    blocks, _ = _ocr_mode_modules(mode)
+    if blocks is None:
+        raise RuntimeError(f"OCR block editor unavailable for mode: {mode}")
+    return blocks.upsert_ocr_block(page_dir, mode, row)
+
+
+def delete_ocr_block(page_dir, mode: str, block_id):
+    blocks, _ = _ocr_mode_modules(mode)
+    if blocks is None:
+        raise RuntimeError(f"OCR block editor unavailable for mode: {mode}")
+    return blocks.delete_ocr_block(page_dir, mode, block_id)
+
+
+def save_ocr_blocks(page_dir, mode: str, rows):
+    blocks, _ = _ocr_mode_modules(mode)
+    if blocks is None:
+        raise RuntimeError(f"OCR block editor unavailable for mode: {mode}")
+    return blocks.save_ocr_blocks(page_dir, mode, rows)
+
+
+def recognize_manual_ocr_block(project, source_path, target_path, bbox, config, *, existing=None):
+    mode = str((project.get("meta") or {}).get("transfer_mode") or getattr(config.transfer, "mode", "") or "").strip().lower()
+    blocks, _ = _ocr_mode_modules(mode)
+    if blocks is None:
+        raise RuntimeError(f"OCR block editor unavailable for mode: {mode}")
+    return blocks.recognize_manual_ocr_block(project, source_path, target_path, bbox, config, existing=existing)
+
+
+def apply_ocr_edit_blocks(page_dir, project, cfg):
+    mode = str((project.get("meta") or {}).get("transfer_mode") or getattr(cfg.transfer, "mode", "") or "").strip().lower()
+    _, renderer = _ocr_mode_modules(mode)
+    if renderer is None:
+        raise RuntimeError(f"OCR edit render unavailable for mode: {mode}")
+    return renderer.apply_ocr_edit_blocks(page_dir, project, cfg)
+
+
+def reset_ocr_edit_blocks(page_dir, project, cfg):
+    mode = str((project.get("meta") or {}).get("transfer_mode") or getattr(cfg.transfer, "mode", "") or "").strip().lower()
+    _, renderer = _ocr_mode_modules(mode)
+    if renderer is None:
+        raise RuntimeError(f"OCR edit reset unavailable for mode: {mode}")
+    return renderer.reset_ocr_edit_blocks(page_dir, project, cfg)
+
 from .workspace import page_id_for_pair, resolve_page_workspace
 from .workspace_guard import PageRunGuard
 from .workspace_cleanup import cleanup_output_workspace
@@ -76,6 +150,12 @@ from .page_management import (
 )
 
 APP_NAME = "Folirina"
+
+
+def _application_icon() -> QIcon:
+    """Load the bundled application icon without relying on the working directory."""
+    path = Path(__file__).with_name("folirina_icon.png")
+    return QIcon(str(path)) if path.is_file() else QIcon()
 VERSION = __version__
 QComboBox = StableComboBox
 
@@ -158,7 +238,7 @@ class RunLogDialog(QDialog):
         wanted = (
             "run.log", "run_trace.jsonl", "last_run_state.json", "project.json", "qa.json",
             "transfer_audit.json", "clear_mask.png", "target_clear_mask.png", "review_preview.png",
-            "mask_transfer.json", "direct_patch.json", "transparent_bubble_reveal.json",
+            "mask_transfer.json", "hybrid_transfer.json", "reletter.json", "direct_patch.json", "transparent_bubble_reveal.json",
         )
         try:
             with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -2509,7 +2589,12 @@ class WorkbenchPage(QWidget):
             self.reset_ocr_blocks.setEnabled(bool(rows))
             if ocr_editor_enabled:
                 scope_label="精准蒙版+OCR" if ocr_edit_scope(current_mode)=="mask_ocr" else "OCR重排"
-                self.ocr_block_status.setText(f"{scope_label} · 人工 OCR 文本块 {len(rows)} 个 · 仅影响当前 OCR 流程")
+                if ocr_edit_scope(current_mode)=="mask_ocr":
+                    self.ocr_block_status.setText(
+                        f"{scope_label} · 人工 OCR 文本块 {len(rows)} 个 · 人工框选=强制 OCR；自动 OCR 仅处理完全无精准蒙版覆盖的区域"
+                    )
+                else:
+                    self.ocr_block_status.setText(f"{scope_label} · 人工 OCR 文本块 {len(rows)} 个 · 仅影响当前 OCR 流程")
             else:
                 self.ocr_block_status.setText("人工 OCR 文本块仅在“精准蒙版+OCR / OCR重排”可用；其他模式完全隔离。")
         if page_root is not None and hasattr(self, "target_erase_mode"):
@@ -2897,6 +2982,12 @@ class StudioWindow(QMainWindow):
             logger.debug("background probe shutdown failed", exc_info=True)
 
         still_running = False
+        try:
+            if hasattr(self, "settings") and not self.settings.shutdown_background_workers():
+                still_running = True
+        except Exception:
+            logger.debug("settings worker shutdown failed", exc_info=True)
+            still_running = True
         for worker in (self.worker, self._prepare_worker, self._page_action_worker):
             try:
                 if worker is None or not worker.isRunning():
@@ -2918,20 +3009,21 @@ class StudioWindow(QMainWindow):
             return
         super().closeEvent(event)
 
-    def _busy_running(self) -> bool:
-        return bool(
-            (self.worker is not None and self.worker.isRunning())
-            or (self._prepare_worker is not None and self._prepare_worker.isRunning())
-            or (self._page_action_worker is not None and self._page_action_worker.isRunning())
-            or (hasattr(self, "settings") and self.settings.is_updating)
+    def _processing_busy_state(self):
+        return compute_busy_state(
+            pipeline_running=self.worker is not None and self.worker.isRunning(),
+            prepare_running=self._prepare_worker is not None and self._prepare_worker.isRunning(),
+            page_action_running=self._page_action_worker is not None and self._page_action_worker.isRunning(),
+            settings_updating=hasattr(self, "settings") and self.settings.is_updating,
         )
 
+    def _busy_running(self) -> bool:
+        return self._processing_busy_state().busy
+
     def _set_busy(self, active: bool | None = None):
-        busy = self._busy_running() if active is None else bool(active)
-        cancellable = bool(
-            (self.worker is not None and self.worker.isRunning())
-            or (self._prepare_worker is not None and self._prepare_worker.isRunning())
-        )
+        state = self._processing_busy_state()
+        busy = state.busy if active is None else bool(active)
+        cancellable = state.cancellable
         self.stop_button.setEnabled(cancellable)
         if hasattr(self, "project"):
             self.project.cancel.setEnabled(busy)
@@ -3084,12 +3176,11 @@ class StudioWindow(QMainWindow):
             self.load_page_marks()
             warning = f" · 跳过/警告 {len(session.warnings)}" if session.warnings else ""
             self.statusBar().showMessage(f"已恢复 {len(session.pages)} 页已有结果{warning}。可直接继续页面检查或进入替换工作台人工补漏。", 8000)
-            # Do not collapse 项目文件 while the restored page/pair state is still
-            # being applied. First finish refresh so page rows/thumbnails visibly
-            # settle, then collapse on the next event-loop turn.
+            # Restoring existing results is not the same as a fresh pairing pass.
+            # Keep 项目文件 visible here; the normal auto_pair() completion path
+            # owns collapsing it. This avoids hiding inputs while restored pairs /
+            # thumbnails are still being inspected or corrected.
             self.refresh_all()
-            if self.state.pairs:
-                QTimer.singleShot(120, lambda: self.project._set_project_files_expanded(False))
         except Exception as exc:
             QMessageBox.critical(self, "读取已有结果失败", str(exc))
         finally:
@@ -3162,7 +3253,7 @@ class StudioWindow(QMainWindow):
         # another control emits a signal.
         self.project._sync_config()
         self._start_worker(PipelineWorker(
-            config=self.state.config.model_copy(deep=True), pair=pair,
+            config=worker_config_snapshot(self.state.config), pair=pair,
             page_mark=mark.to_dict(), output_dir=self._default_output(),
             reapply_review_after_process=bool(reapply_review_after_process),
         ))
@@ -3185,9 +3276,7 @@ class StudioWindow(QMainWindow):
 
         # Flush the current mode/settings into the book worker snapshot too.
         self.project._sync_config()
-        worker_cfg = self.state.config.model_copy(deep=True)
-        worker_cfg.batch.resume = bool(resume)
-        worker_cfg.batch.skip_completed = bool(resume)
+        worker_cfg = worker_config_snapshot(self.state.config, resume=resume)
         mode_label = "继续处理整本" if resume else "从头处理整本"
         self.statusBar().showMessage(f"{mode_label} · 正在准备…")
         self._start_worker(PipelineWorker(
@@ -3247,18 +3336,7 @@ class StudioWindow(QMainWindow):
         if worker is None:
             self._set_busy(False)
             return
-        self.worker = worker
-        self._worker_is_single_page = worker.pair is not None
-        self._worker_page_id = page_id_for_pair(worker.pair) if worker.pair is not None else ""
-        self._worker_reapply_review = bool(getattr(worker, "reapply_review_after_process", False))
-        self.progress.setRange(0,100); self.progress.setValue(0)
-        self.statusBar().showMessage("正在处理…")
-        worker.progress.connect(self._worker_progress)
-        worker.done.connect(self._worker_done)
-        worker.failed.connect(self._worker_failed)
-        worker.cancelled.connect(lambda: self.statusBar().showMessage("已停止，已完成页面已保留", 5000))
-        worker.finished.connect(self._worker_finished)
-        worker.start()
+        self._launch_pipeline_worker(worker)
 
     def _prepare_worker_cancelled(self):
         self._pending_pipeline_worker = None
@@ -3281,23 +3359,32 @@ class StudioWindow(QMainWindow):
         if self.worker is None or not self.worker.isRunning():
             self._set_busy(None)
 
+    def _pipeline_cancelled(self):
+        self.statusBar().showMessage("已停止，已完成页面已保留", 5000)
+
+    def _launch_pipeline_worker(self, worker: PipelineWorker):
+        """Single signal-wiring path after optional runtime/model preparation."""
+        self.worker = worker
+        self._worker_is_single_page = worker.pair is not None
+        self._worker_page_id = page_id_for_pair(worker.pair) if worker.pair is not None else ""
+        self._worker_reapply_review = bool(getattr(worker, "reapply_review_after_process", False))
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.statusBar().showMessage("正在处理…")
+        self._set_busy(True)
+        worker.progress.connect(self._worker_progress)
+        worker.done.connect(self._worker_done)
+        worker.failed.connect(self._worker_failed)
+        worker.cancelled.connect(self._pipeline_cancelled)
+        worker.finished.connect(self._worker_finished)
+        worker.start()
+
     def _start_worker(self, worker: PipelineWorker):
         if self._busy_running():
             QMessageBox.information(self, "处理中", "已有任务正在运行。"); return
         if self._maybe_prepare_models_before_run(worker):
             return
-        self.worker = worker
-        self._worker_is_single_page = worker.pair is not None
-        self._worker_page_id = page_id_for_pair(worker.pair) if worker.pair is not None else ""
-        self._worker_reapply_review = bool(getattr(worker, "reapply_review_after_process", False))
-        self.progress.setRange(0,100); self.progress.setValue(0); self.statusBar().showMessage("正在处理…")
-        self._set_busy(True)
-        worker.progress.connect(self._worker_progress)
-        worker.done.connect(self._worker_done)
-        worker.failed.connect(self._worker_failed)
-        worker.cancelled.connect(lambda: self.statusBar().showMessage("已停止，已完成页面已保留", 5000))
-        worker.finished.connect(self._worker_finished)
-        worker.start()
+        self._launch_pipeline_worker(worker)
 
     def run_page_action(
         self, label: str, action: Callable[[], object],
@@ -3353,12 +3440,7 @@ class StudioWindow(QMainWindow):
     def _worker_progress(self, done, total, name, message, cache_hit):
         self.progress.setRange(0, max(1,total)); self.progress.setValue(done)
         text = str(message or "")
-        if cache_hit: state = "缓存"
-        elif "跳过" in text: state = "跳过"
-        elif "正在" in text: state = "处理中"
-        elif "Error" in text or "失败" in text: state = "失败"
-        elif "取消" in text or "停止" in text: state = "已停止"
-        else: state = "完成"
+        state = classify_progress_state(text, cache_hit=bool(cache_hit))
         row = self._find_pair_row_by_target_name(name)
         if 0 <= row < self.project.table.rowCount():
             self.project.table.setItem(row, 6, QTableWidgetItem(state))
@@ -3402,17 +3484,9 @@ class StudioWindow(QMainWindow):
             self.state.last_project = None
         self.save_page_marks(); self.project._table_signature = None; self.project._thumb_signature = None
         self.state.last_result_path = path if str(path).lower().endswith(".png") else ""
-        cancelled = bool(getattr(project, "meta", {}).get("cancelled")) if hasattr(project, "meta") else False
-        skipped = int((getattr(project, "meta", {}) or {}).get("skipped_count", 0)) if hasattr(project, "meta") else 0
-        resumed = int((getattr(project, "meta", {}) or {}).get("resumed_count", 0)) if hasattr(project, "meta") else 0
-        if cancelled:
-            self.statusBar().showMessage("已停止，已完成页面已保留；下次可点“继续处理整本”", 5000)
-        elif resumed:
-            self.statusBar().showMessage(f"继续处理完成 · 跳过已完成 {resumed} 页" + (f" · 另跳过 {skipped} 页" if skipped else ""), 5000)
-        elif skipped:
-            self.statusBar().showMessage(f"从头处理完成 · 自动/手动跳过 {skipped} 页", 5000)
-        else:
-            self.statusBar().showMessage("从头处理完成", 5000)
+        meta = dict(getattr(project, "meta", {}) or {}) if hasattr(project, "meta") else {}
+        cancelled = bool(meta.get("cancelled"))
+        self.statusBar().showMessage(completion_message(project), 5000)
         if getattr(self, "_worker_is_single_page", False) and not cancelled:
             wanted = getattr(self, "_worker_page_id", "")
             if wanted:
@@ -3463,10 +3537,16 @@ def main():
     logger.info("GUI starting log_dir=%s", paths.directory)
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName(APP_NAME); app.setOrganizationName("Folirina")
+    icon = _application_icon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
     app.setStyleSheet(style_for_theme(_saved_theme_name()))
     if sys.platform == "darwin":
         font=QFont("SF Pro Text"); font.setPointSize(12); app.setFont(font)
-    win = StudioWindow(); win.show()
+    win = StudioWindow()
+    if not icon.isNull():
+        win.setWindowIcon(icon)
+    win.show()
     result = int(app.exec())
     logger.info("GUI stopped exit_code=%s", result)
     return result

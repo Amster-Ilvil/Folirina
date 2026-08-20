@@ -850,27 +850,36 @@ def white_container_paper_mask(
 
 
 def target_container_border_mask(target: np.ndarray, region_mask: np.ndarray, *, band_px: int = 4) -> np.ndarray:
-    """Detect long dark TARGET rules/balloon outlines near a container boundary."""
+    """Detect long dark TARGET rules/balloon outlines near a container boundary.
+
+    The calculation is ROI-bounded because Direct/Mask call this repeatedly for
+    small containers.  Padding matches the morphology radius, preserving the old
+    full-canvas border behaviour while avoiding page-sized connected-components.
+    """
     if target.shape[:2] != region_mask.shape:
         raise ValueError("border-mask inputs must share shape")
-    use = (region_mask > 0).astype(np.uint8)
-    if cv2.countNonZero(use) == 0:
+    use_full = (region_mask > 0).astype(np.uint8)
+    nz = cv2.findNonZero(use_full)
+    if nz is None:
         return np.zeros_like(region_mask)
+    bx, by, bw0, bh0 = cv2.boundingRect(nz)
     r = max(1, int(band_px))
+    h, w = region_mask.shape
+    x0 = max(0, bx - (r if bx > 0 else 0)); y0 = max(0, by - (r if by > 0 else 0))
+    x1 = min(w, bx + bw0 + (r if bx + bw0 < w else 0)); y1 = min(h, by + bh0 + (r if by + bh0 < h else 0))
+    use = use_full[y0:y1, x0:x1]
     er = cv2.erode(use, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r * 2 + 1, r * 2 + 1)), iterations=1)
     band = (use > 0) & (er == 0)
-    gray = _gray(target)
+    gray = _gray(target)[y0:y1, x0:x1]
     vals = gray[use > 0]
     local_bg = float(np.percentile(vals, 72.0)) if vals.size else 245.0
     thr = int(np.clip(local_bg - 48.0, 80, 190))
     dark = ((gray <= thr) & (use > 0)).astype(np.uint8)
     n, labels, stats, _ = cv2.connectedComponentsWithStats(dark, 8)
-    ys, xs = np.where(use > 0)
-    rw = max(1, int(xs.max() - xs.min() + 1)) if xs.size else region_mask.shape[1]
-    rh = max(1, int(ys.max() - ys.min() + 1)) if ys.size else region_mask.shape[0]
-    out = np.zeros_like(region_mask)
+    rw = max(1, int(bw0)); rh = max(1, int(bh0))
+    out_roi = np.zeros_like(use, dtype=np.uint8)
     for lab in range(1, n):
-        x, y, bw, bh, area = [int(v) for v in stats[lab]]
+        _x, _y, bw, bh, area = [int(v) for v in stats[lab]]
         if area <= 0:
             continue
         comp = labels == lab
@@ -882,7 +891,9 @@ def target_container_border_mask(target: np.ndarray, region_mask: np.ndarray, *,
                      (span_y >= 0.42 and bw <= max(7, int(round(rw * 0.10)))))
         outline_like = span_x >= 0.62 and span_y >= 0.45 and fill <= 0.28
         if long_rule or outline_like:
-            out[comp] = 255
+            out_roi[comp] = 255
+    out = np.zeros_like(region_mask)
+    out[y0:y1, x0:x1] = out_roi
     return out
 
 
@@ -916,21 +927,33 @@ def target_white_container_text_mask(target: np.ndarray, paper_mask: np.ndarray)
 
 
 def remove_container_boundary_line_components(mask: np.ndarray, region_mask: np.ndarray) -> tuple[np.ndarray, int]:
-    """Remove mask components that are clearly container boundary rules."""
+    """Remove mask components that are clearly container boundary rules.
+
+    Runs inside the region bbox so white-bubble Direct does not repeatedly label
+    the complete page.  A 3px guard reproduces the 7x7 erosion neighbourhood.
+    """
     if mask.shape != region_mask.shape:
         raise ValueError("boundary-line inputs must share shape")
-    src = ((mask > 0) & (region_mask > 0)).astype(np.uint8)
+    use_full = (region_mask > 0).astype(np.uint8)
+    nz = cv2.findNonZero(use_full)
+    if nz is None:
+        return np.zeros_like(mask), 0
+    bx, by, bw0, bh0 = cv2.boundingRect(nz)
+    h, w = region_mask.shape
+    pad = 3
+    x0 = max(0, bx - (pad if bx > 0 else 0)); y0 = max(0, by - (pad if by > 0 else 0))
+    x1 = min(w, bx + bw0 + (pad if bx + bw0 < w else 0)); y1 = min(h, by + bh0 + (pad if by + bh0 < h else 0))
+    use = use_full[y0:y1, x0:x1]
+    src = ((mask[y0:y1, x0:x1] > 0) & (use > 0)).astype(np.uint8)
     if cv2.countNonZero(src) == 0:
         return np.zeros_like(mask), 0
-    use = (region_mask > 0).astype(np.uint8)
     er = cv2.erode(use, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)), iterations=1)
     band = (use > 0) & (er == 0)
     n, labels, stats, _ = cv2.connectedComponentsWithStats(src, 8)
-    ys, xs = np.where(use > 0)
-    rw = max(1, int(xs.max() - xs.min() + 1)); rh = max(1, int(ys.max() - ys.min() + 1))
-    out = src.copy(); removed = 0
+    rw = max(1, int(bw0)); rh = max(1, int(bh0))
+    out_roi = src.copy(); removed = 0
     for lab in range(1, n):
-        x, y, bw, bh, area = [int(v) for v in stats[lab]]
+        _x, _y, bw, bh, area = [int(v) for v in stats[lab]]
         comp = labels == lab
         if not np.any(comp & band):
             continue
@@ -939,8 +962,10 @@ def remove_container_boundary_line_components(mask: np.ndarray, region_mask: np.
                      (sy >= 0.42 and bw <= max(8, int(rw * 0.12))))
         outline_like = sx >= 0.55 and sy >= 0.40 and fill <= 0.30
         if line_like or outline_like:
-            removed += int(np.count_nonzero(comp)); out[comp] = 0
-    return out.astype(np.uint8) * 255, int(removed)
+            removed += int(np.count_nonzero(comp)); out_roi[comp] = 0
+    out = np.zeros_like(mask, dtype=np.uint8)
+    out[y0:y1, x0:x1] = out_roi * 255
+    return out, int(removed)
 
 
 def white_container_write_envelope(target: np.ndarray, region_mask: np.ndarray, paper_mask: np.ndarray, *, inset_px: int = 2, border_guard_px: int = 2) -> tuple[np.ndarray, dict[str, Any]]:

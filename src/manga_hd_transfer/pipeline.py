@@ -9,12 +9,10 @@ from .cache import PageStageCache
 from .models import BookProject, BubbleInstance, PagePair, PageProject, QAItem, RegistrationResult, TextBlock, TextUnit, UnitMatch
 from .ocr import OCRBackend
 from .page_management import PageMark
-from .reletter_binding import (
-    pair_reletter_bubbles as _pair_reletter_bubbles,
-    filter_region_query_blocks as _filter_region_query_blocks,
-)
-from .reletter_executor import ReletterExecutor
-from .reletter_regions import detect_target_text_regions
+from .modes.reletter.executor import ReletterExecutor as ReletterModeExecutor
+from .modes.reletter.regions import detect_target_text_regions as detect_reletter_target_text_regions
+from .modes.hybrid.executor import ReletterExecutor as HybridReletterExecutor
+from .modes.hybrid.regions import detect_target_text_regions as detect_hybrid_target_text_regions
 from .runtime import configure_runtime
 from .pipeline_passthrough import emit_passthrough_page
 from .pipeline_run_lifecycle import run_page_lifecycle
@@ -147,13 +145,21 @@ class TransferPipeline:
             cache_enabled=bool(self.config.cache.ocr), stats=stats,
         )
 
-    def _reletter_executor(self, cancel_cb=None) -> ReletterExecutor:
-        flow_cells = bool(getattr(self.config.lettering, "koharu_flow_cells_enabled", False))
+    def _reletter_executor(self, cancel_cb=None):
+        mode = str(getattr(self.config.transfer, "mode", "reletter") or "reletter").strip().lower()
+        if mode == "hybrid":
+            executor_cls = HybridReletterExecutor
+            detect_regions_fn = detect_hybrid_target_text_regions
+            flow_cells = bool(getattr(self.config.hybrid.lettering, "koharu_flow_cells_enabled", False))
+        else:
+            executor_cls = ReletterModeExecutor
+            detect_regions_fn = detect_reletter_target_text_regions
+            flow_cells = bool(getattr(self.config.reletter.lettering, "koharu_flow_cells_enabled", False))
         detector = (
-            (lambda image, bubble: detect_target_text_regions(image, bubble, koharu_flow_cells=True))
-            if flow_cells else detect_target_text_regions
+            (lambda image, bubble: detect_regions_fn(image, bubble, koharu_flow_cells=True))
+            if flow_cells else detect_regions_fn
         )
-        return ReletterExecutor(
+        return executor_cls(
             self.config,
             trace=getattr(self, "_run_trace", None),
             cancel_check=lambda stage: _check_cancel(cancel_cb, stage),

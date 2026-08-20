@@ -36,6 +36,8 @@ def normalize_project(value: Any) -> dict[str, Any]:
     meta = as_dict(root.get("meta"))
     meta["direct_patch"] = as_dict(meta.get("direct_patch"), bool_key="used")
     meta["mask_replace"] = as_dict(meta.get("mask_replace"), bool_key="used")
+    meta["hybrid"] = as_dict(meta.get("hybrid"), bool_key="used")
+    meta["reletter"] = as_dict(meta.get("reletter"), bool_key="used")
     meta["aligned_overlay_reveal"] = as_dict(meta.get("aligned_overlay_reveal"), bool_key="used")
     meta["transparent_bubble_reveal"] = as_dict(meta.get("transparent_bubble_reveal"), bool_key="used")
     meta["qa_summary"] = as_dict(meta.get("qa_summary"))

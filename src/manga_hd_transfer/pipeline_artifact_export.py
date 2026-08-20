@@ -9,6 +9,7 @@ replace-translation sidecars without importing renderer implementations.
 
 import os
 import shutil
+import tempfile
 from pathlib import Path
 
 import cv2
@@ -32,6 +33,38 @@ def _replace_with_hardlink(alias: Path, target: Path) -> bool:
         return True
     except OSError:
         return False
+
+
+def _publish_existing_file(alias: Path, target: Path) -> None:
+    """Publish an already encoded artifact without encoding the pixels again.
+
+    The page-local ``final.png`` is authoritative and has already been written
+    atomically.  Book-level finals used to re-run PNG encoding on the exact same
+    pixels.  Prefer an atomic hard-link replacement; on cross-device filesystems,
+    copy bytes to a sibling temp, fsync that temp, then replace the destination.
+    """
+    alias.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{alias.name}.", suffix=".tmp", dir=str(alias.parent))
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        tmp.unlink(missing_ok=True)
+        try:
+            os.link(target, tmp)
+        except OSError:
+            with target.open("rb") as src, tmp.open("wb") as dst:
+                shutil.copyfileobj(src, dst, length=1024 * 1024)
+                dst.flush()
+                try:
+                    os.fsync(dst.fileno())
+                except OSError:
+                    pass
+        os.replace(tmp, alias)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def export_page_artifacts(
@@ -76,6 +109,8 @@ def export_page_artifacts(
     page_root = Path(page_root)
 
     # Artifacts are intentionally explicit and lossless.
+    active_mode = "direct_patch" if direct_container_fast else str(project.meta.get("transfer_mode", "mask_replace") or "mask_replace").strip().lower()
+    active_mask_cfg = config.hybrid.mask if active_mode == "hybrid" else config.mask_replace
     source_original_path = page_root / "source_original.png"
     authority_source_path_artifact = page_root / "source_authority_original.png"
     original_path = page_root / "target_original.png"
@@ -86,6 +121,12 @@ def export_page_artifacts(
     text_layer_path = page_root / "text_layer.png"
     transfer_layer_path = page_root / "mask_transfer_layer.png"
     direct_layer_path = page_root / "direct_patch_layer.png"
+    hybrid_transfer_layer_path = page_root / "hybrid_transfer_layer.png"
+    hybrid_transfer_mask_path = page_root / "hybrid_transfer_mask.png"
+    hybrid_text_layer_path = page_root / "hybrid_text_layer.png"
+    reletter_text_layer_path = page_root / "reletter_text_layer.png"
+    hybrid_transfer_json_path = page_root / "hybrid_transfer.json"
+    reletter_json_path = page_root / "reletter.json"
     chinese_layer_path = page_root / "chinese_transfer_layer.png"
     transfer_mask_path = page_root / "mask_transfer_mask.png"
     direct_region_path = page_root / "direct_patch_regions.png"
@@ -105,7 +146,7 @@ def export_page_artifacts(
     write_image(original_path, target)
     write_image(final_local, rendered)
 
-    active_review_meta = project.meta.get("direct_patch", {}) if direct_container_fast else project.meta.get("mask_replace", {})
+    active_review_meta = project.meta.get(active_mode, {}) if isinstance(project.meta.get(active_mode, {}), dict) else {}
     # Manual-effect candidates originate from Direct safety analysis even when
     # Auto falls through to Mask. Always include them in review preview/queue.
     direct_review_meta = project.meta.get("direct_patch", {}) if isinstance(project.meta.get("direct_patch", {}), dict) else {}
@@ -160,12 +201,23 @@ def export_page_artifacts(
     # Post-render layer composition only: renderer pixels are already final.
     text_rgba = make_text_layer_rgba(target.shape[:2], lettering_masks, color=config.lettering.fill)
     write_rgba(text_layer_path, text_rgba)
+    # Mode-owned aliases make restore/review/export decisions independent. The
+    # generic text_layer remains the final-composition interchange artifact.
+    if active_mode == "hybrid":
+        if not _replace_with_hardlink(hybrid_text_layer_path, text_layer_path):
+            write_rgba(hybrid_text_layer_path, text_rgba)
+    elif active_mode == "reletter":
+        if not _replace_with_hardlink(reletter_text_layer_path, text_layer_path):
+            write_rgba(reletter_text_layer_path, text_rgba)
     chinese_rgba = np.zeros_like(text_rgba)
     if mask_transfer is not None:
         if direct_container_fast:
-            # Direct has its own artifacts. Do not also write mask_transfer_* aliases.
+            # Direct has its own artifacts. Do not also write Mask/Hybrid aliases.
             write_rgba(direct_layer_path, transfer_rgba)
             write_image(direct_region_path, mask_transfer.composite_mask)
+        elif active_mode == "hybrid":
+            write_rgba(hybrid_transfer_layer_path, transfer_rgba)
+            write_image(hybrid_transfer_mask_path, mask_transfer.composite_mask)
         else:
             write_rgba(transfer_layer_path, transfer_rgba)
             write_image(transfer_mask_path, mask_transfer.composite_mask)
@@ -179,7 +231,11 @@ def export_page_artifacts(
         ora_path = page_root / "editable.ora"
         export_openraster(ora_path, target, inpaint_result.image, text_rgba, transfer_rgba if mask_transfer is not None else None)
         psd_path = page_root / "editable.psd"
-        active_transfer_layer_path = direct_layer_path if direct_container_fast else transfer_layer_path
+        active_transfer_layer_path = (
+            direct_layer_path if direct_container_fast
+            else hybrid_transfer_layer_path if active_mode == "hybrid"
+            else transfer_layer_path
+        )
         # PSD needs an on-disk inpainted base; create it lazily only for bundles.
         if not inpainted_path.exists():
             write_image(inpainted_path, inpaint_result.image)
@@ -200,7 +256,11 @@ def export_page_artifacts(
         write_image(page_root / "debug_matching.png", matching_overlay(target, source_units, target_units, matches, registration))
         write_image(page_root / "debug_clear_mask.png", mask_overlay(target, mask_result.mask))
         if mask_transfer is not None:
-            debug_name = "debug_direct_patch.png" if direct_container_fast else "debug_mask_replace.png"
+            debug_name = (
+                "debug_direct_patch.png" if direct_container_fast
+                else "debug_hybrid.png" if active_mode == "hybrid"
+                else "debug_mask_replace.png"
+            )
             write_image(page_root / debug_name, mask_overlay(target, mask_transfer.composite_mask))
         if paired_diff is not None:
             write_image(page_root / "debug_paired_diff.png", mask_overlay(target, paired_diff.change_mask))
@@ -210,17 +270,30 @@ def export_page_artifacts(
         for stale in page_root.glob("debug_*.png"):
             stale.unlink(missing_ok=True)
 
-    if mask_transfer is not None and not direct_container_fast and config.mask_replace.save_patch_artifacts:
+    if mask_transfer is not None and not direct_container_fast and bool(getattr(active_mask_cfg, "save_patch_artifacts", True)):
+        transfer_json_path = hybrid_transfer_json_path if active_mode == "hybrid" else (page_root / "mask_transfer.json")
         save_json(
-            page_root / "mask_transfer.json",
+            transfer_json_path,
             {
-                "mode": str(project.meta.get("transfer_mode", "")),
+                "schema": "folirina.hybrid_transfer.v1" if active_mode == "hybrid" else "folirina.mask_transfer.v1",
+                "mode": active_mode,
                 "applied_count": mask_transfer.applied_count,
                 "matches": [m.to_dict() for m in mask_transfer.matches],
                 "records": transfer_records_to_dict(mask_transfer.records),
                 "manual_reletter_required": manual_reletter_required_rows(mask_transfer.records),
             },
         )
+    if active_mode == "reletter":
+        save_json(
+            reletter_json_path,
+            {
+                "schema": "folirina.reletter.v1",
+                "mode": "reletter",
+                "successful_regions": int(sum(1 for x in lettering_masks if x is not None)),
+                "text_layer": reletter_text_layer_path.name if reletter_text_layer_path.exists() else "",
+            },
+        )
+
     if direct_container_fast and mask_transfer is not None:
         save_json(
             page_root / "direct_patch.json",
@@ -237,8 +310,9 @@ def export_page_artifacts(
         )
 
     if final_path is not None:
-        write_image(final_path, rendered)
-        project.artifacts["book_final"] = str(Path(final_path))
+        final_book = Path(final_path)
+        _publish_existing_file(final_book, final_local)
+        project.artifacts["book_final"] = str(final_book)
     project.artifacts.update(
         {
             "source_original": str(source_original_path),
@@ -255,6 +329,12 @@ def export_page_artifacts(
             "mask_transfer_layer": str(transfer_layer_path) if transfer_layer_path.exists() else "",
             "mask_transfer_mask": str(transfer_mask_path) if transfer_mask_path.exists() else "",
             "mask_transfer_json": str(page_root / "mask_transfer.json") if (page_root / "mask_transfer.json").exists() else "",
+            "hybrid_transfer_layer": str(hybrid_transfer_layer_path) if hybrid_transfer_layer_path.exists() else "",
+            "hybrid_transfer_mask": str(hybrid_transfer_mask_path) if hybrid_transfer_mask_path.exists() else "",
+            "hybrid_transfer_json": str(hybrid_transfer_json_path) if hybrid_transfer_json_path.exists() else "",
+            "hybrid_text_layer": str(hybrid_text_layer_path) if hybrid_text_layer_path.exists() else "",
+            "reletter_text_layer": str(reletter_text_layer_path) if reletter_text_layer_path.exists() else "",
+            "reletter_json": str(reletter_json_path) if reletter_json_path.exists() else "",
             "direct_patch_layer": str(direct_layer_path) if direct_layer_path.exists() else "",
             "direct_patch_regions": str(direct_region_path) if direct_region_path.exists() else "",
             "direct_patch_json": str(page_root / "direct_patch.json") if (page_root / "direct_patch.json").exists() else "",
@@ -263,7 +343,10 @@ def export_page_artifacts(
         }
     )
 
-    manual_queue = project.meta.get("mask_replace", {}).get("manual_reletter_required", []) if (not direct_container_fast and isinstance(project.meta.get("mask_replace"), dict)) else []
+    manual_queue = []
+    if not direct_container_fast and active_mode in {"mask_replace", "hybrid"}:
+        route_meta = project.meta.get(active_mode, {}) if isinstance(project.meta.get(active_mode), dict) else {}
+        manual_queue = list(route_meta.get("manual_reletter_required", []) or [])
     if manual_queue:
         template = {
             "status": "needs_manual_reletter",

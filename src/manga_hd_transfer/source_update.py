@@ -52,12 +52,17 @@ MANAGED_PATHS = (
     "src",
     "scripts",
     "tools",
+    "assets",
+    "mode_baselines",
     ".github",
     ".gitignore",
+    "run_gui.py",
     "config.example.json",
     "pyproject.toml",
     "README.md",
     "LICENSE",
+    "MODE_ISOLATION_MANIFEST.json",
+    "MODE_ISOLATION_POLICY.md",
     "MULTIPLATFORM_INSTALL.md",
 )
 
@@ -390,9 +395,12 @@ def _candidate_root_from_archive(extract_root: Path) -> Path:
 def _validate_candidate(candidate: Path, *, current_version: str) -> str:
     required = (
         candidate / "pyproject.toml",
+        candidate / "run_gui.py",
         candidate / "src" / "manga_hd_transfer" / "__init__.py",
         candidate / "src" / "manga_hd_transfer" / "gui_qt.py",
         candidate / "src" / "manga_hd_transfer" / "pipeline.py",
+        candidate / "MODE_ISOLATION_MANIFEST.json",
+        candidate / "mode_baselines",
     )
     missing = [str(path.relative_to(candidate)) for path in required if not path.exists()]
     if missing:

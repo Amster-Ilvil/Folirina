@@ -21,7 +21,7 @@ import subprocess
 import tarfile
 from typing import Callable, Iterable
 
-from .model_downloads import model_home
+from .storage_paths import model_home
 
 ProgressFn = Callable[[str], None]
 

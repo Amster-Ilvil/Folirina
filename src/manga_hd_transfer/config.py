@@ -350,6 +350,14 @@ class PixelTransferConfigBase(BaseModel):
     white_container_write_border_guard_px: int = 1
     white_container_clear_inset_px: int = 0
     white_container_clear_border_guard_px: int = 0
+    # v2.3.27: Direct white-bubble clarity enhancement. Rebuild the SOURCE patch
+    # as clean paper + SOURCE-derived Chinese ink so low-resolution CN scans do
+    # not carry gray paper/noise into high-resolution JP masters.
+    direct_white_clarity_enhance_enabled: bool = True
+    direct_white_clarity_alpha_gamma: float = 1.0
+    direct_white_clarity_black_boost: int = 0
+    direct_white_clarity_pure_white_floor: int = 248
+    direct_white_clarity_min_text_pixels: int = 18
     white_container_manual_inset_min_px: int = 1
     white_container_manual_inset_max_px: int = 4
     white_container_manual_inset_ratio: float = 0.02
@@ -844,6 +852,14 @@ class MaskReplaceConfig(PixelTransferConfigBase):
     final SOURCE glyph pixels must remain shape-preserving.  The mask decides
     *where* pixels are allowed to write; it must never bend the glyph raster.
     """
+    # v2.3.32 renderer ownership is explicit. Shared low-level geometry may be
+    # reused, but policy/clarity/failure behaviour must resolve through this
+    # namespace only.
+    renderer_owner: str = "mask_replace"
+    # A failed content audit must never remain visibly published in Precise Mask.
+    # Restore the pre-region TARGET and leave an explicit review record instead.
+    incomplete_pixel_policy: str = "restore_target"  # restore_target|keep_review
+
     # v2.3.5 glyph-integrity contract.  Dense DIS flow remains available for
     # candidate/mask discovery, but final Chinese pixels are sampled from the
     # global page registration only.
@@ -860,6 +876,36 @@ class MaskReplaceConfig(PixelTransferConfigBase):
     photo_pair_reject_edge_clipped_open_text: bool = True
     photo_pair_reject_edge_clipped_complex_text: bool = True
     photo_pair_edge_clipped_review_required: bool = True
+    # v2.3.30: shared white-bubble source clarity enhancement. Precise Mask may
+    # also rebuild the local CN source patch as clean paper + source-derived ink
+    # before compositing it into a confirmed white target container.
+    direct_white_clarity_enhance_enabled: bool = True
+    direct_white_clarity_alpha_gamma: float = 1.0
+    direct_white_clarity_black_boost: int = 0
+    direct_white_clarity_pure_white_floor: int = 248
+    direct_white_clarity_min_text_pixels: int = 18
+    # v2.3.36 Precise-Mask structure protection. SOURCE lettering is allowed to
+    # contribute only interior glyph raster; source balloon outlines/tails/burst
+    # rays and nearby artwork are filtered independently. TARGET outline/tail is
+    # then restored byte-exactly from the HD page.
+    mask_source_structure_guard_enabled: bool = True
+    mask_source_structure_guard_ratio: float = 0.035
+    mask_source_structure_guard_min_px: int = 5
+    mask_source_structure_guard_max_px: int = 14
+    mask_source_structure_min_component_area: int = 10
+    mask_source_structure_min_aspect: float = 2.6
+    mask_source_structure_min_span_ratio: float = 0.16
+    mask_source_spiky_boundary_band_px: int = 14
+    mask_target_structure_guard_enabled: bool = True
+    mask_target_border_probe_dilate_px: int = 4
+    mask_target_border_restore_fringe_px: int = 2
+    mask_target_immutable_band_enabled: bool = True
+    mask_target_ordinary_inner_band_px: int = 6
+    mask_target_spiky_inner_band_px: int = 18
+    mask_target_outer_band_px: int = 3
+    mask_target_band_text_margin_px: int = 3
+    mask_target_spiky_glyph_relief_enabled: bool = True
+    mask_target_spiky_glyph_relief_dilate_px: int = 1
 
 
 class DirectPatchConfig(PixelTransferConfigBase):
@@ -899,6 +945,26 @@ class DirectPatchConfig(PixelTransferConfigBase):
     direct_remove_source_border_lines: bool = True
     direct_clear_target_text_before_overlay: bool = True
     direct_white_overlay_border_guard_px: int = 2
+    # Direct-only rigid completion can receive an interior TARGET mask whose
+    # outline itself lies just outside the mask. Probe a narrow dilated ring when
+    # detecting HD balloon borders so full-white clearing cannot nick the target
+    # outline. Mask/Hybrid configs do not own this option and remain unchanged.
+    direct_rigid_target_border_probe_dilate_px: int = 3
+    direct_rigid_target_border_restore_fringe_px: int = 1
+    # v2.3.31: after a full white-container clear, restore only TARGET dark
+    # structural line components that were actually lightened near the outer
+    # registered container boundary. This catches partial oval/rule segments the
+    # conservative pre-write border detector may miss, without resurrecting
+    # central Japanese lettering.
+    direct_post_structural_restore_enabled: bool = True
+    direct_post_structural_restore_target_dark_max: int = 205
+    direct_post_structural_restore_min_lighten: int = 18
+    direct_post_structural_restore_edge_ratio_x: float = 0.16
+    direct_post_structural_restore_edge_ratio_y: float = 0.12
+    direct_post_structural_restore_boundary_band_px: int = 6
+    direct_post_structural_restore_min_area_px: int = 10
+    direct_post_structural_restore_fringe_px: int = 1
+    direct_post_structural_restore_fringe_gray_max: int = 238
 
     # Direct mode should preserve typesetting orientation. Location can still be
     # refined by registration, but final SOURCE overlay is axis-locked.
@@ -976,6 +1042,31 @@ class AlignedOverlayRevealConfig(BaseModel):
     safe_max_region_erase_ratio: float = 0.08
     inpaint_radius: float = 2.5
 
+    # v2.3.38 aligned-hole private TARGET container completion.  Geometry-only
+    # supplemental candidates must look like actual translated text after whole-page
+    # registration; this prevents white clothes/panels/windows from becoming SOURCE holes.
+    target_container_min_confidence: float = 0.55
+    target_container_dedupe_iou: float = 0.60
+    target_container_dedupe_cover: float = 0.82
+    supplemental_max_area_ratio: float = 0.04
+    supplemental_ink_threshold: int = 190
+    supplemental_ink_match_tolerance_px: int = 2
+    supplemental_min_source_ink_density: float = 0.012
+    supplemental_min_target_ink_density: float = 0.008
+    supplemental_min_ink_change_score: float = 0.12
+    supplemental_min_target_text_pixels: int = 25
+    supplemental_min_source_text_pixels: int = 25
+
+    # OCR-free private text-barrier completion for closed narration boxes and
+    # starburst/irregular white bubbles missed by the selected primary detector.
+    target_text_barrier_enabled: bool = True
+    target_text_barrier_min_components: int = 4
+    target_text_barrier_max_candidates: int = 48
+    target_text_barrier_max_area_ratio: float = 0.055
+    target_text_barrier_max_area_to_text_ratio: float = 45.0
+    target_text_barrier_min_white_ratio: float = 0.72
+    target_text_barrier_min_dark_ratio: float = 0.02
+    target_text_barrier_max_dark_ratio: float = 0.24
 
 
 class TransparentBubbleRevealConfig(BaseModel):
@@ -1410,6 +1501,12 @@ class HybridMaskConfig(PixelTransferConfigBase):
     from the user-facing Precise Mask mode. Hybrid may therefore evolve without
     silently changing Mask, and vice versa.
     """
+    # v2.3.32 Hybrid owns a physically separate renderer policy namespace.
+    renderer_owner: str = "hybrid"
+    # Incomplete mask-stage pixels are not published; they are restored so the
+    # private Hybrid OCR/reletter fallback can own the completion cleanly.
+    incomplete_pixel_policy: str = "restore_target"  # restore_target|keep_review; any Mask candidate owns the region, automatic OCR is uncovered-only
+
     # Hybrid uses the same glyph-integrity principle for its first stage: dense
     # alignment may discover masks, never bend the final Chinese raster.
     paired_diff_dense_flow_geometry_only: bool = True
@@ -1425,6 +1522,41 @@ class HybridMaskConfig(PixelTransferConfigBase):
     photo_pair_reject_edge_clipped_open_text: bool = True
     photo_pair_reject_edge_clipped_complex_text: bool = True
     photo_pair_edge_clipped_review_required: bool = True
+    # v2.3.30: shared white-bubble source clarity enhancement for Hybrid
+    # mask-first transfer. OCR completion remains unchanged; only the paired
+    # Chinese pixel patch is cleaned when the target container is verified white.
+    direct_white_clarity_enhance_enabled: bool = True
+    direct_white_clarity_alpha_gamma: float = 1.0
+    direct_white_clarity_black_boost: int = 0
+    direct_white_clarity_pure_white_floor: int = 248
+    direct_white_clarity_min_text_pixels: int = 18
+    # v2.3.36 Hybrid-private copy of the same product rule. These fields are
+    # intentionally separate from MaskReplaceConfig so future tuning cannot
+    # silently alter the other mode.
+    hybrid_source_structure_guard_enabled: bool = True
+    hybrid_source_structure_guard_ratio: float = 0.035
+    hybrid_source_structure_guard_min_px: int = 5
+    hybrid_source_structure_guard_max_px: int = 14
+    hybrid_source_structure_min_component_area: int = 10
+    hybrid_source_structure_min_aspect: float = 2.6
+    hybrid_source_structure_min_span_ratio: float = 0.16
+    hybrid_source_spiky_boundary_band_px: int = 14
+    hybrid_target_structure_guard_enabled: bool = True
+    hybrid_target_border_probe_dilate_px: int = 4
+    hybrid_target_border_restore_fringe_px: int = 2
+    hybrid_target_immutable_band_enabled: bool = True
+    hybrid_target_ordinary_inner_band_px: int = 6
+    hybrid_target_spiky_inner_band_px: int = 18
+    hybrid_target_outer_band_px: int = 3
+    hybrid_target_band_text_margin_px: int = 3
+    hybrid_target_spiky_glyph_relief_enabled: bool = True
+    hybrid_target_spiky_glyph_relief_dilate_px: int = 1
+    # OCR policy: automatic OCR is a fallback only for truly uncovered regions.
+    # Any region that already has a Mask-stage candidate/ownership is excluded
+    # from automatic OCR; the GUI manual OCR box may still explicitly override.
+    hybrid_auto_ocr_uncovered_only: bool = True
+    hybrid_auto_ocr_block_if_any_mask_candidate: bool = True
+    hybrid_manual_ocr_force_allowed: bool = True
 
 
 class HybridModeConfig(BaseModel):

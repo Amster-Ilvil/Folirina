@@ -75,9 +75,9 @@ def _external_path_error(config: PipelineConfig, role: str, backend: str) -> str
 def plan_runtime_requirements(config: PipelineConfig) -> RuntimePreflightPlan:
     """Plan model/runtime preparation for the selected mode.
 
-    v2.0.90 makes Koharu Global Layout the shared first semantic detector for
-    every transfer mode, so its runtime is always prepared once up front. OCR
-    requirements are mode-contract gated: a 0-OCR visual route must not download
+    Runtime preparation follows the selected detector policy and transfer-mode
+    contract. OCR requirements are mode-contract gated: a 0-OCR visual route must
+    not download
     or initialize an OCR model merely because an old project still remembers an
     OCR selection. Registration remains independent because every automatic
     SOURCE→TARGET route needs geometric alignment before semantic layout.
@@ -109,19 +109,21 @@ def plan_runtime_requirements(config: PipelineConfig) -> RuntimePreflightPlan:
     add(primary_key, detector_labels[primary_key], reason=f"主检测器 · {detector_strategy(config.bubbles)}", runtime_key=primary_key)
 
     # OCR model choices only matter when the selected mode contract permits OCR.
-    # Reveal routes use OCR only when the dedicated TARGET-presence switch is on.
-    reveal_mode = mode in {"transparent_bubble_reveal", "aligned_overlay_reveal"}
+    # Only Transparent Reveal owns the optional TARGET-presence OCR switch.
+    # Aligned Overlay is a separate 0-OCR route; it must not inherit a remembered
+    # Transparent-Reveal toggle from the shared settings object.
+    presence_ocr_mode = mode == "transparent_bubble_reveal"
     reveal_ocr_enabled = bool(getattr(config.transparent_bubble_reveal, "target_text_presence_ocr_enabled", False))
     ocr_runtime_enabled = bool(
         contract.may_use_ocr
-        or (reveal_mode and bool(getattr(contract, "may_use_presence_ocr", False)) and reveal_ocr_enabled)
+        or (presence_ocr_mode and bool(getattr(contract, "may_use_presence_ocr", False)) and reveal_ocr_enabled)
     )
     if ocr_runtime_enabled:
         main = str(config.ocr.backend or "none")
         src = main if config.ocr.source_backend in (None, "", "inherit") else str(config.ocr.source_backend)
         tgt = main if config.ocr.target_backend in (None, "", "inherit") else str(config.ocr.target_backend)
         profiles = []
-        if reveal_mode:
+        if presence_ocr_mode:
             profile = _paddle_profile_for_backend(config, tgt)
             if profile:
                 profiles.append(profile)
@@ -130,9 +132,9 @@ def plan_runtime_requirements(config: PipelineConfig) -> RuntimePreflightPlan:
         for profile in profiles:
             family = get_paddle_model_profile(profile).pipeline
             runtime_key = "paddle_doc" if family in {"vl", "structure"} else "paddle"
-            add("paddle", profile_label(profile), profile=profile, reason="TARGET 文字存在验证" if reveal_mode else "当前 OCR 选择", runtime_key=runtime_key)
+            add("paddle", profile_label(profile), profile=profile, reason="TARGET 文字存在验证" if presence_ocr_mode else "当前 OCR 选择", runtime_key=runtime_key)
 
-        role_backends = (("target", tgt),) if reveal_mode else (("source", src), ("target", tgt))
+        role_backends = (("target", tgt),) if presence_ocr_mode else (("source", src), ("target", tgt))
         for role, backend in role_backends:
             err = _external_path_error(config, role, backend)
             if err:

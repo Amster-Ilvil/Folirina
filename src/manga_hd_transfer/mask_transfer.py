@@ -37,6 +37,8 @@ from .mask_transfer_models import MaskTransferRecord, MaskTransferResult
 from .modes.mask_replace.raster_policy import paired_proxy_geometry_risk
 from .external_command import run_external_command
 from .text_only_transfer import target_text_mask_in_container, cleanup_target_residual_specks, clear_uniform_white_container_interior, white_container_paper_mask, white_container_write_envelope, target_container_border_mask, remove_container_boundary_line_components
+from .modes.mask_replace.source_clarity import enhance_white_source_patch as _mask_enhance_white_source_patch
+from .modes.hybrid.source_clarity import enhance_white_source_patch as _hybrid_enhance_white_source_patch
 from .config import MaskReplaceConfig
 from .geometry import polygon_bbox, transform_points, transform_to_homography
 from .io_utils import read_image, write_image
@@ -699,9 +701,75 @@ def transfer_ocr_guided_text_units(
 
 
 
+def _target_mask_is_white_container(target: np.ndarray, region_mask: np.ndarray, cfg: MaskReplaceConfig) -> tuple[bool, dict[str, float | bool]]:
+    region_u8 = (region_mask > 0).astype(np.uint8) * 255
+    pixels = int(cv2.countNonZero(region_u8))
+    if pixels <= 0:
+        return False, {"is_white": False, "reason": "empty_region", "paper_ratio": 0.0, "robust_spread": 255.0}
+    paper = white_container_paper_mask(target, region_u8, None)
+    paper_ratio = float(cv2.countNonZero(paper) / max(1, pixels))
+    gray = cv2.cvtColor(target, cv2.COLOR_BGR2GRAY) if target.ndim == 3 else target.astype(np.uint8)
+    vals = gray[region_u8 > 0]
+    robust_spread = float(np.percentile(vals, 90.0) - np.percentile(vals, 10.0)) if vals.size > 0 else 255.0
+    min_ratio = float(getattr(cfg, "white_container_full_clear_min_paper_ratio", 0.68))
+    max_spread = float(getattr(cfg, "white_container_full_clear_max_robust_spread", 14.0))
+    ok = bool(paper_ratio >= min_ratio and robust_spread <= max_spread)
+    return ok, {
+        "is_white": ok,
+        "reason": "paper_ratio_and_spread" if ok else "not_uniform_white",
+        "paper_ratio": paper_ratio,
+        "robust_spread": robust_spread,
+        "min_paper_ratio": min_ratio,
+        "max_robust_spread": max_spread,
+    }
+
+
+def _maybe_apply_white_source_clarity(
+    source_image: np.ndarray,
+    target_image: np.ndarray,
+    target_region_mask: np.ndarray,
+    cfg: MaskReplaceConfig,
+    *,
+    source_region_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Apply source clarity with explicit SOURCE/TARGET coordinate authorities.
+
+    Paired aligned routes use one target-space mask for both images. Rigid routes
+    keep the original SOURCE raster and therefore have a source-space mask plus a
+    separate target-space white-container mask. Never index an original SOURCE
+    image with TARGET geometry when the editions have different dimensions.
+    """
+    enabled = bool(getattr(cfg, "direct_white_clarity_enhance_enabled", True))
+    white_ok, white_diag = _target_mask_is_white_container(target_image, target_region_mask, cfg)
+    diag: dict[str, object] = {"enabled": enabled, "target_region": white_diag, "applied": False, "reason": "disabled" if not enabled else "target_not_white"}
+    if not enabled or not white_ok:
+        return source_image.copy(), diag
+    sm = target_region_mask if source_region_mask is None else np.asarray(source_region_mask)
+    if sm.shape != source_image.shape[:2]:
+        diag["reason"] = "source_mask_shape_mismatch"
+        diag["source_shape"] = list(source_image.shape[:2])
+        diag["source_mask_shape"] = list(sm.shape)
+        return source_image.copy(), diag
+    source_text = target_text_mask_in_container(source_image, sm)
+    owner = str(getattr(cfg, "renderer_owner", "mask_replace") or "mask_replace").strip().lower()
+    clarity_fn = _hybrid_enhance_white_source_patch if owner == "hybrid" else _mask_enhance_white_source_patch
+    enhanced, clarity_diag = clarity_fn(
+        source_image,
+        sm,
+        source_text,
+        enabled=enabled,
+        alpha_gamma=float(getattr(cfg, "direct_white_clarity_alpha_gamma", 1.0)),
+        black_boost=int(getattr(cfg, "direct_white_clarity_black_boost", 0)),
+        pure_white_floor=int(getattr(cfg, "direct_white_clarity_pure_white_floor", 248)),
+        min_text_pixels=int(getattr(cfg, "direct_white_clarity_min_text_pixels", 18)),
+    )
+    diag.update({"applied": bool(clarity_diag.get("applied", False)), "reason": str(clarity_diag.get("reason", "ok")), "source": clarity_diag})
+    return enhanced, diag
+
 
 def _rigid_source_raster(
     source: np.ndarray,
+    target_reference: np.ndarray,
     source_mask: np.ndarray,
     target_mask: np.ndarray,
     target_shape: tuple[int, int],
@@ -709,10 +777,10 @@ def _rigid_source_raster(
     cfg: MaskReplaceConfig,
     *,
     source_gray: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray, float, float, float, float, float] | None:
+) -> tuple[np.ndarray, np.ndarray, float, float, float, float, float, dict[str, object]] | None:
     """Place the complete source lettering raster with uniform scale only.
 
-    Returns ``(soft_alpha, ink_mask, scale, dx, dy, ink_coverage, mask_containment)``
+    Returns ``(soft_alpha, ink_mask, scale, dx, dy, ink_coverage, mask_containment, clarity_diag)``
     in target coordinates.  ``soft_alpha`` is derived from the original source
     grayscale raster as one field; characters are never split/reassembled.
     """
@@ -735,7 +803,9 @@ def _rigid_source_raster(
         if cv2.countNonZero(er) > 0:
             target_inner = er
 
-    gray = source_gray if source_gray is not None else cv2.cvtColor(source, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    clarity_source, clarity_diag = _maybe_apply_white_source_clarity(source, target_reference, target_mask, cfg, source_region_mask=source_mask)
+    gray_source = clarity_source if clarity_diag.get("applied", False) else source
+    gray = source_gray if (source_gray is not None and not bool(clarity_diag.get("applied", False))) else cv2.cvtColor(gray_source, cv2.COLOR_BGR2GRAY).astype(np.float32)
     if gray.dtype != np.float32:
         gray = gray.astype(np.float32)
     crop_gray = gray[sy0:sy1, sx0:sx1]
@@ -820,7 +890,7 @@ def _rigid_source_raster(
     ink_mask = (full_alpha >= max(0.08, floor)).astype(np.uint8) * 255
     # dx/dy are reported relative to the pure centroid placement at the selected scale.
     base_x = tcx - rel_cx * scale; base_y = tcy - rel_cy * scale
-    return full_alpha, ink_mask, scale, float(px - base_x), float(py - base_y), float(ink_cov), float(mask_cov)
+    return full_alpha, ink_mask, scale, float(px - base_x), float(py - base_y), float(ink_cov), float(mask_cov), clarity_diag
 
 
 
@@ -1034,10 +1104,10 @@ def transfer_rigid_container_rasters(
         if not text_support_ok:
             continue
         base_scale = float(diag.get("uniform_scale", 1.0))
-        placed = _rigid_source_raster(source, sm, tm, shape, base_scale, placement_cfg, source_gray=source_gray_f32)
+        placed = _rigid_source_raster(source, target_reference, sm, tm, shape, base_scale, placement_cfg, source_gray=source_gray_f32)
         if placed is None:
             continue
-        alpha, source_ink_mask, scale, dx, dy, ink_cov, mask_cov = placed
+        alpha, source_ink_mask, scale, dx, dy, ink_cov, mask_cov, white_clarity_diag = placed
         source_ink_mask, source_boundary_removed = remove_container_boundary_line_components(source_ink_mask, tm)
         if source_boundary_removed > 0:
             alpha[source_ink_mask == 0] = 0.0
@@ -1097,7 +1167,6 @@ def transfer_rigid_container_rasters(
         backend = "rigid-container-text-only"
         clarity = "target-background-source-ink-only"
         match_notes = ["rigid_container_text_only", "target_background_preserved", f"uniform_scale={scale:.6f}", f"ink_coverage={ink_cov:.5f}", f"mask_containment={mask_cov:.5f}"]
-        patch = None
         gap_fill_diag = {"added_pixels": 0, "enabled": False}
         a = np.clip(alpha, 0.0, 1.0)
         a *= (border_safe_envelope.astype(np.float32) / 255.0)
@@ -1124,10 +1193,25 @@ def transfer_rigid_container_rasters(
         }
         if bool(getattr(placement_cfg, "rigid_container_full_patch_preserve_target_border", True)):
             if bool(full_clear_diag.get("white_full_clear_applied", False)):
-                # Restore only the actual HD outline/rules. The old implementation
-                # restored the entire inset ring and could resurrect Japanese glyph
-                # fragments sitting near a narration-box edge.
-                protected_ring = target_container_border_mask(target_reference, tm, band_px=4)
+                # Restore only the actual HD outline/rules.  Direct's OCR-free
+                # completion masks are interior authorities, so the HD outline can
+                # sit a few pixels *outside* ``tm`` and be invisible to the old
+                # detector. DirectPatchConfig alone opts into a narrow probe ring;
+                # Mask/Hybrid have no such field and retain their exact behaviour.
+                probe_px=max(0,int(getattr(cfg,"direct_rigid_target_border_probe_dilate_px",0)))
+                border_probe=tm
+                if probe_px>0:
+                    k=cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(probe_px*2+1,probe_px*2+1))
+                    border_probe=cv2.dilate((tm>0).astype(np.uint8)*255,k,iterations=1)
+                protected_ring = target_container_border_mask(
+                    target_reference, border_probe, band_px=max(4,probe_px+1)
+                )
+                fringe_px=max(0,int(getattr(cfg,"direct_rigid_target_border_restore_fringe_px",0)))
+                if probe_px>0 and fringe_px>0 and cv2.countNonZero(protected_ring)>0:
+                    fk=cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(fringe_px*2+1,fringe_px*2+1))
+                    protected_ring=cv2.dilate(protected_ring,fk,iterations=1)
+                full_clear_diag["target_border_probe_dilate_px"]=int(probe_px)
+                full_clear_diag["target_border_restore_fringe_px"]=int(fringe_px)
             else:
                 protected_ring = cv2.bitwise_and(tm, cv2.bitwise_not(border_safe_envelope))
             ring_sel = protected_ring > 0
@@ -1163,8 +1247,8 @@ def transfer_rigid_container_rasters(
         rec.local_dx = dx; rec.local_dy = dy; rec.ink_ratio = float(cv2.countNonZero(source_ink_mask) / max(1, cv2.countNonZero(tm)))
         if sbox is not None: rec.source_bbox = sbox
         if tbox is not None: rec.target_bbox = tbox
-        if patch is not None:
-            rec.meta["mask_write_gap_fill"] = gap_fill_diag
+        rec.meta["white_source_clarity"] = white_clarity_diag
+        rec.meta["mask_write_gap_fill"] = gap_fill_diag
         rec.meta["target_border_preservation"] = border_diag
         rec.meta["white_container_full_clear"] = full_clear_diag
         rec.meta["source_text_support"] = text_support_diag
@@ -1187,23 +1271,13 @@ def transfer_rigid_container_rasters(
             min_source_coverage=min_cov,
             max_target_residual=max_res,
         )
-        if not rec.content_complete and patch is not None:
-            repaired, repaired_mask, repair_diag = _repair_content_region(
-                rec, rendered, patch_rgb, target_reference, write_alpha8, tm,
-                source_ink_mask, target_ink, cfg,
-                tolerance_px=3, min_source_coverage=min_cov, max_target_residual=max_res,
-            )
-            rec.meta["content_auto_repair"] = repair_diag
-            if bool(repair_diag.get("improved", False)):
-                rendered = repaired
-                write_alpha8 = np.maximum(write_alpha8, repaired_mask)
-                clear = np.maximum(clear, repaired_mask)
-                composite = np.maximum(composite, write_alpha8)
-                clear_all = np.maximum(clear_all, clear)
-                use = write_alpha8 > 0
-                if np.any(use):
-                    layer[use, :3] = rendered[use][:, ::-1]
-                layer[..., 3] = np.maximum(layer[..., 3], write_alpha8)
+        # The rigid text-only path has no target-sized SOURCE RGB patch.  Older
+        # code retained a dead auto-repair branch referencing an undefined
+        # ``patch_rgb``; it was guarded by ``patch is not None`` even though
+        # ``patch`` was always None.  Keep this route fail-closed: incomplete
+        # content is sent to review instead of inventing pixels from an invalid
+        # raster source. Other mask routes that own a valid aligned source image
+        # still use ``_repair_content_region`` normally.
         # A full-container clear + near-total source-raster containment is a stronger
         # success criterion than legacy "pixels were written".
         if not rec.content_complete:
@@ -1403,6 +1477,16 @@ def transfer_paired_diff_regions(
             records.append(rec)
             continue
 
+        # v2.3.32 fail-closed publication snapshot. Precise Mask and Hybrid may
+        # both *attempt* a region, but an incomplete content audit must not leave
+        # half-cleared Japanese / blurred Chinese in the published pixel layer.
+        # Snapshot only for policies that can roll back; keep_review retains the
+        # legacy behaviour without the copy cost.
+        incomplete_policy = str(getattr(cfg, "incomplete_pixel_policy", "keep_review") or "keep_review").strip().lower()
+        rollback_state = None
+        if incomplete_policy in {"restore_target", "defer_to_ocr"}:
+            rollback_state = (rendered.copy(), layer.copy(), composite_mask.copy(), clear_mask_all.copy())
+
         paste_mask = tm.copy()
         # Enclosed bubble masks include the complete interior. A tiny inset keeps
         # the clean HD target outline/tail untouched. Free SFX masks are already
@@ -1509,6 +1593,18 @@ def transfer_paired_diff_regions(
                 rec, source_ink_mask, text_diag.get("target_ink_mask"), text_img, cfg
             )
 
+            if not bool(getattr(rec, "content_complete", False)) and incomplete_policy in {"restore_target", "defer_to_ocr"}:
+                rec.applied = False
+                rec.reason = "content_incomplete_deferred_to_ocr" if incomplete_policy == "defer_to_ocr" else "content_incomplete_not_published"
+                rec.candidate = True
+                rec.review_required = True
+                rec.review_reason = rec.reason
+                rec.restorable = True
+                rec.editable = True
+                rec.meta["incomplete_pixel_policy"] = incomplete_policy
+                records.append(rec)
+                continue
+
             rendered = text_img
             alpha8 = write_mask.astype(np.uint8)
             composite_mask = np.maximum(composite_mask, alpha8)
@@ -1570,9 +1666,18 @@ def transfer_paired_diff_regions(
         if cfg.normalize_background:
             warped_img = _normalize_bubble_background(warped_img, tm, target, tm)
 
+        white_clarity_diag = {"enabled": bool(getattr(cfg, "direct_white_clarity_enhance_enabled", True)), "applied": False, "reason": "not_evaluated"}
+        if region_kind == "bubble":
+            warped_img, white_clarity_diag = _maybe_apply_white_source_clarity(warped_img, target, tm, cfg)
+        source_fidelity_lock = bool(white_clarity_diag.get("applied", False))
+        if source_fidelity_lock:
+            rec.clarity_mode = "source-faithful-white-clarity"
+            rec.meta["source_raster_fidelity_lock"] = True
+
         rec.sr_backend = str(render_source_label or "paired-dense-align")
         rec.meta["render_source"] = dict(render_source_diagnostics or {})
         rec.meta["glyph_dense_warp"] = bool(rec.meta["render_source"].get("glyph_dense_warp", rec.sr_backend == "paired-dense-align"))
+        rec.meta["white_source_clarity"] = white_clarity_diag
         rec.meta["dense_flow_geometry_only"] = bool(rec.meta["render_source"].get("dense_flow_geometry_only", False))
         rec.sr_scale = 1.0
         # Geometry QA is defined against the target-driven write mask. Preserve the
@@ -1589,7 +1694,8 @@ def transfer_paired_diff_regions(
         # layout, but strengthen soft antialiased edges before falling all the way
         # to binary ink reconstruction/OCR. This is most useful for clean low-res
         # scans mapped onto a higher-resolution target.
-        if (fidelity in {"auto", "pixels"}
+        if (not source_fidelity_lock
+                and fidelity in {"auto", "pixels"}
                 and rec.clarity_mode in {"pixels", "paired-aligned-pixels"}
                 and bool(getattr(cfg, "pixel_enhance_enabled", True))
                 and (rec.sharpness < float(getattr(cfg, "pixel_enhance_sharpness_trigger", 58.0))
@@ -1610,7 +1716,7 @@ def transfer_paired_diff_regions(
         # Rebuild their local Chinese ink over the clean target instead of copying
         # camera pixels. Unlike a whole-bubble clear, the supplemental target mask
         # is compact, so this is also safe for open burst bubbles/free text.
-        if photo_source and cfg.photo_pair_crisp_text_enabled:
+        if photo_source and cfg.photo_pair_crisp_text_enabled and not source_fidelity_lock:
             reconstructed = None
             ink_ratio = 0.0
             # v0.8.16: if source glyph pixels cross the target mask boundary, rescue
@@ -1660,7 +1766,7 @@ def transfer_paired_diff_regions(
         # Paired transfer already knows where the translated pixels live. For
         # non-photo structural regions, use deterministic ink reconstruction only
         # when the aligned pixels are too soft.
-        elif region_kind == "bubble" and (fidelity == "ink" or (fidelity == "auto" and too_soft)):
+        elif region_kind == "bubble" and not source_fidelity_lock and (fidelity == "ink" or (fidelity == "auto" and too_soft)):
             reconstructed = None
             ink_ratio = 0.0
             if cfg.ink_reconstruction_enabled:
@@ -1674,7 +1780,8 @@ def transfer_paired_diff_regions(
             else:
                 rec.clarity_mode = "paired-aligned-pixels"
         else:
-            rec.clarity_mode = "paired-aligned-pixels"
+            if not source_fidelity_lock:
+                rec.clarity_mode = "paired-aligned-pixels"
 
         gap_fill_diag = {"enabled": False, "iterations": 0, "added_pixels": 0}
         if region_kind == "bubble":
@@ -1731,6 +1838,17 @@ def transfer_paired_diff_regions(
                 if np.any(use):
                     layer[use, :3] = cv2.cvtColor(rendered, cv2.COLOR_BGR2RGB)[use]
                 layer[..., 3] = np.maximum(layer[..., 3], write_mask)
+        if region_kind == "bubble" and not bool(getattr(rec, "content_complete", False)) and incomplete_policy in {"restore_target", "defer_to_ocr"}:
+            if rollback_state is not None:
+                rendered, layer, composite_mask, clear_mask_all = rollback_state
+            rec.applied = False
+            rec.reason = "content_incomplete_deferred_to_ocr" if incomplete_policy == "defer_to_ocr" else "content_incomplete_not_published"
+            rec.candidate = True
+            rec.review_required = True
+            rec.review_reason = rec.reason
+            rec.restorable = True
+            rec.editable = True
+            rec.meta["incomplete_pixel_policy"] = incomplete_policy
         records.append(rec)
 
     return MaskTransferResult(rendered, layer, composite_mask, matches, records, clear_mask_all)

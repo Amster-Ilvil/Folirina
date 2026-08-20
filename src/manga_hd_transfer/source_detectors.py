@@ -17,7 +17,7 @@ import numpy as np
 from .config import BubbleConfig, MaskReplaceConfig
 from .geometry import mask_to_largest_polygon
 from .models import BubbleInstance
-from .cache import PageStageCache
+from .cache import PageStageCache, image_stage_signature
 from .layout_evidence import collect_koharu_layout_evidence_cached, filter_candidates_by_layout_authority
 from .detector_policy import (
     primary_detector, source_auxiliary_providers, expensive_provider,
@@ -215,6 +215,48 @@ def _cluster_text_components(gray: np.ndarray, comps: list[tuple[int,int,int,int
     return kept
 
 
+def _semanticize_pseudo_text_barrier_mask(
+    flood_mask: np.ndarray,
+    text_bbox: tuple[int, int, int, int] | list[int],
+    container_bbox: tuple[int, int, int, int] | list[int],
+    *,
+    barrier_dilate_px: int,
+) -> tuple[np.ndarray, list[int]]:
+    """Convert a holey white-flood candidate into Direct semantic authority.
+
+    ``pseudo_text_barrier`` deliberately uses dark printed glyphs as barriers.
+    Glyphs that touch a component edge therefore create open concavities in the
+    flood mask. Direct must not use those concavities as a write restriction or
+    it will clip exactly the first/last translated text column. Repair only the
+    already-proven text seed, clip the repair to the accepted container bbox, and
+    fill the resulting outer topology. No pixel can escape the vetted bbox.
+    """
+    m=(flood_mask>0).astype(np.uint8)*255
+    if cv2.countNonZero(m)==0:
+        return np.zeros_like(m), [0,0,0,0]
+    h,w=m.shape[:2]
+    bx0,by0,bx1,by1=[int(v) for v in container_bbox]
+    bx0=max(0,min(w,bx0)); bx1=max(bx0,min(w,bx1))
+    by0=max(0,min(h,by0)); by1=max(by0,min(h,by1))
+    tx0,ty0,tx1,ty1=[int(v) for v in text_bbox]
+    seed_pad=max(2,int(barrier_dilate_px)+2)
+    sx0=max(bx0,tx0-seed_pad); sy0=max(by0,ty0-seed_pad)
+    sx1=min(bx1,tx1+seed_pad); sy1=min(by1,ty1+seed_pad)
+    repaired=m.copy()
+    if sx1>sx0 and sy1>sy0:
+        repaired[sy0:sy1,sx0:sx1]=255
+    poly=mask_to_largest_polygon(repaired)
+    if len(poly)<3:
+        return np.zeros_like(m), [sx0,sy0,sx1,sy1]
+    semantic=np.zeros_like(m)
+    pts=np.asarray(poly,dtype=np.int32).reshape(-1,1,2)
+    cv2.fillPoly(semantic,[pts],255)
+    guard=np.zeros_like(m)
+    guard[by0:by1,bx0:bx1]=255
+    semantic=cv2.bitwise_and(semantic,guard)
+    return semantic,[sx0,sy0,sx1,sy1]
+
+
 @register_provider("source_detector","pseudo_text_barrier")
 def detect_pseudo_text_barrier(
     source: np.ndarray,
@@ -292,18 +334,33 @@ def detect_pseudo_text_barrier(
             continue
         if any(_iou(m,b.mask)>0.70 for b in out if b.mask is not None):
             continue
-        poly=mask_to_largest_polygon(m)
-        if len(poly)<3:
+        # The white flood intentionally treats dark printed glyphs as barriers.
+        # When a glyph touches the flood boundary this creates a *concavity*, not
+        # merely an enclosed hole, so filling the largest contour alone is not
+        # enough: the first/last vertical text column can remain cut out.  Stitch
+        # only the proven text seed back into the accepted container, clipped to
+        # its already-vetted bbox, then recover/fill the outer topology.  This is
+        # still SOURCE-only evidence and cannot grow beyond the candidate bbox.
+        semantic_mask,semantic_seed_bbox=_semanticize_pseudo_text_barrier_mask(
+            m,[tx0,ty0,tx1,ty1],bb,barrier_dilate_px=int(dp),
+        )
+        poly=mask_to_largest_polygon(semantic_mask)
+        if len(poly)<3 or cv2.countNonZero(semantic_mask)<300:
             continue
         out.append(BubbleInstance(
             id=f"pseudo-text-barrier-{len(out):04d}", polygon=poly,
             confidence=float(np.clip(0.78 + min(0.15,g["count"]*0.004),0,0.94)),
-            kind="speech", mask=m, safe_mask=m.copy(), block_ids=[],
+            kind="speech", mask=semantic_mask, safe_mask=semantic_mask.copy(), block_ids=[],
             meta={
                 "backend":"pseudo_text_barrier","source_only":True,"text_component_count":int(g["count"]),
                 "text_bbox":[int(tx0),int(ty0),int(tx1),int(ty1)],"barrier_threshold":int(thr),
                 "barrier_dilate_px":int(dp),"white_ratio":float(white),"dark_ratio":float(dark),
                 "area_to_text_ratio":float(ratio),"container_bbox":[int(v) for v in bb],
+                "semantic_mask_fills_text_holes":True,
+                "semantic_mask_stitches_boundary_text":True,
+                "semantic_seed_bbox":[int(v) for v in semantic_seed_bbox],
+                "white_flood_pixels":int(cv2.countNonZero(m)),
+                "semantic_pixels":int(cv2.countNonZero(semantic_mask)),
             },
         ))
     return out
@@ -602,16 +659,44 @@ def run_source_detector_chain(
         # that canonical result so MangaLens/RT-DETR are not inferred twice on
         # Direct pages. Unit/plugin calls without a page cache keep the registry
         # path below.
-        if phase == "primary" and cache is not None and source_path:
+        if phase == "primary" and cache is not None and source_path and bool(cache_enabled):
+            # Page-flow has already executed/cached the selected primary.  Read
+            # the canonical stage directly instead of importing the page-level
+            # bubble service back into this detector-domain module.  This keeps
+            # detector orchestration one-way while preserving the exact cache
+            # key used by ``primary_bubbles_cached``.
             try:
-                from .pipeline_bubble_service import primary_bubbles_cached
-                rows = primary_bubbles_cached(
-                    "source", source, source_path, bubble_config=bubble_cfg, cache=cache,
-                    cache_enabled=bool(cache_enabled), stats=stats if stats is not None else {},
+                primary_sig = image_stage_signature(
+                    source_path, bubble_cfg,
+                    {"role": "source", "detector_policy_primary": name, "primary_only_stage": True},
                 )
-                audit.append({"provider": name, "status": "ok_cached_primary", "count": len(rows), "phase": phase})
-                return list(rows or [])
-            except Exception as exc:
+                rows = cache.load_bubbles("primary_source", primary_sig)
+                if rows is not None:
+                    # v2.3.22: cached primary detections are real detector output,
+                    # not audit-only metadata.  The v2.3.20 cycle-breaking refactor
+                    # returned them from this helper before extending ``hints``; the
+                    # outer chain therefore reported a 10-row cache hit while
+                    # returning zero rows to Direct. Direct then fell through to a
+                    # partial pseudo-text fallback and left Japanese pixels behind.
+                    kept: list[BubbleInstance] = []
+                    for bubble in rows:
+                        if bubble.mask is None:
+                            continue
+                        if any(
+                            old.mask is not None and old.mask.shape == bubble.mask.shape and _iou(old.mask, bubble.mask) > 0.72
+                            for old in existing + hints
+                        ):
+                            continue
+                        kept.append(bubble)
+                    hints.extend(kept)
+                    if stats is not None:
+                        stats["primary_detector_source"] = f"hit:{name}:{len(kept)}"
+                    audit.append({
+                        "provider": name, "status": "ok_cached_primary",
+                        "count": len(kept), "cached_count": len(rows), "phase": phase,
+                    })
+                    return kept
+            except (OSError, ValueError, TypeError) as exc:
                 logger.warning("Canonical primary detector cache unavailable for %s: %s", name, exc)
         provider = REGISTRY.get("source_detector", name)
         if provider is None:
