@@ -154,7 +154,7 @@ APP_NAME = "Folirina"
 
 def _application_icon() -> QIcon:
     """Load the bundled application icon without relying on the working directory."""
-    path = Path(__file__).with_name("folirina_icon.png")
+    path = Path(__file__).with_name("Folirina.icns")
     return QIcon(str(path)) if path.is_file() else QIcon()
 VERSION = __version__
 QComboBox = StableComboBox
