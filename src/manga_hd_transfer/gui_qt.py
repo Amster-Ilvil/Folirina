@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+import cv2
 import numpy as np
 
 from PySide6.QtCore import Qt, QSize, QThread, QTimer, Signal, QRectF, QSettings, QUrl
@@ -40,7 +41,7 @@ from .app_logging import configure_application_logging, install_exception_hooks,
 from .platform_support import desktop_platform_badge
 from .gui_components import (
     _configure_responsive_dialog, _fit_scene_rect, StableThumbnailList, ImageView, Card, PageHero, OptionRow,
-    PathRow, ZoomPreviewView, StableComboBox, WorkbenchPageRail,
+    PathRow, ZoomPreviewView, StableComboBox, StableSpinBox, StableDoubleSpinBox, StableSlider, WorkbenchPageRail,
 )
 from .studio_state import StudioState
 from .studio_project_page import ProjectPage, PagePreviewDialog
@@ -53,14 +54,15 @@ from .model_downloads import apply_config_updates, model_home, model_local_paths
 from .dependency_install import missing_dependency_modules, dependency_summary
 from .paddle_profiles import PADDLE_MODEL_PROFILES, profile_label, backend_profile_key
 from .runtime_preflight import plan_runtime_requirements, pending_model_requirements
+from .app_icon import apply_application_icon
 from .gui_processing_policy import (
     compute_busy_state, classify_progress_state, worker_config_snapshot, completion_message,
 )
 from .io_utils import load_json, save_json, write_image
-from .review_history import record_review_state, undo_review_state, redo_review_state, review_history_counts
+from .review_history import review_history_counts
 from .font_catalog import discover_fonts
 from .review_apply import apply_review_page, generate_remove_text_preview, apply_target_layer_erase_review, reset_target_layer_erase_review, apply_target_layer_restore_review, reset_target_layer_restore_review, apply_manual_force_transfer_review, reset_manual_force_transfer_review, manual_force_auto_evidence_masks
-from .manual_effect import map_target_bbox_to_source, build_manual_effect_masks, build_reveal_seed_mask, estimate_source_background, composite_source_text_delta, clean_manual_target_text
+from .manual_effect import map_target_bbox_to_source, registration_homography, build_manual_effect_masks, build_reveal_seed_mask, estimate_source_background, composite_source_text_delta, clean_manual_target_text
 from .modes.reletter import ocr_edit_blocks as _reletter_ocr_edit_blocks
 from .modes.reletter import ocr_edit_render as _reletter_ocr_edit_render
 from .modes.hybrid import ocr_edit_blocks as _hybrid_ocr_edit_blocks
@@ -74,6 +76,19 @@ def _ocr_mode_modules(mode: str):
     if key == "reletter":
         return _reletter_ocr_edit_blocks, _reletter_ocr_edit_render
     return None, None
+
+
+def _manual_effect_ops_for_mode(mode: str):
+    """Return the mode-owned manual open-text engine when available."""
+    key = str(mode or "").strip().lower()
+    if key == "mask_replace":
+        from .modes.mask_replace import open_text_manual as ops
+        return ops
+    if key == "hybrid":
+        from .modes.hybrid import open_text_manual as ops
+        return ops
+    from . import manual_effect as ops
+    return ops
 
 
 def is_ocr_edit_mode(mode: str) -> bool:
@@ -141,8 +156,20 @@ from .workspace_cleanup import cleanup_output_workspace
 from .mode_contracts import clear_stale_mode_outputs
 from .session_restore import scan_existing_results
 from .schema_compat import as_dict, as_dict_rows, as_list, normalize_project, normalize_overrides, normalize_review_applied
-from .result_state import commit_reviewed_result
-from .manual_review_service import commit_manual_effect
+from .result_state import commit_reviewed_result, atomic_copy_file
+from .manual_review_service import (
+    commit_manual_effect, apply_review_history_step, apply_review_overrides_transaction,
+    run_manual_review_transaction,
+)
+from .region_selection import (
+    selection_mask_from_spec, selection_bbox_from_spec, bbox_from_mask,
+    spec_from_mask, project_selection_spec, snap_selection_mask_to_lineart,
+    recognize_closed_region_from_selection,
+)
+from .region_brush_reveal import (
+    stroke_bbox as brush_stroke_bbox, paint_reveal_stroke_inplace,
+    compose_reveal_patch, mask_bbox as brush_mask_bbox, mask_counts as brush_mask_counts,
+)
 from .page_management import (
     PAGE_TYPE_INFO, MANUAL_PAGE_TYPES, PageMark,
     default_mark, manual_mark, marks_from_json, marks_to_json, page_mark_key,
@@ -150,14 +177,11 @@ from .page_management import (
 )
 
 APP_NAME = "Folirina"
-
-
-def _application_icon() -> QIcon:
-    """Load the bundled application icon without relying on the working directory."""
-    path = Path(__file__).with_name("Folirina.icns")
-    return QIcon(str(path)) if path.is_file() else QIcon()
 VERSION = __version__
 QComboBox = StableComboBox
+QSpinBox = StableSpinBox
+QDoubleSpinBox = StableDoubleSpinBox
+QSlider = StableSlider
 
 logger = logging.getLogger(__name__)
 _THEME_SETTING_KEY = "ui/theme"
@@ -521,12 +545,16 @@ class MaskEditorDialog(QDialog):
         brush_row = QHBoxLayout(); brush_row.addWidget(QLabel("画笔大小"))
         self.slider = QSlider(Qt.Orientation.Horizontal); self.slider.setRange(4, 120); self.slider.setValue(24)
         self.size_label = QLabel("24 px"); brush_row.addWidget(self.slider, 1); brush_row.addWidget(self.size_label); root.addLayout(brush_row)
-        action_row = QHBoxLayout()
+        action_bar=QFrame(); action_bar.setObjectName("editorActionBar"); action_grid=QGridLayout(action_bar); action_grid.setContentsMargins(0,0,0,0); action_grid.setHorizontalSpacing(6); action_grid.setVerticalSpacing(5)
         self.focus_button=QPushButton("聚焦当前层"); self.fit_button = QPushButton("查看整页"); self.clear_button = QPushButton("清空当前层"); self.import_reference_button = QPushButton(f"复制 {self._reference_label} → 人工层"); self.import_reference_button.setEnabled(has_reference); self.import_reference_button.setVisible(has_reference); self.reset_reference_button = QPushButton("恢复自动原始") if has_reference else None; self.save_button = QPushButton(save_label); self.save_button.setObjectName("primary"); self.cancel_button = QPushButton("取消")
         self.import_reference_button.setToolTip("将当前蓝色 OCR/自动蒙版复制到红色人工层；蓝色层本身现在也可以直接涂抹或擦除。")
-        action_row.addWidget(self.focus_button); action_row.addWidget(self.fit_button); action_row.addWidget(self.clear_button); action_row.addWidget(self.import_reference_button);
-        if self.reset_reference_button is not None: action_row.addWidget(self.reset_reference_button)
-        action_row.addStretch(1); action_row.addWidget(self.save_button); action_row.addWidget(self.cancel_button); root.addLayout(action_row)
+        for col,button in enumerate((self.focus_button,self.fit_button,self.clear_button,self.import_reference_button)):
+            button.setMinimumWidth(0); action_grid.addWidget(button,0,col)
+        next_col=4
+        if self.reset_reference_button is not None:
+            self.reset_reference_button.setMinimumWidth(0); action_grid.addWidget(self.reset_reference_button,0,next_col); next_col+=1
+        action_grid.setColumnStretch(next_col,1); action_grid.addWidget(self.save_button,1,max(0,next_col-1)); action_grid.addWidget(self.cancel_button,1,next_col)
+        root.addWidget(action_bar,0)
         self.slider.valueChanged.connect(self._brush); self.fit_button.clicked.connect(self.view.fit_to_window); self.focus_button.clicked.connect(self.view.fit_to_active_mask)
         self.paint_add.clicked.connect(lambda: self._set_mode("add")); self.paint_erase.clicked.connect(lambda: self._set_mode("erase"))
         self.clear_button.clicked.connect(self._clear); self.import_reference_button.clicked.connect(self._import_reference); self.save_button.clicked.connect(self.accept); self.cancel_button.clicked.connect(self.reject)
@@ -679,9 +707,11 @@ class RevealMaskDialog(QDialog):
         brush_row=QHBoxLayout(); brush_row.addWidget(QLabel("画笔大小"))
         self.slider=QSlider(Qt.Orientation.Horizontal); self.slider.setRange(4,160); self.slider.setValue(32)
         self.size_label=QLabel("32 px"); brush_row.addWidget(self.slider,1); brush_row.addWidget(self.size_label); root.addLayout(brush_row)
-        action_row=QHBoxLayout()
+        action_bar=QFrame(); action_bar.setObjectName("editorActionBar"); action_grid=QGridLayout(action_bar); action_grid.setContentsMargins(0,0,0,0); action_grid.setHorizontalSpacing(6); action_grid.setVerticalSpacing(5)
         self.focus_button=QPushButton("聚焦选区"); self.fit_button=QPushButton("查看整页"); self.auto_button=QPushButton("恢复自动建议"); self.clear_button=QPushButton("全部恢复日文"); self.save_button=QPushButton("保存擦除显字"); self.save_button.setObjectName("primary"); self.cancel_button=QPushButton("取消")
-        action_row.addWidget(self.focus_button); action_row.addWidget(self.fit_button); action_row.addWidget(self.auto_button); action_row.addWidget(self.clear_button); action_row.addStretch(1); action_row.addWidget(self.save_button); action_row.addWidget(self.cancel_button); root.addLayout(action_row)
+        for col,button in enumerate((self.focus_button,self.fit_button,self.auto_button,self.clear_button)):
+            button.setMinimumWidth(0); action_grid.addWidget(button,0,col)
+        action_grid.setColumnStretch(4,1); action_grid.addWidget(self.save_button,1,3); action_grid.addWidget(self.cancel_button,1,4); root.addWidget(action_bar,0)
         self._auto_seed=(np.asarray(initial_mask)>0).astype(np.uint8)*255
         self.slider.valueChanged.connect(self._brush); self.fit_button.clicked.connect(self.view.fit_to_window); self.focus_button.clicked.connect(self._focus_selection)
         self.auto_button.clicked.connect(self._restore_auto); self.clear_button.clicked.connect(self._clear); self.save_button.clicked.connect(self.accept); self.cancel_button.clicked.connect(self.reject)
@@ -738,8 +768,17 @@ class RevealMaskDialog(QDialog):
 
 
 class RegionSelectView(QGraphicsView):
-    """Zoomable image view with one editable rectangle in image coordinates."""
-    selection_changed = Signal(object)
+    """Zoomable TARGET-space selection view used by every regional review tool.
+
+    Rectangle remains the compatibility default.  Ellipse, freehand and smart
+    closed-region selection share the same serializable ``selection_spec`` so
+    renderers never depend on Qt scene geometry.
+    """
+    selection_changed = Signal(object)          # compatibility: emits bbox
+    selection_spec_changed = Signal(object)
+    brush_stroke_started = Signal(object)
+    brush_stroke_segment = Signal(object)
+    brush_stroke_finished = Signal()
 
     def __init__(self, image_path: str | Path, *, editable: bool, parent=None):
         super().__init__(parent)
@@ -747,100 +786,256 @@ class RegionSelectView(QGraphicsView):
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
-        self._editable = bool(editable)
+        self._editable = bool(editable); self._image_path=str(image_path)
         reader = QImageReader(str(image_path)); reader.setAutoTransform(True)
         image = reader.read()
         if image.isNull():
             raise ValueError(f"无法读取图片：{Path(image_path).name}")
-        self._pix = QPixmap.fromImage(image)
-        self._scene.addPixmap(self._pix)
-        self._rect_item = self._scene.addRect(QRectF(), QPen(QColor(ACCENT), 2.0))
-        self._rect_item.setZValue(4)
+        self._pix = QPixmap.fromImage(image); self._scene.addPixmap(self._pix)
+        self._overlay_item=self._scene.addPixmap(QPixmap()); self._overlay_item.setZValue(4)
         self._scene.setSceneRect(0, 0, self._pix.width(), self._pix.height())
-        self._start = None
-        self._box: list[int] = []
-        self._panning = False; self._pan_last = None
-        self._auto_fit = True; self._fit_pending = False
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.fit_to_window()
+        self._start=None; self._points=[]; self._selection_spec={}; self._selection_mask=np.zeros((self._pix.height(),self._pix.width()),np.uint8); self._selection_bbox=[]
+        self._selection_mode="rect"; self._snap_enabled=False; self._snap_distance=10; self._snap_diag={}; self._snap_cv_cache=None
+        self._panning=False; self._pan_last=None; self._auto_fit=True; self._fit_pending=False
+        self._interaction_mode="selection"; self._brush_size=40; self._brush_last=None; self._brush_right=False
+        self.setDragMode(QGraphicsView.DragMode.NoDrag); self.setInteractive(True); self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding); self.fit_to_window()
 
     def _apply_fit(self):
-        self._fit_pending = False
-        if not self._auto_fit or self.viewport().width() < 8 or self.viewport().height() < 8:
-            return
-        self.resetTransform(); self.fitInView(_fit_scene_rect(self._scene), Qt.AspectRatioMode.KeepAspectRatio)
+        self._fit_pending=False
+        if not self._auto_fit or self.viewport().width()<8 or self.viewport().height()<8: return
+        self.resetTransform(); self.fitInView(_fit_scene_rect(self._scene),Qt.AspectRatioMode.KeepAspectRatio)
 
-    def fit_to_window(self):
-        self._auto_fit = True; self._apply_fit()
+    def fit_to_window(self): self._auto_fit=True; self._apply_fit()
 
-    def resizeEvent(self, event):
+    def resizeEvent(self,event):
         super().resizeEvent(event)
         if self._auto_fit and not self._fit_pending:
-            self._fit_pending = True; QTimer.singleShot(0, self._apply_fit)
+            self._fit_pending=True; QTimer.singleShot(0,self._apply_fit)
 
-    def wheelEvent(self, event):
-        factor = 1.15 if event.angleDelta().y() > 0 else (1.0 / 1.15)
-        current = float(self.transform().m11()); target = current * factor
-        if 0.05 <= target <= 12.0:
-            self._auto_fit = False; self.scale(factor, factor)
+    def wheelEvent(self,event):
+        factor=1.15 if event.angleDelta().y()>0 else 1.0/1.15; target=float(self.transform().m11())*factor
+        if 0.05<=target<=12.0: self._auto_fit=False; self.scale(factor,factor)
         event.accept()
 
-    def mouseDoubleClickEvent(self, event):
-        self.fit_to_window(); event.accept()
+    def mouseDoubleClickEvent(self,event): self.fit_to_window(); event.accept()
 
-    def _clamp(self, x: float, y: float) -> tuple[int, int]:
-        return (
-            max(0, min(self._pix.width(), int(round(x)))),
-            max(0, min(self._pix.height(), int(round(y)))),
-        )
+    def _clamp(self,x:float,y:float)->tuple[int,int]:
+        return max(0,min(self._pix.width()-1,int(round(x)))),max(0,min(self._pix.height()-1,int(round(y))))
 
-    def set_box(self, bbox: list[int] | tuple[int, int, int, int] | None, *, emit: bool = False):
-        if not bbox or len(bbox) != 4:
-            self._box = []; self._rect_item.setRect(QRectF())
-            if emit: self.selection_changed.emit([])
-            return
-        x0, y0 = self._clamp(float(bbox[0]), float(bbox[1])); x1, y1 = self._clamp(float(bbox[2]), float(bbox[3]))
-        x0, x1 = sorted((x0, x1)); y0, y1 = sorted((y0, y1))
-        if x1 - x0 < 2 or y1 - y0 < 2:
-            self._box = []; self._rect_item.setRect(QRectF())
+    def set_interaction_mode(self,mode:str):
+        key=str(mode or "selection").strip().lower()
+        self._interaction_mode="brush" if key=="brush" else "selection"
+        self._brush_last=None; self._brush_right=False
+        self.viewport().setCursor(Qt.CursorShape.CrossCursor if self._editable else Qt.CursorShape.ArrowCursor)
+
+    def interaction_mode(self)->str: return str(self._interaction_mode)
+    def set_brush_size(self,value:int): self._brush_size=max(2,min(320,int(value)))
+
+    def set_selection_mode(self,mode:str):
+        mode=str(mode or "rect").strip().lower(); self._selection_mode=mode if mode in {"rect","ellipse","freehand","smart"} else "rect"
+        self.viewport().setCursor(Qt.CursorShape.CrossCursor if self._editable else Qt.CursorShape.ArrowCursor)
+
+    def set_snap_enabled(self,enabled:bool): self._snap_enabled=bool(enabled)
+    def set_snap_distance(self,value:int): self._snap_distance=max(0,min(32,int(value)))
+    def set_snap_image_path(self,path:str|Path):
+        path=str(path)
+        if path != self._image_path: self._snap_cv_cache=None
+        self._image_path=path
+
+    def _snap_image(self):
+        if self._snap_cv_cache is None:
+            image=cv2.imread(self._image_path,cv2.IMREAD_COLOR)
+            if image is not None and image.shape[:2]==self._selection_mask.shape:
+                self._snap_cv_cache=image
+        return self._snap_cv_cache
+
+    def snap_current_selection(self):
+        """Nudge an already-good selection boundary toward nearby line art."""
+        if not self._editable or cv2.countNonZero(self._selection_mask)<=0: return False
+        image=self._snap_image()
+        if image is None: return False
+        snapped,diag=snap_selection_mask_to_lineart(image,self._selection_mask,max_distance=self._snap_distance)
+        self._snap_diag=dict(diag or {})
+        if not bool(diag.get("used_fallback")):
+            spec=spec_from_mask(snapped,kind="smart",snapped=True,diagnostics=diag)
         else:
-            self._box = [x0, y0, x1, y1]
-            self._rect_item.setRect(QRectF(float(x0), float(y0), float(x1 - x0), float(y1 - y0)))
-        if emit: self.selection_changed.emit(list(self._box))
+            spec=dict(self._selection_spec or {}); spec["diagnostics"]=dict(diag or {}); spec["snapped"]=False
+        self._selection_mask[:]=np.where(snapped>0,255,0).astype(np.uint8); self._selection_bbox=bbox_from_mask(self._selection_mask); spec["bbox"]=list(self._selection_bbox); self._selection_spec=spec
+        self._refresh_overlay(); self._emit_selection(); return True
 
-    def box(self) -> list[int]:
-        return list(self._box)
+    def recognize_closed_region(self):
+        """Turn a rough box/lasso into a topologically enclosed manga region."""
+        if not self._editable or cv2.countNonZero(self._selection_mask)<=0: return False
+        image=self._snap_image()
+        if image is None: return False
+        closed,diag=recognize_closed_region_from_selection(
+            image,self._selection_mask,
+            gap_close=max(3,min(8,int(round(self._snap_distance*0.5)))),
+            max_expand_px=max(0,self._snap_distance),
+        )
+        self._snap_diag=dict(diag or {})
+        success=not bool(diag.get("used_fallback"))
+        if success:
+            self._selection_mask[:]=np.where(closed>0,255,0).astype(np.uint8)
+            spec=spec_from_mask(self._selection_mask,kind="smart",snapped=True,diagnostics=diag)
+        else:
+            spec=dict(self._selection_spec or {}); spec["diagnostics"]=dict(diag or {}); spec["snapped"]=False
+        self._selection_bbox=bbox_from_mask(self._selection_mask); spec["bbox"]=list(self._selection_bbox); self._selection_spec=spec
+        self._refresh_overlay(); self._emit_selection(); return success
 
-    def mousePressEvent(self, event):
-        if event.button() in (Qt.MouseButton.MiddleButton, Qt.MouseButton.RightButton):
-            self._panning = True; self._pan_last = event.position().toPoint()
-            self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor); event.accept(); return
-        if not self._editable or event.button() != Qt.MouseButton.LeftButton:
+    def replace_display_image(self,path:str|Path):
+        reader=QImageReader(str(path)); reader.setAutoTransform(True); image=reader.read()
+        if image.isNull(): return False
+        pix=QPixmap.fromImage(image)
+        if pix.width()!=self._pix.width() or pix.height()!=self._pix.height(): return False
+        self._pix=pix
+        # The first scene item is the base image; keep selection overlay intact.
+        items=[item for item in self._scene.items() if item is not self._overlay_item]
+        if items:
+            base=min(items,key=lambda item:item.zValue()); base.setPixmap(pix)
+        return True
+
+    def _refresh_overlay(self):
+        # Never allocate a page-sized RGBA overlay while the mouse is moving.
+        # A 4096x5824 page used to allocate ~95 MB per drag event here, which
+        # made the selection system visibly stutter and could pressure macOS
+        # memory.  Render only the tight selection ROI and position that pixmap
+        # back in scene coordinates.
+        box=list(self._selection_bbox or [])
+        if len(box)!=4:
+            self._overlay_item.setPixmap(QPixmap()); self._overlay_item.setPos(0,0); return
+        x0,y0,x1,y1=[int(v) for v in box]
+        crop=self._selection_mask[y0:y1,x0:x1]
+        if crop.size==0 or cv2.countNonZero(crop)<=0:
+            self._overlay_item.setPixmap(QPixmap()); self._overlay_item.setPos(0,0); return
+        inside=crop>0; ch,cw=crop.shape; rgba=np.zeros((ch,cw,4),np.uint8)
+        edge=cv2.morphologyEx(crop,cv2.MORPH_GRADIENT,np.ones((3,3),np.uint8))>0
+        accent=QColor(ACCENT); r,g,b=accent.red(),accent.green(),accent.blue()
+        rgba[inside,0]=r; rgba[inside,1]=g; rgba[inside,2]=b; rgba[inside,3]=54
+        rgba[edge,0]=r; rgba[edge,1]=g; rgba[edge,2]=b; rgba[edge,3]=255
+        q=QImage(rgba.data,cw,ch,int(rgba.strides[0]),QImage.Format.Format_RGBA8888).copy()
+        self._overlay_item.setPixmap(QPixmap.fromImage(q)); self._overlay_item.setPos(x0,y0)
+
+    def _emit_selection(self):
+        # Drag paths maintain the bbox incrementally; do not rescan a 20-30 MP
+        # mask merely to emit a Qt signal on mouse release.
+        box=list(self._selection_bbox); self.selection_changed.emit(box); self.selection_spec_changed.emit(dict(self._selection_spec))
+
+    def clear_selection(self,*,emit:bool=False):
+        if len(self._selection_bbox)==4:
+            x0,y0,x1,y1=self._selection_bbox; self._selection_mask[y0:y1,x0:x1]=0
+        else:
+            self._selection_mask[:]=0
+        self._selection_bbox=[]; self._selection_spec={}; self._snap_diag={}; self._refresh_overlay()
+        if emit: self._emit_selection()
+
+    def set_selection_spec(self,spec:dict|None,*,emit:bool=False):
+        data=dict(spec or {}); old_box=list(self._selection_bbox)
+        mask=selection_mask_from_spec(data,self._selection_mask.shape,out=self._selection_mask,clear_bbox=old_box)
+        box=selection_bbox_from_spec(data,self._selection_mask.shape)
+        if not box or cv2.countNonZero(mask[box[1]:box[3],box[0]:box[2]])<=0:
+            self.clear_selection(emit=emit); return
+        data.setdefault("schema","folirina.region_selection.v1"); data.setdefault("kind","rect"); data["bbox"]=box
+        self._selection_bbox=box; self._selection_spec=data; self._refresh_overlay()
+        if emit: self._emit_selection()
+
+    def set_box(self,bbox:list[int]|tuple[int,int,int,int]|None,*,emit:bool=False):
+        if not bbox or len(bbox)!=4: self.clear_selection(emit=emit); return
+        self.set_selection_spec({"schema":"folirina.region_selection.v1","kind":"rect","bbox":[int(v) for v in bbox],"points":[],"snapped":False},emit=emit)
+
+    def box(self)->list[int]: return list(self._selection_bbox)
+    def image_shape(self)->tuple[int,int]: return tuple(self._selection_mask.shape)
+    def selection_spec(self)->dict: return dict(self._selection_spec)
+    def selection_mask(self): return self._selection_mask.copy()
+    def snap_diagnostics(self)->dict: return dict(self._snap_diag)
+
+    def _apply_raw_spec(self,spec:dict,*,final:bool=False):
+        old_box=list(self._selection_bbox)
+        mask=selection_mask_from_spec(spec,self._selection_mask.shape,out=self._selection_mask,clear_bbox=old_box)
+        box=selection_bbox_from_spec(spec,self._selection_mask.shape); kind=str(spec.get("kind") or "rect")
+        nonempty=bool(len(box)==4 and cv2.countNonZero(mask[box[1]:box[3],box[0]:box[2]])>0)
+        if final and nonempty and (self._snap_enabled or kind=="smart"):
+            image=self._snap_image()
+            if image is not None and image.shape[:2]==mask.shape:
+                if kind=="smart":
+                    snapped,diag=recognize_closed_region_from_selection(
+                        image,mask,
+                        gap_close=max(3,min(8,int(round(self._snap_distance*0.5)))),
+                        max_expand_px=max(0,self._snap_distance),
+                    )
+                else:
+                    snapped,diag=snap_selection_mask_to_lineart(image,mask,max_distance=self._snap_distance)
+                self._snap_diag=dict(diag)
+                self._selection_mask[:]=np.where(snapped>0,255,0).astype(np.uint8); mask=self._selection_mask
+                if not bool(diag.get("used_fallback")):
+                    spec=spec_from_mask(mask,kind="smart",snapped=True,diagnostics=diag)
+                else:
+                    spec=dict(spec); spec["diagnostics"]=dict(diag); spec["snapped"]=False
+                box=bbox_from_mask(mask)
+        self._selection_bbox=list(box or []); spec=dict(spec); spec["bbox"]=list(self._selection_bbox); self._selection_spec=spec; self._refresh_overlay()
+        if final: self._emit_selection()
+
+    def mousePressEvent(self,event):
+        if event.button()==Qt.MouseButton.MiddleButton or (self._interaction_mode=="selection" and event.button()==Qt.MouseButton.RightButton):
+            self._panning=True; self._pan_last=event.position().toPoint(); self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor); event.accept(); return
+        if not self._editable:
             super().mousePressEvent(event); return
-        p = self.mapToScene(event.position().toPoint()); self._start = self._clamp(p.x(), p.y())
-        self.set_box([self._start[0], self._start[1], self._start[0] + 2, self._start[1] + 2])
+        if self._interaction_mode=="brush":
+            if event.button() not in (Qt.MouseButton.LeftButton,Qt.MouseButton.RightButton):
+                super().mousePressEvent(event); return
+            p=self.mapToScene(event.position().toPoint()); now=self._clamp(p.x(),p.y())
+            self._brush_last=now; self._brush_right=event.button()==Qt.MouseButton.RightButton
+            payload={"point":[now[0],now[1]],"right":bool(self._brush_right),"brush_size":int(self._brush_size)}
+            self.brush_stroke_started.emit(dict(payload))
+            self.brush_stroke_segment.emit({"from":[now[0],now[1]],"to":[now[0],now[1]],"right":bool(self._brush_right),"brush_size":int(self._brush_size)})
+            event.accept(); return
+        if event.button()!=Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event); return
+        p=self.mapToScene(event.position().toPoint()); self._start=self._clamp(p.x(),p.y()); self._points=[list(self._start)]
+        if self._selection_mode=="freehand":
+            self._apply_raw_spec({"schema":"folirina.region_selection.v1","kind":"freehand","points":self._points,"bbox":[]})
+        else:
+            kind="smart" if self._selection_mode=="smart" else self._selection_mode
+            self._apply_raw_spec({"schema":"folirina.region_selection.v1","kind":kind,"bbox":[self._start[0],self._start[1],self._start[0]+2,self._start[1]+2],"points":[]})
         event.accept()
 
-    def mouseMoveEvent(self, event):
+    def mouseMoveEvent(self,event):
         if self._panning and self._pan_last is not None:
-            now_view = event.position().toPoint(); delta = now_view - self._pan_last; self._pan_last = now_view
-            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
-            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
-            event.accept(); return
-        if not self._editable or self._start is None:
+            now=event.position().toPoint(); delta=now-self._pan_last; self._pan_last=now; self.horizontalScrollBar().setValue(self.horizontalScrollBar().value()-delta.x()); self.verticalScrollBar().setValue(self.verticalScrollBar().value()-delta.y()); event.accept(); return
+        if not self._editable:
             super().mouseMoveEvent(event); return
-        p = self.mapToScene(event.position().toPoint()); end = self._clamp(p.x(), p.y())
-        self.set_box([self._start[0], self._start[1], end[0], end[1]])
+        if self._interaction_mode=="brush":
+            if self._brush_last is None:
+                super().mouseMoveEvent(event); return
+            p=self.mapToScene(event.position().toPoint()); now=self._clamp(p.x(),p.y()); last=self._brush_last; self._brush_last=now
+            self.brush_stroke_segment.emit({"from":[last[0],last[1]],"to":[now[0],now[1]],"right":bool(self._brush_right),"brush_size":int(self._brush_size)})
+            event.accept(); return
+        if self._start is None:
+            super().mouseMoveEvent(event); return
+        p=self.mapToScene(event.position().toPoint()); end=self._clamp(p.x(),p.y())
+        if self._selection_mode=="freehand":
+            if not self._points or abs(end[0]-self._points[-1][0])+abs(end[1]-self._points[-1][1])>=2: self._points.append([end[0],end[1]])
+            self._apply_raw_spec({"schema":"folirina.region_selection.v1","kind":"freehand","points":self._points,"bbox":[]})
+        else:
+            kind="smart" if self._selection_mode=="smart" else self._selection_mode
+            self._apply_raw_spec({"schema":"folirina.region_selection.v1","kind":kind,"bbox":[self._start[0],self._start[1],end[0],end[1]],"points":[]})
         event.accept()
 
-    def mouseReleaseEvent(self, event):
-        if self._panning and event.button() in (Qt.MouseButton.MiddleButton, Qt.MouseButton.RightButton):
-            self._panning = False; self._pan_last = None; self.viewport().unsetCursor(); event.accept(); return
-        if self._editable and self._start is not None and event.button() == Qt.MouseButton.LeftButton:
-            p = self.mapToScene(event.position().toPoint()); end = self._clamp(p.x(), p.y())
-            start = self._start; self._start = None
-            self.set_box([start[0], start[1], end[0], end[1]], emit=True)
-            event.accept(); return
+    def mouseReleaseEvent(self,event):
+        if self._panning and event.button() in (Qt.MouseButton.MiddleButton,Qt.MouseButton.RightButton):
+            self._panning=False; self._pan_last=None; self.viewport().setCursor(Qt.CursorShape.CrossCursor if self._editable else Qt.CursorShape.ArrowCursor); event.accept(); return
+        if self._editable and self._interaction_mode=="brush" and self._brush_last is not None and event.button() in (Qt.MouseButton.LeftButton,Qt.MouseButton.RightButton):
+            self._brush_last=None; self._brush_right=False; self.brush_stroke_finished.emit(); event.accept(); return
+        if self._editable and self._start is not None and event.button()==Qt.MouseButton.LeftButton:
+            p=self.mapToScene(event.position().toPoint()); end=self._clamp(p.x(),p.y()); start=self._start; self._start=None
+            if self._selection_mode=="freehand":
+                if len(self._points)>=3: self._points.append(self._points[0])
+                spec={"schema":"folirina.region_selection.v1","kind":"freehand","points":self._points,"bbox":[]}
+            else:
+                kind="smart" if self._selection_mode=="smart" else self._selection_mode; spec={"schema":"folirina.region_selection.v1","kind":kind,"bbox":[start[0],start[1],end[0],end[1]],"points":[]}
+            self._apply_raw_spec(spec,final=True); event.accept(); return
         super().mouseReleaseEvent(event)
 
 
@@ -1013,11 +1208,619 @@ def _manual_effect_unhandled_candidates(candidates: list[dict[str, Any]], existi
     return out
 
 
+class RegionCompositeDialog(QDialog):
+    """Selection-first regional review workbench.
+
+    Three visual authorities are always visible: original Japanese TARGET,
+    registered old Chinese SOURCE and the current reviewed result.  The current
+    result is the only editable canvas; selections are mirrored to the two
+    references so the user can verify every local operation before committing.
+    """
+
+    _TOOLS = [
+        ("直接贴图", "region_direct_patch", "把已配准 SOURCE 像素直接写入选区；适合两版画面完全一致的局部。"),
+        ("精准蒙版", "region_precise_mask", "只清 TARGET 日文字形并迁移 SOURCE 中文原字形；现在只计算选区周边 ROI，不再为一个小框重跑整页。"),
+        ("挖孔揭示", "region_hole_reveal", "把选区内部揭示为已配准 SOURCE；可向内缩保护气泡/文本框边线。"),
+        ("透明文字", "region_transparent", "只迁移 SOURCE 中文笔画差量，尽量保留 TARGET 彩图、肤色和背景纹理。"),
+        ("OCR / 排字", "region_ocr", "只 OCR 当前选区；可修改中文、方向、字号、断句和排版后再应用。"),
+    ]
+
+    def __init__(self, page_dir: str|Path, source_path: str|Path, target_path: str|Path,
+                 display_path: str|Path, project: dict[str,Any], config: PipelineConfig,
+                 parent=None, *, commit_handler=None):
+        super().__init__(parent)
+        self.page_dir=Path(page_dir); self.source_path=Path(source_path); self.target_path=Path(target_path)
+        self.display_path=Path(display_path); self.project=dict(project or {}); self.config=config.model_copy(deep=True)
+        self._commit_handler=commit_handler; self._applied=0; self._ocr_payload={}
+        self.setWindowTitle("区域复合工具 · 选区系统 / Direct / 蒙版 / 挖孔 / 透明 / OCR")
+        # v2.3.43: the old bottom-toolbar layout could advertise a safe dialog
+        # size but still grow beyond the real macOS content area because child
+        # size hints were wider/taller than the requested window.  Keep the
+        # visual workbench in the centre and move every control into a bounded
+        # side inspector with its own vertical scroll fallback.  The commit
+        # buttons live outside that scroll area, so they can never disappear.
+        _configure_responsive_dialog(self,(1480,920),(760,520))
+        root=QVBoxLayout(self); root.setContentsMargins(10,10,10,10); root.setSpacing(7)
+
+        intro=QLabel("在中间“当前结果”上建立选区；左侧固定显示高清日文 TARGET 与旧版中文 SOURCE。右侧选区和处理工具始终可见，同一区域可以连续叠加多个工具。")
+        intro.setObjectName("hint"); intro.setWordWrap(True)
+        intro.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        root.addWidget(intro)
+
+        # A QSplitter can preserve stale pane sizes across the macOS native
+        # maximise transition.  v2.3.46 therefore managed to give the centre
+        # canvas the whole screen while leaving the inspector just beyond the
+        # visible right edge.  Use a grid with two bounded side columns instead:
+        # refs + elastic canvas + inspector.  The canvas is the only column that
+        # may absorb/give up horizontal space.
+        body=QWidget(); body.setObjectName("regionWorkspaceBody")
+        body_grid=QGridLayout(body); body_grid.setContentsMargins(0,0,0,0); body_grid.setHorizontalSpacing(6); body_grid.setVerticalSpacing(0)
+
+        # Reference column: true Japanese authority above, registered Chinese
+        # source below.  It is deliberately narrow so the editable result keeps
+        # most of the screen on 1480px-class Mac displays.
+        refs=QSplitter(Qt.Orientation.Vertical); refs.setChildrenCollapsible(False); refs.setHandleWidth(4)
+        refs.setMinimumWidth(180); refs.setMaximumWidth(300); refs.setSizePolicy(QSizePolicy.Policy.Fixed,QSizePolicy.Policy.Expanding)
+        jp_card=QFrame(); jp_card.setObjectName("card"); jpl=QVBoxLayout(jp_card); jpl.setContentsMargins(6,6,6,6); jpl.setSpacing(4)
+        jp_title=QLabel("高清日文原图 · TARGET 参考（始终不变）"); jp_title.setObjectName("sectionTitle"); jp_title.setWordWrap(True); jpl.addWidget(jp_title)
+        self.jp_view=RegionSelectView(self.target_path,editable=False,parent=self); self.jp_view.setMinimumHeight(120); jpl.addWidget(self.jp_view,1)
+        cn_card=QFrame(); cn_card.setObjectName("card"); cnl=QVBoxLayout(cn_card); cnl.setContentsMargins(6,6,6,6); cnl.setSpacing(4)
+        cn_title=QLabel("旧版中文 · SOURCE 配准参考"); cn_title.setObjectName("sectionTitle"); cn_title.setWordWrap(True); cnl.addWidget(cn_title)
+        self.source_view=RegionSelectView(self.source_path,editable=False,parent=self); self.source_view.setMinimumHeight(120); cnl.addWidget(self.source_view,1)
+        refs.addWidget(jp_card); refs.addWidget(cn_card); refs.setSizes([320,320])
+
+        current_card=QFrame(); current_card.setObjectName("card"); current_card.setMinimumWidth(320); current_card.setSizePolicy(QSizePolicy.Policy.Expanding,QSizePolicy.Policy.Expanding)
+        cr=QVBoxLayout(current_card); cr.setContentsMargins(6,6,6,6); cr.setSpacing(4)
+        current_title=QLabel("当前结果 · 在这里建立选区并连续处理"); current_title.setObjectName("sectionTitle"); current_title.setWordWrap(True); cr.addWidget(current_title)
+        self.target_view=RegionSelectView(self.display_path if self.display_path.exists() else self.target_path,editable=True,parent=self)
+        self.target_view.setMinimumHeight(300); self.target_view.set_snap_image_path(self.target_path); cr.addWidget(self.target_view,1)
+        # Non-destructive brush reveal state.  The masks are page-sized uint8,
+        # while live preview pixels are kept as sparse 256px tiles so a 4K page
+        # never needs a full QPixmap rebuild for every mouse move.
+        self._brush_base=cv2.imread(str(self.display_path if self.display_path.exists() else self.target_path),cv2.IMREAD_COLOR)
+        self._brush_source=cv2.imread(str(self.source_path),cv2.IMREAD_COLOR)
+        if self._brush_base is None or self._brush_base.shape[:2] != self.target_view.image_shape():
+            raise ValueError("区域涂抹无法读取当前结果")
+        if self._brush_source is None:
+            raise ValueError("区域涂抹无法读取旧版中文 SOURCE")
+        bh,bw=self._brush_base.shape[:2]
+        self._brush_transparent=np.zeros((bh,bw),np.uint8); self._brush_hole=np.zeros((bh,bw),np.uint8)
+        self._brush_history=[]; self._brush_redo_stack=[]; self._brush_stroke_before={}; self._brush_stroke_tiles=set()
+        self._brush_preview_items={}; self._brush_source_tile_cache={}; self._brush_tile_size=256
+        self._brush_interaction=False
+
+        # Right inspector.  This replaces both the oversized top selection bar
+        # and the oversized bottom processing panel from v2.3.42.  At normal
+        # height every control is visible at once; on a smaller display only
+        # this inspector scrolls while the canvases and footer stay fixed.
+        inspector_scroll=QScrollArea(); inspector_scroll.setObjectName("regionInspectorScroll")
+        inspector_scroll.setWidgetResizable(True)
+        inspector_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        inspector_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        inspector_scroll.setMinimumWidth(280); inspector_scroll.setMaximumWidth(340)
+        inspector_scroll.setSizePolicy(QSizePolicy.Policy.Fixed,QSizePolicy.Policy.Expanding)
+        inspector_host=QWidget(); inspector_host.setMinimumWidth(0)
+        ip=QVBoxLayout(inspector_host); ip.setContentsMargins(5,2,5,2); ip.setSpacing(7)
+
+        selection_panel=QFrame(); selection_panel.setObjectName("selectionPanel")
+        sp=QVBoxLayout(selection_panel); sp.setContentsMargins(8,7,8,7); sp.setSpacing(5)
+        title=QLabel("① 选区系统"); title.setObjectName("sectionTitle"); sp.addWidget(title)
+        help_label=QLabel("左键拖选 / 手绘 · 右键或中键平移 · 滚轮缩放 · 双击适合窗口")
+        help_label.setObjectName("quiet"); help_label.setWordWrap(True); help_label.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred); sp.addWidget(help_label)
+        shapes_box=QWidget(); sg=QGridLayout(shapes_box); sg.setContentsMargins(0,0,0,0); sg.setHorizontalSpacing(5); sg.setVerticalSpacing(5)
+        self.shape_group=QButtonGroup(self); self.shape_group.setExclusive(True); self.shape_buttons=[]
+        shape_defs=[("矩形框","rect"),("椭圆框","ellipse"),("爆炸框 / 智能闭合","smart"),("手绘闭合","freehand")]
+        for i,(label,key) in enumerate(shape_defs):
+            b=QPushButton(label); b.setCheckable(True); b.setObjectName("segmented"); b.setProperty("selectionMode",key)
+            b.setMinimumHeight(29); b.setMinimumWidth(96); b.setSizePolicy(QSizePolicy.Policy.Expanding,QSizePolicy.Policy.Fixed)
+            self.shape_group.addButton(b); self.shape_buttons.append(b); sg.addWidget(b,i//2,i%2)
+        sg.setColumnStretch(0,1); sg.setColumnStretch(1,1); self.shape_buttons[0].setChecked(True); sp.addWidget(shapes_box)
+        self.snap=QCheckBox("普通选区完成后自动吸附线稿"); self.snap.setChecked(False); sp.addWidget(self.snap)
+        snap_row=QHBoxLayout(); snap_row.setContentsMargins(0,0,0,0); snap_row.addWidget(QLabel("吸附距离"))
+        self.snap_distance=QSpinBox(); self.snap_distance.setRange(2,24); self.snap_distance.setValue(10); self.snap_distance.setSuffix(" px"); snap_row.addWidget(self.snap_distance); snap_row.addStretch(1); sp.addLayout(snap_row)
+        refine_row=QGridLayout(); refine_row.setContentsMargins(0,0,0,0); refine_row.setHorizontalSpacing(5)
+        self.smart_refine_btn=QPushButton("识别当前选框的闭合区域"); self.smart_refine_btn.setObjectName("softPrimary"); self.smart_refine_btn.setMinimumHeight(30)
+        self.clear_selection_btn=QPushButton("清除选区"); self.clear_selection_btn.setMinimumHeight(30)
+        refine_row.addWidget(self.smart_refine_btn,0,0); refine_row.addWidget(self.clear_selection_btn,0,1); refine_row.setColumnStretch(0,2); refine_row.setColumnStretch(1,1); sp.addLayout(refine_row)
+        ip.addWidget(selection_panel)
+
+        tool_panel=QFrame(); tool_panel.setObjectName("selectionPanel")
+        tp=QVBoxLayout(tool_panel); tp.setContentsMargins(8,7,8,7); tp.setSpacing(5)
+        tools_head=QLabel("② 区域处理工具"); tools_head.setObjectName("sectionTitle"); tp.addWidget(tools_head)
+        tools_widget=QWidget(); tg=QGridLayout(tools_widget); tg.setContentsMargins(0,0,0,0); tg.setHorizontalSpacing(5); tg.setVerticalSpacing(5)
+        self.tool_group=QButtonGroup(self); self.tool_group.setExclusive(True); self.tool_buttons=[]
+        for i,(label,key,_hint) in enumerate(self._TOOLS):
+            b=QPushButton(label); b.setCheckable(True); b.setObjectName("segmented"); b.setProperty("regionTool",key)
+            b.setMinimumHeight(29); b.setMinimumWidth(96); b.setSizePolicy(QSizePolicy.Policy.Expanding,QSizePolicy.Policy.Fixed)
+            self.tool_group.addButton(b); self.tool_buttons.append(b); tg.addWidget(b,i//2,i%2)
+        tg.setColumnStretch(0,1); tg.setColumnStretch(1,1); self.tool_buttons[1].setChecked(True); tp.addWidget(tools_widget)
+        self.tool_hint=QLabel(); self.tool_hint.setObjectName("quiet"); self.tool_hint.setWordWrap(True); self.tool_hint.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred); tp.addWidget(self.tool_hint)
+        self.performance_hint=QLabel("精准蒙版快速 ROI：只计算选区和安全外扩区，选区外仍强制 0 像素写入。")
+        self.performance_hint.setObjectName("hint"); self.performance_hint.setWordWrap(True); self.performance_hint.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred); tp.addWidget(self.performance_hint)
+
+        params_widget=QWidget(); pg=QGridLayout(params_widget); pg.setContentsMargins(0,0,0,0); pg.setHorizontalSpacing(5); pg.setVerticalSpacing(4)
+        self.feather=QSpinBox(); self.feather.setRange(0,8); self.feather.setValue(0); self.feather.setSuffix(" px")
+        self.inset=QSpinBox(); self.inset.setRange(0,12); self.inset.setValue(1); self.inset.setSuffix(" px")
+        self.offset_x=QSpinBox(); self.offset_x.setRange(-100,100); self.offset_x.setSuffix(" px")
+        self.offset_y=QSpinBox(); self.offset_y.setRange(-100,100); self.offset_y.setSuffix(" px")
+        pg.addWidget(QLabel("边缘羽化"),0,0); pg.addWidget(self.feather,0,1)
+        pg.addWidget(QLabel("挖孔内缩"),1,0); pg.addWidget(self.inset,1,1)
+        pg.addWidget(QLabel("SOURCE X 微调"),2,0); pg.addWidget(self.offset_x,2,1)
+        pg.addWidget(QLabel("SOURCE Y 微调"),3,0); pg.addWidget(self.offset_y,3,1)
+        pg.setColumnStretch(1,1); tp.addWidget(params_widget)
+
+        self.ocr_box=QFrame(); self.ocr_box.setObjectName("card")
+        op=QVBoxLayout(self.ocr_box); op.setContentsMargins(7,6,7,6); op.setSpacing(5)
+        ocrrow=QHBoxLayout(); self.ocr_btn=QPushButton("识别当前选区"); self.ocr_btn.setObjectName("softPrimary")
+        self.ocr_status=QLabel("可先识别，再直接修改中文"); self.ocr_status.setObjectName("quiet"); self.ocr_status.setWordWrap(True); self.ocr_status.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        ocrrow.addWidget(self.ocr_btn); ocrrow.addWidget(self.ocr_status,1); op.addLayout(ocrrow)
+        self.ocr_text=QPlainTextEdit(); self.ocr_text.setMaximumHeight(74); self.ocr_text.setPlaceholderText("区域 OCR 中文结果；可手工修改后再应用。"); op.addWidget(self.ocr_text)
+        og=QGridLayout(); og.setHorizontalSpacing(5); og.setVerticalSpacing(4)
+        self.ocr_orientation=QComboBox(); self.ocr_orientation.addItem("自动","auto"); self.ocr_orientation.addItem("竖排","vertical"); self.ocr_orientation.addItem("横排","horizontal")
+        self.ocr_font_size=QSpinBox(); self.ocr_font_size.setRange(0,160); self.ocr_font_size.setSpecialValueText("自动"); self.ocr_font_size.setSuffix(" px")
+        self.ocr_columns=QSpinBox(); self.ocr_columns.setRange(0,12); self.ocr_columns.setSpecialValueText("自动")
+        self.ocr_break=QComboBox(); self.ocr_break.addItem("智能断句","smart"); self.ocr_break.addItem("均衡断句","balanced"); self.ocr_break.addItem("保留源换行","source")
+        self.ocr_layout=QComboBox(); self.ocr_layout.addItem("智能缩放","smart_scaling"); self.ocr_layout.addItem("严格字号","strict"); self.ocr_layout.addItem("填充文本框","balloon_fill")
+        og.addWidget(QLabel("方向"),0,0); og.addWidget(self.ocr_orientation,0,1); og.addWidget(QLabel("字号"),1,0); og.addWidget(self.ocr_font_size,1,1)
+        og.addWidget(QLabel("列数"),2,0); og.addWidget(self.ocr_columns,2,1); og.addWidget(QLabel("断句"),3,0); og.addWidget(self.ocr_break,3,1)
+        og.addWidget(QLabel("排版"),4,0); og.addWidget(self.ocr_layout,4,1); og.setColumnStretch(1,1); op.addLayout(og)
+        tp.addWidget(self.ocr_box); ip.addWidget(tool_panel)
+
+        brush_panel=QFrame(); brush_panel.setObjectName("selectionPanel")
+        bp=QVBoxLayout(brush_panel); bp.setContentsMargins(8,7,8,7); bp.setSpacing(5)
+        brush_head=QLabel("③ 涂抹揭示 / 挖孔"); brush_head.setObjectName("sectionTitle"); bp.addWidget(brush_head)
+        brush_help=QLabel("左键实时揭示；右键临时恢复日文；中键平移。透明揭示使用软边透明，挖孔是硬剪裁。每一笔都可撤销/重做。")
+        brush_help.setObjectName("quiet"); brush_help.setWordWrap(True); brush_help.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred); bp.addWidget(brush_help)
+        brush_modes=QWidget(); bg=QGridLayout(brush_modes); bg.setContentsMargins(0,0,0,0); bg.setHorizontalSpacing(5); bg.setVerticalSpacing(5)
+        self.brush_group=QButtonGroup(self); self.brush_group.setExclusive(True); self.brush_buttons=[]
+        for i,(label,key) in enumerate((("透明揭示","transparent"),("挖孔揭示","hole"),("恢复日文","restore"))):
+            b=QPushButton(label); b.setCheckable(True); b.setObjectName("segmented"); b.setProperty("brushRevealMode",key); b.setMinimumHeight(29); b.setSizePolicy(QSizePolicy.Policy.Expanding,QSizePolicy.Policy.Fixed)
+            self.brush_group.addButton(b); self.brush_buttons.append(b); bg.addWidget(b,0,i)
+        bg.setColumnStretch(0,1); bg.setColumnStretch(1,1); bg.setColumnStretch(2,1); bp.addWidget(brush_modes)
+        br=QGridLayout(); br.setHorizontalSpacing(5); br.setVerticalSpacing(4)
+        self.brush_size=QSlider(Qt.Orientation.Horizontal); self.brush_size.setRange(4,240); self.brush_size.setValue(42)
+        self.brush_size_label=QLabel("42 px")
+        self.brush_feather=QSpinBox(); self.brush_feather.setRange(0,24); self.brush_feather.setValue(3); self.brush_feather.setSuffix(" px")
+        self.brush_opacity=QSpinBox(); self.brush_opacity.setRange(10,100); self.brush_opacity.setValue(100); self.brush_opacity.setSuffix(" %")
+        br.addWidget(QLabel("画笔"),0,0); br.addWidget(self.brush_size,0,1); br.addWidget(self.brush_size_label,0,2)
+        br.addWidget(QLabel("透明羽化"),1,0); br.addWidget(self.brush_feather,1,1,1,2)
+        br.addWidget(QLabel("透明强度"),2,0); br.addWidget(self.brush_opacity,2,1,1,2); br.setColumnStretch(1,1); bp.addLayout(br)
+        self.brush_limit_selection=QCheckBox("仅在当前选区内涂抹"); self.brush_limit_selection.setChecked(False); bp.addWidget(self.brush_limit_selection)
+        brush_actions=QGridLayout(); brush_actions.setHorizontalSpacing(5); brush_actions.setVerticalSpacing(5)
+        self.brush_undo_btn=QPushButton("撤销一笔"); self.brush_redo_btn=QPushButton("重做一笔"); self.brush_clear_btn=QPushButton("全部恢复日文")
+        brush_actions.addWidget(self.brush_undo_btn,0,0); brush_actions.addWidget(self.brush_redo_btn,0,1); brush_actions.addWidget(self.brush_clear_btn,1,0,1,2); brush_actions.setColumnStretch(0,1); brush_actions.setColumnStretch(1,1); bp.addLayout(brush_actions)
+        self.brush_status=QLabel("尚未涂抹 · 选择“透明揭示”或“挖孔揭示”后直接在中间画布操作")
+        self.brush_status.setObjectName("hint"); self.brush_status.setWordWrap(True); self.brush_status.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred); bp.addWidget(self.brush_status)
+        ip.addWidget(brush_panel); ip.addStretch(1)
+        inspector_scroll.setWidget(inspector_host)
+
+        body_grid.addWidget(refs,0,0); body_grid.addWidget(current_card,0,1); body_grid.addWidget(inspector_scroll,0,2)
+        body_grid.setColumnStretch(0,0); body_grid.setColumnStretch(1,1); body_grid.setColumnStretch(2,0); body_grid.setRowStretch(0,1)
+        root.addWidget(body,1)
+        self._region_body=body; self._region_body_grid=body_grid; self._region_refs=refs; self._region_current=current_card; self._region_inspector=inspector_scroll
+
+        # Sticky footer: v2.3.42 placed this after a tall tools block and the
+        # Apply button could end up outside the window.  Here it is never inside
+        # a scroll area and long status text is explicitly allowed to shrink.
+        footer_panel=QFrame(); footer_panel.setObjectName("selectionPanel")
+        footer=QHBoxLayout(footer_panel); footer.setContentsMargins(8,6,8,6); footer.setSpacing(7)
+        status_box=QWidget(); sv=QVBoxLayout(status_box); sv.setContentsMargins(0,0,0,0); sv.setSpacing(1)
+        self.selection_status=QLabel("尚未选择区域 · 请在中间当前结果上左键拖选")
+        self.selection_status.setObjectName("hint"); self.selection_status.setWordWrap(True); self.selection_status.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        self.undo_hint=QLabel("涂抹可在本窗口逐笔撤销/重做；提交后仍可在工作台撤销最近区域动作"); self.undo_hint.setObjectName("quiet"); self.undo_hint.setWordWrap(True); self.undo_hint.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        sv.addWidget(self.selection_status); sv.addWidget(self.undo_hint); footer.addWidget(status_box,1)
+        self.apply_btn=QPushButton("应用当前工具到选区"); self.apply_btn.setObjectName("primary"); self.apply_btn.setMinimumHeight(36); self.apply_btn.setMinimumWidth(178); self.apply_btn.setMaximumWidth(240)
+        close=QPushButton("完成"); close.setMinimumHeight(36); close.setMinimumWidth(82); close.setMaximumWidth(120)
+        footer.addWidget(self.apply_btn,0); footer.addWidget(close,0); root.addWidget(footer_panel,0)
+
+        for b in self.shape_buttons: b.clicked.connect(self._shape_changed)
+        for b in self.tool_buttons: b.clicked.connect(self._tool_changed)
+        for b in self.brush_buttons: b.clicked.connect(self._brush_mode_changed)
+        self.snap.toggled.connect(lambda v:self.target_view.set_snap_enabled(bool(v)))
+        self.snap_distance.valueChanged.connect(self.target_view.set_snap_distance)
+        self.smart_refine_btn.clicked.connect(self._refine_current_selection)
+        self.clear_selection_btn.clicked.connect(self._clear_selection)
+        self.target_view.selection_changed.connect(self._selection_changed)
+        self.target_view.brush_stroke_started.connect(self._brush_stroke_started)
+        self.target_view.brush_stroke_segment.connect(self._brush_stroke_segment)
+        self.target_view.brush_stroke_finished.connect(self._brush_stroke_finished)
+        self.brush_size.valueChanged.connect(self._brush_size_changed)
+        self.brush_feather.valueChanged.connect(lambda _v:self._refresh_all_brush_tiles())
+        self.brush_opacity.valueChanged.connect(lambda _v:self._refresh_all_brush_tiles())
+        self.offset_x.valueChanged.connect(lambda _v:self._brush_alignment_changed())
+        self.offset_y.valueChanged.connect(lambda _v:self._brush_alignment_changed())
+        self.brush_undo_btn.clicked.connect(self._brush_undo); self.brush_redo_btn.clicked.connect(self._brush_redo); self.brush_clear_btn.clicked.connect(self._brush_clear)
+        self.ocr_btn.clicked.connect(self._recognize_ocr); self.apply_btn.clicked.connect(self._apply_tool); close.clicked.connect(self.accept)
+        self.target_view.set_selection_mode("rect"); self.target_view.set_interaction_mode("selection"); self.target_view.set_snap_enabled(False); self.target_view.set_snap_distance(10); self.target_view.set_brush_size(42)
+        self._update_brush_controls(); self._tool_changed(); QTimer.singleShot(0,self._finish_region_layout)
+
+    def _apply_region_column_widths(self):
+        """Keep both side workspaces visible at every supported window width."""
+        if not hasattr(self,"_region_refs") or not hasattr(self,"_region_inspector"):
+            return
+        available=max(760,int(self.width())-36)
+        if available < 1080:
+            refs_w, inspector_w = 180, 280
+        elif available < 1320:
+            refs_w, inspector_w = 210, 292
+        elif available < 1540:
+            refs_w, inspector_w = 250, 312
+        else:
+            refs_w, inspector_w = 280, 328
+        self._region_refs.setFixedWidth(int(refs_w))
+        self._region_inspector.setFixedWidth(int(inspector_w))
+
+    def _finish_region_layout(self):
+        """Finalize bounded columns and image fitting in the normal dialog."""
+        # v2.3.48 intentionally restores the pre-v2.3.45 windowed editor size.
+        # Keep the responsive three-column protections from v2.3.47, but never
+        # promote/maximise the dialog here: the user explicitly wants the
+        # original independent editor size back.
+        self._apply_region_column_widths(); self._fit()
+        # Cocoa can still settle the native frame one or two event-loop turns
+        # later. Re-apply only the bounded columns/fit, never window geometry.
+        for delay in (50,180):
+            QTimer.singleShot(delay,self._settle_region_layout)
+
+    def _settle_region_layout(self):
+        self._apply_region_column_widths(); self._fit()
+
+    def resizeEvent(self,event):
+        super().resizeEvent(event)
+        if hasattr(self,"_region_refs"):
+            self._apply_region_column_widths()
+
+    def _fit(self):
+        self.jp_view.fit_to_window(); self.source_view.fit_to_window(); self.target_view.fit_to_window()
+
+    def _checked_property(self,group:QButtonGroup,name:str,default:str)->str:
+        b=group.checkedButton(); return str(b.property(name) if b is not None else default)
+
+    def _shape_changed(self,*_):
+        self._activate_selection_interaction()
+        mode=self._checked_property(self.shape_group,"selectionMode","rect")
+        self.target_view.set_selection_mode(mode)
+        names={"rect":"矩形框","ellipse":"椭圆框","smart":"爆炸框 / 智能闭合","freehand":"手绘闭合"}
+        self.selection_status.setText(f"已选择 {names.get(mode,mode)} · 请在中间当前结果上左键操作")
+
+    def _tool_key(self)->str: return self._checked_property(self.tool_group,"regionTool","region_precise_mask")
+
+    def _tool_changed(self,*_):
+        self._activate_selection_interaction()
+        key=self._tool_key(); hints={k:h for _l,k,h in self._TOOLS}; self.tool_hint.setText(hints.get(key,""))
+        is_ocr=key=="region_ocr"; self.ocr_box.setVisible(is_ocr); self.performance_hint.setVisible(key=="region_precise_mask")
+        self.inset.setEnabled(key=="region_hole_reveal")
+        self.feather.setEnabled(key in {"region_direct_patch","region_hole_reveal","region_transparent"})
+        offsets=key!="region_ocr"; self.offset_x.setEnabled(offsets); self.offset_y.setEnabled(offsets)
+        if key=="region_hole_reveal" and self.feather.value()==0: self.feather.setValue(1)
+
+    def _uncheck_brush_buttons(self):
+        if not hasattr(self,"brush_group"): return
+        self.brush_group.setExclusive(False)
+        for button in self.brush_buttons: button.setChecked(False)
+        self.brush_group.setExclusive(True)
+
+    def _activate_selection_interaction(self):
+        self._brush_interaction=False
+        if hasattr(self,"target_view"):
+            self.target_view.set_interaction_mode("selection")
+        self._uncheck_brush_buttons()
+        if hasattr(self,"apply_btn"): self.apply_btn.setText("应用当前工具到选区")
+
+    def _brush_mode_key(self)->str:
+        return self._checked_property(self.brush_group,"brushRevealMode","transparent")
+
+    def _brush_mode_changed(self,*_):
+        self._brush_interaction=True
+        self.target_view.set_interaction_mode("brush")
+        self.target_view.set_brush_size(int(self.brush_size.value()))
+        key=self._brush_mode_key(); names={"transparent":"透明揭示","hole":"挖孔揭示","restore":"恢复日文"}
+        self.apply_btn.setText("提交当前涂抹揭示")
+        self.selection_status.setText(f"涂抹模式 · {names.get(key,key)} · 左键涂抹，右键恢复，中键平移")
+        self._update_brush_controls()
+
+    def _brush_size_changed(self,value:int):
+        self.target_view.set_brush_size(int(value)); self.brush_size_label.setText(f"{int(value)} px")
+
+    def _tile_bounds(self,key):
+        tx,ty=[int(v) for v in key]; size=int(self._brush_tile_size); h,w=self._brush_transparent.shape
+        x0=tx*size; y0=ty*size; return x0,y0,min(w,x0+size),min(h,y0+size)
+
+    def _tiles_for_bbox(self,bbox):
+        if not bbox or len(bbox)!=4: return set()
+        x0,y0,x1,y1=[int(v) for v in bbox]; size=int(self._brush_tile_size)
+        if x1<=x0 or y1<=y0: return set()
+        return {(tx,ty) for ty in range(max(0,y0)//size,(max(0,y1-1)//size)+1) for tx in range(max(0,x0)//size,(max(0,x1-1)//size)+1)}
+
+    def _remember_before_tiles(self,keys):
+        for key in keys:
+            if key in self._brush_stroke_before: continue
+            x0,y0,x1,y1=self._tile_bounds(key)
+            self._brush_stroke_before[key]=(self._brush_transparent[y0:y1,x0:x1].copy(),self._brush_hole[y0:y1,x0:x1].copy())
+            self._brush_stroke_tiles.add(key)
+
+    def _source_tile(self,key):
+        dx=int(self.offset_x.value()); dy=int(self.offset_y.value()); cache_key=(int(key[0]),int(key[1]),dx,dy)
+        cached=self._brush_source_tile_cache.get(cache_key)
+        if cached is not None: return cached
+        from .region_composite import _aligned_source_roi
+        roi=self._tile_bounds(key)
+        crop,_identity=_aligned_source_roi(self._brush_source,self._brush_base.shape[:2],self.project,roi,source_offset_x=dx,source_offset_y=dy)
+        self._brush_source_tile_cache[cache_key]=crop
+        return crop
+
+    def _refresh_brush_tile(self,key):
+        x0,y0,x1,y1=self._tile_bounds(key)
+        tr=self._brush_transparent[y0:y1,x0:x1]; ho=self._brush_hole[y0:y1,x0:x1]
+        alpha_present=bool(np.any(tr>0) or np.any(ho>0))
+        item=self._brush_preview_items.get(key)
+        if not alpha_present:
+            if item is not None:
+                try: self.target_view._scene.removeItem(item)
+                except RuntimeError: pass
+                self._brush_preview_items.pop(key,None)
+            return
+        base=self._brush_base[y0:y1,x0:x1]
+        under=self._source_tile(key)
+        preview,_patch=compose_reveal_patch(base,under,tr,ho,transparent_feather_px=int(self.brush_feather.value()),transparent_opacity=float(self.brush_opacity.value())/100.0)
+        rgb=cv2.cvtColor(preview,cv2.COLOR_BGR2RGB); hh,ww=rgb.shape[:2]
+        q=QImage(rgb.data,ww,hh,int(rgb.strides[0]),QImage.Format.Format_RGB888).copy(); pix=QPixmap.fromImage(q)
+        if item is None:
+            item=self.target_view._scene.addPixmap(pix); item.setZValue(2.5); self._brush_preview_items[key]=item
+        else: item.setPixmap(pix)
+        item.setPos(x0,y0)
+
+    def _refresh_brush_tiles(self,keys):
+        for key in set(keys or []): self._refresh_brush_tile(key)
+        self._update_brush_controls()
+
+    def _refresh_all_brush_tiles(self):
+        if not hasattr(self,"_brush_transparent"): return
+        box=brush_mask_bbox(self._brush_transparent,self._brush_hole)
+        keys=set(self._brush_preview_items.keys())|self._tiles_for_bbox(box)
+        self._refresh_brush_tiles(keys)
+
+    def _brush_alignment_changed(self):
+        if not hasattr(self,"_brush_source_tile_cache"): return
+        self._brush_source_tile_cache.clear(); self._refresh_all_brush_tiles()
+
+    def _brush_stroke_started(self,payload):
+        self._brush_stroke_before={}; self._brush_stroke_tiles=set()
+
+    def _brush_stroke_segment(self,payload):
+        if not self._brush_interaction: return
+        start=list((payload or {}).get("from") or []); end=list((payload or {}).get("to") or [])
+        if len(start)!=2 or len(end)!=2: return
+        diameter=int((payload or {}).get("brush_size") or self.brush_size.value())
+        candidate=brush_stroke_bbox(self._brush_transparent.shape,[start,end],diameter)
+        keys=self._tiles_for_bbox(candidate); self._remember_before_tiles(keys)
+        limit=None
+        if self.brush_limit_selection.isChecked():
+            if cv2.countNonZero(self.target_view._selection_mask)<=0:
+                self.brush_status.setText("已启用“仅在当前选区内涂抹”，但当前没有选区。先建立选区或关闭限制。")
+                return
+            limit=self.target_view._selection_mask
+        mode="restore" if bool((payload or {}).get("right")) else self._brush_mode_key()
+        diag=paint_reveal_stroke_inplace(self._brush_transparent,self._brush_hole,[start,end],diameter,mode,limit_mask=limit)
+        if diag.changed_pixels>0: self._refresh_brush_tiles(self._tiles_for_bbox(diag.bbox))
+
+    def _brush_stroke_finished(self):
+        entries=[]; changed_keys=set()
+        for key in sorted(self._brush_stroke_tiles):
+            before=self._brush_stroke_before.get(key)
+            if before is None: continue
+            x0,y0,x1,y1=self._tile_bounds(key); after=(self._brush_transparent[y0:y1,x0:x1].copy(),self._brush_hole[y0:y1,x0:x1].copy())
+            if np.array_equal(before[0],after[0]) and np.array_equal(before[1],after[1]): continue
+            entries.append((key,before[0],before[1],after[0],after[1])); changed_keys.add(key)
+        self._brush_stroke_before={}; self._brush_stroke_tiles=set()
+        if entries:
+            self._brush_history.append(entries)
+            if len(self._brush_history)>100: self._brush_history=self._brush_history[-100:]
+            self._brush_redo_stack.clear()
+        self._refresh_brush_tiles(changed_keys)
+
+    def _restore_brush_record(self,record,after:bool):
+        keys=set()
+        for key,btr,bho,atr,aho in record:
+            x0,y0,x1,y1=self._tile_bounds(key)
+            self._brush_transparent[y0:y1,x0:x1]=atr if after else btr
+            self._brush_hole[y0:y1,x0:x1]=aho if after else bho
+            keys.add(key)
+        self._refresh_brush_tiles(keys)
+
+    def _brush_undo(self):
+        if not self._brush_history: return
+        record=self._brush_history.pop(); self._restore_brush_record(record,False); self._brush_redo_stack.append(record); self._update_brush_controls()
+
+    def _brush_redo(self):
+        if not self._brush_redo_stack: return
+        record=self._brush_redo_stack.pop(); self._restore_brush_record(record,True); self._brush_history.append(record); self._update_brush_controls()
+
+    def _brush_clear(self):
+        box=brush_mask_bbox(self._brush_transparent,self._brush_hole)
+        keys=self._tiles_for_bbox(box)
+        if not keys: return
+        record=[]
+        for key in sorted(keys):
+            x0,y0,x1,y1=self._tile_bounds(key); btr=self._brush_transparent[y0:y1,x0:x1].copy(); bho=self._brush_hole[y0:y1,x0:x1].copy()
+            if not np.any(btr) and not np.any(bho): continue
+            atr=np.zeros_like(btr); aho=np.zeros_like(bho); record.append((key,btr,bho,atr,aho))
+            self._brush_transparent[y0:y1,x0:x1]=0; self._brush_hole[y0:y1,x0:x1]=0
+        if record:
+            self._brush_history.append(record); self._brush_redo_stack.clear(); self._refresh_brush_tiles(keys)
+
+    def _update_brush_controls(self):
+        if not hasattr(self,"brush_status"): return
+        counts=brush_mask_counts(self._brush_transparent,self._brush_hole)
+        self.brush_undo_btn.setEnabled(bool(self._brush_history)); self.brush_redo_btn.setEnabled(bool(self._brush_redo_stack)); self.brush_clear_btn.setEnabled(counts["union_pixels"]>0)
+        self.brush_status.setText(f"透明 {counts['transparent_pixels']:,} px · 挖孔 {counts['hole_pixels']:,} px · 共 {counts['union_pixels']:,} px · 撤销 {len(self._brush_history)} / 重做 {len(self._brush_redo_stack)}")
+
+    def _clear_brush_preview_items(self):
+        for item in list(self._brush_preview_items.values()):
+            try: self.target_view._scene.removeItem(item)
+            except RuntimeError: pass
+        self._brush_preview_items.clear()
+
+    def _reset_brush_session(self,final_path:Path|None=None):
+        if final_path is not None and final_path.exists():
+            image=cv2.imread(str(final_path),cv2.IMREAD_COLOR)
+            if image is not None and image.shape==self._brush_base.shape:
+                self._brush_base=image; self.target_view.replace_display_image(final_path)
+        self._brush_transparent[:]=0; self._brush_hole[:]=0; self._brush_history.clear(); self._brush_redo_stack.clear(); self._brush_stroke_before={}; self._brush_stroke_tiles=set(); self._brush_source_tile_cache.clear(); self._clear_brush_preview_items(); self._update_brush_controls()
+
+    def _build_brush_commit(self):
+        import uuid
+        box=brush_mask_bbox(self._brush_transparent,self._brush_hole)
+        if len(box)!=4: raise ValueError("当前没有可提交的涂抹揭示")
+        x0,y0,x1,y1=box
+        tr=self._brush_transparent[y0:y1,x0:x1].copy(); ho=self._brush_hole[y0:y1,x0:x1].copy()
+        from .region_composite import _aligned_source_roi
+        under,_identity=_aligned_source_roi(self._brush_source,self._brush_base.shape[:2],self.project,(x0,y0,x1,y1),source_offset_x=int(self.offset_x.value()),source_offset_y=int(self.offset_y.value()))
+        base=self._brush_base[y0:y1,x0:x1]
+        _preview,patch=compose_reveal_patch(base,under,tr,ho,transparent_feather_px=int(self.brush_feather.value()),transparent_opacity=float(self.brush_opacity.value())/100.0)
+        if cv2.countNonZero(patch[:,:,3])<=0: raise ValueError("涂抹揭示的有效透明区域为空")
+        counts=brush_mask_counts(tr,ho); kinds=[]
+        if counts["transparent_pixels"]: kinds.append("transparent")
+        if counts["hole_pixels"]: kinds.append("hole")
+        row={
+            "id":f"region-brush-{uuid.uuid4().hex[:10]}","enabled":True,"mode":"region_brush_reveal","target_bbox":box,
+            "reveal_patch_bbox":box,"reveal_mask_bbox":box,"origin":"region_composite_editor","tool_kind":"region_brush_reveal","owner_transfer_mode":"",
+            "source_offset_x":int(self.offset_x.value()),"source_offset_y":int(self.offset_y.value()),"brush_size_px":int(self.brush_size.value()),
+            "transparent_feather_px":int(self.brush_feather.value()),"transparent_opacity":float(self.brush_opacity.value())/100.0,
+            "brush_reveal_kind":"+".join(kinds) if kinds else "none",**counts,
+        }
+        union=np.maximum(tr,ho).astype(np.uint8)
+        return row,union,patch
+
+    def _apply_brush_session(self):
+        if self._commit_handler is None:
+            QMessageBox.warning(self,"无法提交","当前区域编辑器没有连接复核提交器。"); return
+        try: row,reveal,patch=self._build_brush_commit()
+        except Exception as exc: QMessageBox.information(self,"没有涂抹",str(exc)); return
+        old_text=self.apply_btn.text(); self.apply_btn.setText("正在提交涂抹…"); self.apply_btn.setEnabled(False); QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            QApplication.processEvents(); final=self._commit_handler(row,reveal,patch); self._applied+=1
+            final_path=Path(str(final)) if final else self.page_dir/"final_reviewed.png"
+            self._reset_brush_session(final_path)
+            self.selection_status.setText(f"涂抹揭示已提交 · 已叠加 {self._applied} 步 · 可继续涂抹或切回选区工具")
+        except Exception as exc: QMessageBox.critical(self,"涂抹揭示提交失败",str(exc))
+        finally:
+            QApplication.restoreOverrideCursor(); self.apply_btn.setEnabled(True); self.apply_btn.setText("提交当前涂抹揭示" if self._brush_interaction else old_text)
+
+    def _clear_selection(self):
+        self.target_view.clear_selection(emit=True); self.jp_view.clear_selection(); self.source_view.clear_selection()
+
+    def _refine_current_selection(self):
+        if len(self.target_view.box())!=4:
+            QMessageBox.information(self,"没有选区","请先画矩形、椭圆或手绘闭合区域，再识别附近闭合边界。"); return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            QApplication.processEvents(); ok=self.target_view.recognize_closed_region()
+            if not ok:
+                diag=self.target_view.snap_diagnostics(); reason=str(diag.get("reason") or "")
+                messages={
+                    "no_closed_region":"当前选框内没有检测到可靠的封闭线稿区域。请让粗框完整包住气泡边界，并留少量外侧背景。",
+                    "no_paintable_region":"选框内几乎全是结构线，无法形成可填充闭合区域。请稍微扩大选框。",
+                    "empty_selection":"当前选区无效，请重新框选。",
+                    "empty_image":"无法读取高清日文原图。",
+                }
+                QMessageBox.warning(self,"闭合区域识别失败",messages.get(reason,"未找到可靠闭合区域，已保留原选区；可扩大粗框后重试。"))
+        finally: QApplication.restoreOverrideCursor()
+
+    def _selection_changed(self,bbox):
+        box=list(bbox or [])
+        if len(box)!=4:
+            self.jp_view.clear_selection(); self.source_view.clear_selection(); self.selection_status.setText("尚未选择区域 · 请在中间当前结果上左键拖选"); return
+        spec=self.target_view.selection_spec(); self.jp_view.set_selection_spec(spec)
+        try:
+            src_spec=project_selection_spec(
+                spec, registration_homography(self.project), self.source_view.image_shape(), target_to_source=True
+            )
+            if src_spec: self.source_view.set_selection_spec(src_spec)
+            else: self.source_view.set_box(map_target_bbox_to_source(self.project,box))
+        except (ValueError, TypeError, np.linalg.LinAlgError):
+            self.source_view.set_box(map_target_bbox_to_source(self.project,box))
+        diag=spec.get("diagnostics") or {}; snap_text=""
+        if spec.get("snapped"): snap_text=" · 已识别闭合区域"
+        elif diag.get("used_fallback"): snap_text=" · 未找到可靠闭合区域，保留原选区"
+        roi=diag.get("roi_fraction")
+        roi_text=f" · 闭合分析仅计算 {float(roi)*100:.1f}% 页面" if isinstance(roi,(int,float)) and float(roi)<0.99 else ""
+        names={"rect":"矩形","ellipse":"椭圆","smart":"智能闭合","freehand":"手绘闭合"}
+        kind=str(spec.get("kind") or "rect")
+        self.selection_status.setText(f"{names.get(kind,kind)} · TARGET {box[0]},{box[1]}–{box[2]},{box[3]}{snap_text}{roi_text}")
+
+    def _recognize_ocr(self):
+        box=self.target_view.box()
+        if len(box)!=4:
+            QMessageBox.information(self,"没有选区","请先选择 OCR 区域。"); return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            QApplication.processEvents()
+            payload=_hybrid_ocr_edit_blocks.recognize_manual_ocr_block(self.project,self.source_path,self.target_path,box,self.config,existing=self._ocr_payload or None)
+            self._ocr_payload=dict(payload or {}); self.ocr_text.setPlainText(str(payload.get("render_text") or payload.get("ocr_text") or "")); backend=str(payload.get("source_backend") or "OCR")
+            err=str(payload.get("source_ocr_error") or "").strip(); self.ocr_status.setText(f"{backend} · " + (f"识别失败：{err}" if err else f"置信度 {float(payload.get('confidence') or 0.0):.2f}"))
+        except Exception as exc: QMessageBox.critical(self,"区域 OCR 失败",str(exc))
+        finally: QApplication.restoreOverrideCursor()
+
+    def _row(self)->dict[str,Any]:
+        import uuid
+        spec=self.target_view.selection_spec(); box=self.target_view.box(); key=self._tool_key()
+        row={
+            "id":f"region-action-{uuid.uuid4().hex[:10]}","enabled":True,"mode":key,"target_bbox":box,"selection_spec":spec,
+            "source_offset_x":int(self.offset_x.value()),"source_offset_y":int(self.offset_y.value()),"feather_px":int(self.feather.value()),"inset_px":int(self.inset.value()),
+            "origin":"region_composite_editor","tool_kind":"region_composite","owner_transfer_mode":"","ocr_allowed":key=="region_ocr",
+        }
+        if key=="region_ocr":
+            payload=dict(self._ocr_payload or {}); payload.pop("id",None); row.update(payload)
+            row.update({
+                "render_text":self.ocr_text.toPlainText().strip(),"ocr_text":str(payload.get("ocr_text") or self.ocr_text.toPlainText().strip()),
+                "selection_spec":spec,"target_bbox":box,"orientation":str(self.ocr_orientation.currentData() or "auto"),
+                "font_size":int(self.ocr_font_size.value()),"columns":int(self.ocr_columns.value()),
+                "line_break_mode":str(self.ocr_break.currentData() or "smart"),"layout_mode":str(self.ocr_layout.currentData() or "smart_scaling"),
+            })
+        return row
+
+    def _apply_tool(self):
+        if self._brush_interaction:
+            self._apply_brush_session(); return
+        if brush_mask_counts(self._brush_transparent,self._brush_hole)["union_pixels"]>0:
+            QMessageBox.information(self,"存在未提交涂抹","当前还有未提交的透明/挖孔笔触。请先切回涂抹模式提交，或用“全部恢复日文”清空后再应用区域工具。"); return
+        if len(self.target_view.box())!=4:
+            QMessageBox.information(self,"没有选区","请先在中间“当前结果”画出处理区域。"); return
+        if self._tool_key()=="region_ocr" and not self.ocr_text.toPlainText().strip():
+            self._recognize_ocr()
+            if not self.ocr_text.toPlainText().strip(): return
+        row=self._row()
+        if self._commit_handler is None:
+            QMessageBox.warning(self,"无法提交","当前区域编辑器没有连接复核提交器。"); return
+        old_text=self.apply_btn.text(); self.apply_btn.setText("处理中…"); self.apply_btn.setEnabled(False); QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            QApplication.processEvents(); final=self._commit_handler(row,None,None); self._applied+=1
+            final_path=Path(str(final)) if final else self.page_dir/"final_reviewed.png"
+            if final_path.exists():
+                self.target_view.replace_display_image(final_path)
+                refreshed=cv2.imread(str(final_path),cv2.IMREAD_COLOR)
+                if refreshed is not None and refreshed.shape==self._brush_base.shape: self._brush_base=refreshed
+                self._brush_source_tile_cache.clear()
+            self._selection_changed(self.target_view.box())
+            self.selection_status.setText(self.selection_status.text()+f" · 已叠加 {self._applied} 步")
+            if self._tool_key()=="region_ocr": self.ocr_status.setText("当前 OCR 动作已提交；选区保持，可继续处理")
+        except Exception as exc: QMessageBox.critical(self,"区域工具应用失败",str(exc))
+        finally:
+            QApplication.restoreOverrideCursor(); self.apply_btn.setEnabled(True); self.apply_btn.setText(old_text)
+
+    def applied_count(self)->int: return int(self._applied)
+
+
 class ManualEffectDialog(QDialog):
     """Human recovery editor for detector-missed bubbles/open/SFX text."""
 
-    def __init__(self, source_path: str | Path, target_path: str | Path, project: dict[str, Any], parent=None, *, initial_bbox: list[int] | None = None, initial_mode: str | None = None, commit_handler=None, trace_handler=None, config=None):
-        super().__init__(parent); self.setWindowTitle("人工补漏 / 开放式效果字")
+    def __init__(self, source_path: str | Path, target_path: str | Path, project: dict[str, Any], parent=None, *, initial_bbox: list[int] | None = None, initial_mode: str | None = None, commit_handler=None, trace_handler=None, config=None, tool_kind: str = "manual_effect", owner_transfer_mode: str = "", ops_module=None):
+        super().__init__(parent)
+        self._tool_kind = str(tool_kind or "manual_effect")
+        self._owner_transfer_mode = str(owner_transfer_mode or "").strip().lower()
+        self._ops = ops_module or _manual_effect_ops_for_mode(self._owner_transfer_mode)
+        self.setWindowTitle("开放文字框选" if self._tool_kind == "open_text_box" else "人工补漏 / 开放式效果字")
         _configure_responsive_dialog(self, (1500, 960), (980, 650))
         self.project = dict(project or {}); self.source_path=Path(source_path); self.target_path=Path(target_path); self._reveal_mask=None; self._reveal_patch=None
         self._config = config
@@ -1028,7 +1831,10 @@ class ManualEffectDialog(QDialog):
         self._mode_locked_by_user = bool(self._initial_mode)
         self._applying_mode_programmatically = False
         root = QVBoxLayout(self); root.setContentsMargins(12,12,12,12); root.setSpacing(9)
-        hint = QLabel("在右侧高清日文图上拖框。这个框不依赖 OCR、气泡检测器或自动候选；程序会利用已保存的页面配准，从旧中文版提取对应区域。开放式效果字模式只迁移 SOURCE 支持的中文笔画，并自动估计/清除 TARGET 的日文笔画，尽量保留紫色、网点和人物背景。")
+        if self._tool_kind == "open_text_box":
+            hint = QLabel("在右侧高清日文图上只框住开放式文字。框选只是搜索范围，不会整块贴图：程序使用当前模式自己的精准蒙版引擎，只清 TARGET 日文字形，再迁移 SOURCE 中文原始笔画；人物、网点、背景和框线保持 TARGET。此工具不调用 OCR。")
+        else:
+            hint = QLabel("在右侧高清日文图上拖框。这个框不依赖 OCR、气泡检测器或自动候选；程序会利用已保存的页面配准，从旧中文版提取对应区域。开放式效果字模式只迁移 SOURCE 支持的中文笔画，并自动估计/清除 TARGET 的日文笔画，尽量保留紫色、网点和人物背景。")
         hint.setObjectName("hint"); hint.setWordWrap(True); root.addWidget(hint)
         split = QSplitter(Qt.Orientation.Horizontal)
         left = QFrame(); left.setObjectName("card"); ll=QVBoxLayout(left); ll.setContentsMargins(8,8,8,8); ll.addWidget(QLabel("旧版中文 · 自动映射参考")); self.source_view=RegionSelectView(source_path, editable=False, parent=self); ll.addWidget(self.source_view,1)
@@ -1036,7 +1842,13 @@ class ManualEffectDialog(QDialog):
         split.addWidget(left); split.addWidget(right); split.setSizes([390,980]); split.setStretchFactor(0,0); split.setStretchFactor(1,1); split.setChildrenCollapsible(False); root.addWidget(split,1)
 
         form=QFormLayout(); form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
-        self.mode=QComboBox(); self.mode.addItem("彩色开放式文字 · 擦除显字（只改文字）","reveal_text"); self.mode.addItem("彩色开放式文字 · 自动迁移（只改文字）","effect_text"); self.mode.addItem("白色气泡 · 文字迁移 + X/Y 微调（不贴背景）","white_bubble_text")
+        self.mode=QComboBox()
+        if self._tool_kind == "open_text_box":
+            mode_label = "开放文字框选 · 精准蒙版原字迁移（不 OCR）" if self._owner_transfer_mode == "mask_replace" else "开放文字框选 · Hybrid 蒙版原字迁移（不 OCR）"
+            self.mode.addItem(mode_label, "open_text_box")
+            self.mode.setEnabled(False)
+        else:
+            self.mode.addItem("彩色开放式文字 · 擦除显字（只改文字）","reveal_text"); self.mode.addItem("彩色开放式文字 · 自动迁移（只改文字）","effect_text"); self.mode.addItem("白色气泡 · 文字迁移 + X/Y 微调（不贴背景）","white_bubble_text")
         self.diff=QSpinBox(); self.diff.setRange(8,96); self.diff.setValue(24); self.diff.setSuffix(" / 255")
         self.expand=QSpinBox(); self.expand.setRange(1,5); self.expand.setValue(2); self.expand.setSuffix(" px")
         self.feather=QSpinBox(); self.feather.setRange(0,4); self.feather.setValue(0); self.feather.setSuffix(" px")
@@ -1048,14 +1860,20 @@ class ManualEffectDialog(QDialog):
         form.addRow("人工模式",self.mode); form.addRow("差异灵敏度",self.diff); form.addRow("笔画扩张",self.expand); form.addRow("边缘羽化",self.feather); form.addRow("日文处理",self.auto_clear); form.addRow("SOURCE 微调",nudge)
         root.addLayout(form)
         self.info=QLabel("尚未框选区域"); self.info.setObjectName("quiet"); root.addWidget(self.info)
-        self.mode_guide=QLabel("彩色/紫色/人物背景上的文字请选择“擦除显字”；普通白色对白气泡请选择“白色气泡 · 文字迁移”。选框只是搜索范围，不会作为整块写入范围。")
+        self.mode_guide=QLabel("开放文字框选：只框文字本身，尽量不要碰相邻气泡边框、人物轮廓或分格线。保存后属于当前精准蒙版模式，不会创建 OCR 文本块。" if self._tool_kind == "open_text_box" else "彩色/紫色/人物背景上的文字请选择“擦除显字”；普通白色对白气泡请选择“白色气泡 · 文字迁移”。选框只是搜索范围，不会作为整块写入范围。")
         self.mode_guide.setObjectName("hint"); self.mode_guide.setWordWrap(True); root.addWidget(self.mode_guide)
-        row=QHBoxLayout(); fit=QPushButton("适合窗口"); reset=QPushButton("清除框选"); self.preview_mask_btn=QPushButton("预览实际文字 Mask"); self.preview_mask_btn.setObjectName("softPrimary"); save=QPushButton("应用此人工区域"); save.setObjectName("primary"); cancel=QPushButton("取消")
-        row.addWidget(fit); row.addWidget(reset); row.addWidget(self.preview_mask_btn); row.addStretch(1); row.addWidget(save); row.addWidget(cancel); root.addLayout(row)
+        action_bar=QFrame(); action_bar.setObjectName("editorActionBar"); action_grid=QGridLayout(action_bar); action_grid.setContentsMargins(0,0,0,0); action_grid.setHorizontalSpacing(6); action_grid.setVerticalSpacing(5)
+        fit=QPushButton("适合窗口"); reset=QPushButton("清除框选"); self.preview_mask_btn=QPushButton("预览实际文字 Mask"); self.preview_mask_btn.setObjectName("softPrimary"); save=QPushButton("应用此人工区域"); save.setObjectName("primary"); cancel=QPushButton("取消")
+        for col,button in enumerate((fit,reset,self.preview_mask_btn)):
+            button.setMinimumWidth(0); action_grid.addWidget(button,0,col)
+        action_grid.setColumnStretch(3,1); action_grid.addWidget(save,1,2); action_grid.addWidget(cancel,1,3); root.addWidget(action_bar,0)
         self.target_view.selection_changed.connect(self._selection_changed)
         fit.clicked.connect(self._fit); reset.clicked.connect(lambda: self.target_view.set_box([], emit=True)); self.preview_mask_btn.clicked.connect(self._preview_effective_masks); save.clicked.connect(self._accept_checked); cancel.clicked.connect(self.reject)
         self.mode.currentIndexChanged.connect(self._mode_changed)
         self.mode.activated.connect(self._manual_mode_activated)
+        if self._tool_kind == "open_text_box":
+            self._initial_mode = "open_text_box"
+            self._mode_locked_by_user = True
         if self._initial_mode:
             mi = self.mode.findData(self._initial_mode)
             if mi >= 0:
@@ -1088,20 +1906,28 @@ class ManualEffectDialog(QDialog):
             self.target_view.set_box(self._initial_bbox, emit=True)
 
     def _mode_changed(self):
-        effect = (self.mode.currentData() in ("effect_text", "reveal_text"))
+        effect = (self.mode.currentData() in ("effect_text", "reveal_text", "open_text_box"))
         for w in (self.diff,self.expand,self.feather,self.auto_clear): w.setEnabled(effect)
         if hasattr(self, "preview_mask_btn"):
-            self.preview_mask_btn.setEnabled(self.mode.currentData() == "white_bubble_text")
-            self.preview_mask_btn.setToolTip("白气泡模式下显示经过边框剥离后的真实 SOURCE 写入 / TARGET 清除 Mask" if self.preview_mask_btn.isEnabled() else "请先选择“白色气泡 · 文字迁移”模式")
+            previewable = self.mode.currentData() in {"white_bubble_text", "open_text_box"}
+            self.preview_mask_btn.setEnabled(previewable)
+            if self.mode.currentData() == "open_text_box":
+                self.preview_mask_btn.setToolTip("显示开放文字框内真正会写入的 SOURCE 中文 Mask 与会清除的 TARGET 日文 Mask")
+            else:
+                self.preview_mask_btn.setToolTip("白气泡模式下显示经过边框剥离后的真实 SOURCE 写入 / TARGET 清除 Mask" if previewable else "请先选择可预览的文字迁移模式")
 
     def _selection_changed(self, bbox):
         box = list(bbox or [])
         if len(box) != 4:
             self.source_view.set_box([]); self.info.setText("尚未框选区域"); return
-        src_box = map_target_bbox_to_source(self.project, box); self.source_view.set_box(src_box)
-        recommendation = "彩色开放式文字建议使用“擦除显字”"
-        suggested_mode = "reveal_text"
-        if self._target_cv is not None:
+        src_box = self._ops.map_target_bbox_to_source(self.project, box); self.source_view.set_box(src_box)
+        if self._tool_kind == "open_text_box":
+            recommendation = "开放文字框选：将只迁移 SOURCE 中文笔画，不 OCR"
+            suggested_mode = "open_text_box"
+        else:
+            recommendation = "彩色开放式文字建议使用“擦除显字”"
+            suggested_mode = "reveal_text"
+        if self._target_cv is not None and self._tool_kind != "open_text_box":
             import cv2
             h, w = self._target_cv.shape[:2]; x0, y0, x1, y1 = [int(v) for v in box]
             x0 = max(0, min(w, x0)); x1 = max(0, min(w, x1)); y0 = max(0, min(h, y0)); y1 = max(0, min(h, y1))
@@ -1126,8 +1952,8 @@ class ManualEffectDialog(QDialog):
         self.info.setText(f"TARGET {box[0]},{box[1]}–{box[2]},{box[3]} · SOURCE 自动映射约 {src_box[0]},{src_box[1]}–{src_box[2]},{src_box[3]} · {recommendation}")
 
     def _preview_effective_masks(self):
-        if self.mode.currentData() != "white_bubble_text":
-            QMessageBox.information(self, "仅用于白气泡", "请先选择“白色气泡 · 文字迁移 + X/Y 微调（不贴背景）”。")
+        if self.mode.currentData() not in {"white_bubble_text", "open_text_box"}:
+            QMessageBox.information(self, "当前模式不可预览", "请使用“开放文字框选”或“白色气泡 · 文字迁移”模式。")
             return
         box = self.target_view.box()
         if len(box) != 4:
@@ -1140,8 +1966,15 @@ class ManualEffectDialog(QDialog):
             QMessageBox.warning(self, "无法预览", "源图或目标图读取失败。")
             return
         try:
-            masks = build_manual_effect_masks(source, target, self.project, self._row_payload(), getattr(self, "_config", None))
-            dlg = ManualTextMaskPreviewDialog(self.target_path, masks.source_mask, masks.target_clear_mask, masks.diagnostics, self)
+            if self.mode.currentData() == "open_text_box":
+                preview = self._ops.render_open_text_box(source, target, self.project, self._row_payload(), getattr(self, "_config", None))
+                source_mask = np.asarray(preview.get("source_mask"), np.uint8)
+                clear_mask = np.asarray(preview.get("target_clear_mask"), np.uint8)
+                diagnostics = dict(preview.get("diagnostics") or {})
+            else:
+                masks = self._ops.build_manual_effect_masks(source, target, self.project, self._row_payload(), getattr(self, "_config", None))
+                source_mask, clear_mask, diagnostics = masks.source_mask, masks.target_clear_mask, masks.diagnostics
+            dlg = ManualTextMaskPreviewDialog(self.target_path, source_mask, clear_mask, diagnostics, self)
             dlg.exec()
         except Exception as exc:
             QMessageBox.critical(self, "无法预览实际 Mask", str(exc))
@@ -1163,6 +1996,9 @@ class ManualEffectDialog(QDialog):
             "source_offset_x": int(self.offset_x.value()),
             "source_offset_y": int(self.offset_y.value()),
             "origin": "manual_open_text_editor",
+            "tool_kind": self._tool_kind,
+            "owner_transfer_mode": self._owner_transfer_mode,
+            "ocr_allowed": False if self._tool_kind == "open_text_box" else None,
         }
 
     def _accept_checked(self):
@@ -1180,8 +2016,8 @@ class ManualEffectDialog(QDialog):
                 self._trace("reveal_prepare_failed", reason="source_or_target_unreadable")
                 return
             try:
-                masks=build_manual_effect_masks(source,target,self.project,self._row_payload(),getattr(self, "_config", None))
-                seed=build_reveal_seed_mask(masks.source_mask,masks.target_clear_mask,padding_px=max(4,int(self.expand.value())+2))
+                masks=self._ops.build_manual_effect_masks(source,target,self.project,self._row_payload(),getattr(self, "_config", None))
+                seed=self._ops.build_reveal_seed_mask(masks.source_mask,masks.target_clear_mask,padding_px=max(4,int(self.expand.value())+2))
                 try:
                     dlg=RevealMaskDialog(self.target_path,masks.aligned_source,masks.source_mask,masks.target_clear_mask,seed,self,focus_bbox=box)
                 except TypeError as exc:
@@ -1387,9 +2223,17 @@ class WorkbenchPage(QWidget):
         stage_note=QLabel("自动没有识别到、识别不完整，或者自动蒙版本身过大/错误时，使用“人工强制迁移蒙版”：红色人工层与蓝色 OCR/自动层都可直接编辑。自动区域会先收紧为真实文字像素，避免整块气泡/画面被当成清除区；只剩零星残字时再用“仅擦 TARGET 日文层”。")
         stage_note.setObjectName("quiet"); stage_note.setWordWrap(True); stages.layout.addWidget(stage_note); sl.addWidget(stages)
 
-        recovery=Card("人工补漏 / 开放式效果字", "专门处理自动检测漏掉的开放式效果字、彩底文字、人物画面上的文字。无需 OCR，也不要求存在气泡边界；人工框选后直接进入最终复核链。")
+        recovery=Card("区域复合处理 / 人工补漏", "整页模式只负责第一遍自动处理；这里可以在同一选区连续叠加 Direct、精准蒙版、挖孔揭示、透明文字与 OCR，而不切换或重跑整页模式。")
+        self.region_composite_hint=QLabel("推荐：先运行一个最合适的整页模式，再打开“区域复合工具”。选区支持矩形、椭圆、爆炸框智能闭合和自由闭合；每个区域动作独立保存，选区外禁止写入。")
+        self.region_composite_hint.setObjectName("hint"); self.region_composite_hint.setWordWrap(True); recovery.layout.addWidget(self.region_composite_hint)
+        self.region_composite=QPushButton("区域复合工具…"); self.region_composite.setObjectName("primary"); self.region_composite.setToolTip("一个选区内连续调用 Direct / 精准蒙版 / 挖孔 / 透明文字 / OCR。处理后保留选区，便于继续叠加下一种工具。")
+        recovery.layout.addWidget(self.region_composite)
         self.expand_direct_range=QCheckBox("扩大 Direct 候选范围（难页）"); self.expand_direct_range.setChecked(bool(getattr(self.window.state.config.direct_patch,"source_direct_expand_candidate_range",False))); self.expand_direct_range.setToolTip("可选恢复模式：允许更小/更细长/弱文字种子的 Direct 候选进入检查。默认关闭；同页配准与 TARGET 背景保护仍是硬条件。")
         recovery.layout.addWidget(self.expand_direct_range)
+        self.open_text_box_hint=QLabel("精准蒙版专用：自动检测漏掉开放式文字时，直接框住文字。只迁移 SOURCE 中文原字形，不 OCR、不整块贴背景。")
+        self.open_text_box_hint.setObjectName("hint"); self.open_text_box_hint.setWordWrap(True); recovery.layout.addWidget(self.open_text_box_hint)
+        self.open_text_box=QPushButton("开放文字框选…"); self.open_text_box.setObjectName("primary"); self.open_text_box.setToolTip("仅用于精准蒙版 / 精准蒙版+OCR。手动画框后由当前模式自己的蒙版引擎清除 TARGET 日文并迁移 SOURCE 中文；Hybrid 不会因此触发 OCR。")
+        recovery.layout.addWidget(self.open_text_box)
         self.manual_effect_status=QLabel("当前页暂无人工补漏区域"); self.manual_effect_status.setObjectName("hint"); self.manual_effect_status.setWordWrap(True); recovery.layout.addWidget(self.manual_effect_status)
         self.manual_effect_candidate_status=QLabel("安全策略暂无待处理彩色/复杂文字候选"); self.manual_effect_candidate_status.setObjectName("quiet"); self.manual_effect_candidate_status.setWordWrap(True); recovery.layout.addWidget(self.manual_effect_candidate_status)
         self.manual_effect_candidate_target=QComboBox(); self.manual_effect_candidate_target.setMinimumWidth(0); self.manual_effect_candidate_target.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon); self.manual_effect_candidate_target.setMinimumContentsLength(8); recovery.layout.addWidget(self.manual_effect_candidate_target)
@@ -1489,6 +2333,8 @@ class WorkbenchPage(QWidget):
         self.reset_target_layer_erase.clicked.connect(self._reset_target_layer_erase)
         self.target_layer_restore.clicked.connect(self._edit_target_layer_restore)
         self.reset_target_layer_restore.clicked.connect(self._reset_target_layer_restore)
+        self.region_composite.clicked.connect(self._open_region_composite_editor)
+        self.open_text_box.clicked.connect(self._add_open_text_box_region)
         self.add_manual_effect.clicked.connect(self._add_manual_effect_region)
         self.add_manual_effect_candidate.clicked.connect(self._add_next_manual_effect_candidate)
         self.undo_manual_effect.clicked.connect(self._undo_manual_effect_region)
@@ -1509,7 +2355,7 @@ class WorkbenchPage(QWidget):
             "run", "reprocess_current", "edit_clear_mask", "remove_text_only", "apply_mask_review",
             "reset_clear_mask", "force_transfer_mask", "reset_force_transfer_mask",
             "target_layer_erase", "reset_target_layer_erase", "target_layer_restore",
-            "reset_target_layer_restore", "add_manual_effect", "add_manual_effect_candidate",
+            "reset_target_layer_restore", "region_composite", "open_text_box", "add_manual_effect", "add_manual_effect_candidate",
             "undo_manual_effect", "manual_apply", "manual_reset", "manual_undo", "manual_redo",
             "candidate_accept", "candidate_restore",
         )
@@ -1559,7 +2405,10 @@ class WorkbenchPage(QWidget):
             return
         if not self.side.isVisible():
             return
-        compact = self.width() < 900
+        # Horizontal mode needs page rail + usable canvas + the 430px review
+        # inspector.  The old 900px threshold left a 900-1140px dead zone where
+        # Qt honoured those minimums by pushing the inspector off-screen.
+        compact = self.width() < 1180
         if self._compact_layout is compact:
             return
         self._compact_layout = compact
@@ -1576,7 +2425,7 @@ class WorkbenchPage(QWidget):
             self.split.setOrientation(Qt.Orientation.Horizontal)
             self.side.setMinimumHeight(0); self.side.setMaximumHeight(16777215)
             self.side.setMinimumWidth(430); self.side.setMaximumWidth(540)
-            w=max(1100,self.width())
+            w=max(1180,self.width())
             rail_w=min(190,max(150,int(w*0.13)))
             side_w=min(500,max(430,int(w*0.31)))
             canvas_w=max(560,w-rail_w-side_w)
@@ -2046,7 +2895,7 @@ class WorkbenchPage(QWidget):
             src=stable if stable.exists() else (frozen if frozen.exists() else page_dir/"final.png")
             dst=page_dir/"final_reviewed.png"
             if src.exists():
-                shutil.copy2(src,dst); final=dst
+                atomic_copy_file(src,dst); final=dst
             else:
                 final=page_dir/"target_original.png"
             for name in ("manual_effect_transfer_layer.png","manual_effect_transfer_mask.png","manual_effect_clear_mask.png"):
@@ -2133,8 +2982,10 @@ class WorkbenchPage(QWidget):
 
         self.window.state.last_result_path = str(result.final_reviewed)
         remembered_mode = str(row.get("mode", "") or "")
-        self.window.state.last_manual_effect_mode = remembered_mode
-        if remembered_mode:
+        # Region-composite actions reuse the manual-effect transaction/history,
+        # but must not replace the legacy dialog's remembered effect mode.
+        if remembered_mode and not remembered_mode.startswith("region_"):
+            self.window.state.last_manual_effect_mode = remembered_mode
             _app_settings().setValue("review/last_manual_effect_mode", remembered_mode)
         pair=self.window.current_pair(); page_id=page_id_for_pair(pair) if pair is not None else ""; proj=self.window.state.projects_by_page.get(page_id)
         if proj is not None:
@@ -2155,7 +3006,54 @@ class WorkbenchPage(QWidget):
         self.refresh()
         return result.final_reviewed
 
-    def _add_manual_effect_region(self, preset_candidate: dict[str, Any] | None = None):
+    def _open_region_composite_editor(self):
+        page_dir=self._current_page_dir(); ws=self._workspace()
+        if page_dir is None or ws is None or not ws.project_path or not ws.project_path.exists():
+            QMessageBox.information(self,"尚未处理","请先用任意整页模式处理当前页，再进入区域复合工具。")
+            return
+        source_path=page_dir/"source_original.png"; target_path=page_dir/"target_original.png"
+        if not source_path.exists() or not target_path.exists():
+            QMessageBox.warning(self,"缺少页面缓存","当前页缺少 SOURCE / TARGET 原图缓存，请重新处理当前页一次。")
+            return
+        display_path=page_dir/"final_reviewed.png"
+        if not display_path.exists(): display_path=page_dir/"final.png"
+        if not display_path.exists(): display_path=target_path
+        try:
+            project=normalize_project(load_json(ws.project_path))
+        except Exception as exc:
+            QMessageBox.critical(self,"无法读取页面项目",str(exc)); return
+        self._start_manual_gui_flow(page_dir,{"origin":"region_composite"})
+        self._trace_manual_gui_flow(page_dir,"region_composite_opened")
+        def _commit(row,reveal,reveal_patch):
+            self._trace_manual_gui_flow(page_dir,"region_action_commit",{"mode":str(row.get("mode") or ""),"target_bbox":list(row.get("target_bbox") or [])})
+            return self._commit_manual_effect_dialog_result(page_dir,row,reveal,reveal_patch,{})
+        try:
+            dlg=RegionCompositeDialog(page_dir,source_path,target_path,display_path,project,self.window.state.config,self,commit_handler=_commit)
+        except Exception as exc:
+            self._trace_manual_gui_flow(page_dir,"region_composite_failed",{"reason":str(exc)})
+            QMessageBox.critical(self,"无法打开区域复合工具",str(exc)); return
+        dlg.exec()
+        self._trace_manual_gui_flow(page_dir,"region_composite_closed",{"applied_count":dlg.applied_count()})
+        try: self.image.clear_cache()
+        except Exception: pass
+        self.current_view="result"
+        for b,k in self.view_buttons: b.setChecked(k=="result")
+        self.refresh()
+
+    def _add_open_text_box_region(self):
+        page_dir=self._current_page_dir(); ws=self._workspace()
+        current_mode=str(((ws.meta or {}).get("transfer_mode") if ws is not None else "") or self.window.state.config.transfer.mode or "").strip().lower()
+        if current_mode not in {"mask_replace", "hybrid"}:
+            QMessageBox.information(self, "当前模式不可用", "“开放文字框选”只属于精准蒙版 / 精准蒙版+OCR。Direct 和整页挖孔保持各自的安全合同。")
+            return
+        self._add_manual_effect_region(
+            None,
+            forced_tool_kind="open_text_box",
+            forced_mode="open_text_box",
+            owner_transfer_mode=current_mode,
+        )
+
+    def _add_manual_effect_region(self, preset_candidate: dict[str, Any] | None = None, *, forced_tool_kind: str = "manual_effect", forced_mode: str | None = None, owner_transfer_mode: str | None = None):
         page_dir=self._current_page_dir(); ws=self._workspace()
         if page_dir is None or ws is None or not ws.project_path or not ws.project_path.exists():
             QMessageBox.information(self,"尚未处理","请先处理当前页。人工补漏复用本页已经保存的配准，不会重新跑 OCR。")
@@ -2165,9 +3063,13 @@ class WorkbenchPage(QWidget):
             QMessageBox.warning(self,"缺少页面缓存","当前页缺少 source_original.png 或 target_original.png，请重新处理当前页一次。")
             return
         project=normalize_project(load_json(ws.project_path))
+        project_mode=str(as_dict(project.get("meta")).get("transfer_mode", "") or owner_transfer_mode or self.window.state.config.transfer.mode or "").strip().lower()
+        manual_ops=_manual_effect_ops_for_mode(project_mode)
         preset_candidate = as_dict(preset_candidate)
         initial_bbox = as_list(preset_candidate.get("target_bbox"))
-        if preset_candidate:
+        if forced_mode:
+            initial_mode = str(forced_mode)
+        elif preset_candidate:
             initial_mode = str(preset_candidate.get("suggested_manual_mode", "reveal_text") or "reveal_text")
         else:
             remembered = str(getattr(self.window.state, "last_manual_effect_mode", "") or "")
@@ -2181,7 +3083,12 @@ class WorkbenchPage(QWidget):
         def _trace(stage,payload):
             self._trace_manual_gui_flow(page_dir,stage,payload)
         try:
-            dlg=ManualEffectDialog(source_path,target_path,project,self,initial_bbox=initial_bbox,initial_mode=initial_mode,commit_handler=_commit,trace_handler=_trace,config=self.window.state.config)
+            dlg=ManualEffectDialog(
+                source_path,target_path,project,self,
+                initial_bbox=initial_bbox,initial_mode=initial_mode,commit_handler=_commit,trace_handler=_trace,
+                config=self.window.state.config, tool_kind=str(forced_tool_kind or "manual_effect"),
+                owner_transfer_mode=str(owner_transfer_mode or project_mode), ops_module=manual_ops,
+            )
         except Exception as exc:
             self._trace_manual_gui_flow(page_dir,"manual_dialog_failed",{"reason":str(exc)})
             QMessageBox.critical(self,"无法打开人工补漏",str(exc)); return
@@ -2226,15 +3133,19 @@ class WorkbenchPage(QWidget):
             QMessageBox.information(self,"没有人工区域","当前页没有可撤销的人工补漏区域。")
             return
         removed=rows.pop()
+        reveal_files=[]
         for key in ("reveal_mask_file","reveal_patch_file"):
             name=str(removed.get(key,"") or "").strip()
-            if name:
-                try: (page_dir/name).unlink(missing_ok=True)
-                except OSError: pass
+            if name: reveal_files.append(name)
         overrides["manual_effect_regions"]=rows; overrides["status"]="reviewed_with_manual_effect" if rows else "reviewed"
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            self._apply_manual_effect_overrides(page_dir,overrides)
+            run_manual_review_transaction(page_dir,lambda: self._apply_manual_effect_overrides(page_dir,overrides))
+            # Delete no-longer-referenced sparse patch files only after the page
+            # state has been successfully recomposed and published.
+            for name in reveal_files:
+                try: (page_dir/name).unlink(missing_ok=True)
+                except OSError: logger.warning("unable to remove obsolete manual patch %s",page_dir/name)
             self.window.statusBar().showMessage(f"已撤销最近人工区域 · 剩余 {len(rows)} 个",4000); self.refresh()
         except Exception as exc: QMessageBox.critical(self,"撤销失败",str(exc))
         finally: QApplication.restoreOverrideCursor()
@@ -2405,10 +3316,10 @@ class WorkbenchPage(QWidget):
             return
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            state=undo_review_state(page_dir) if direction=="undo" else redo_review_state(page_dir)
-            if state is None:
+            step=apply_review_history_step(page_dir,direction,self.window.state.config.model_copy(deep=True))
+            if step is None:
                 self.window.statusBar().showMessage("没有可用的编辑历史。",2500); return
-            final=apply_review_page(page_dir,self.window.state.config.model_copy(deep=True))
+            final=step.final_reviewed
             self.window.state.last_result_path=str(final); self._sync_reviewed_book_final(final)
             self.current_view="result"
             for b,k in self.view_buttons: b.setChecked(k=="result")
@@ -2435,11 +3346,10 @@ class WorkbenchPage(QWidget):
             overrides["owner_transfer_mode"]=str(as_dict(project_now.get("meta")).get("transfer_mode", "") or self.window.state.config.transfer.mode)
         except Exception:
             overrides["owner_transfer_mode"]=str(self.window.state.config.transfer.mode)
-        record_review_state(page_dir, normalize_overrides(load_json(path) if path.exists() else {}), "reset_manual_reletter")
-        save_json(path,overrides)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            final=apply_review_page(page_dir,self.window.state.config.model_copy(deep=True))
+            tx=apply_review_overrides_transaction(page_dir,overrides,self.window.state.config.model_copy(deep=True),history_reason="reset_manual_reletter")
+            final=tx.final_reviewed
             self.window.state.last_result_path=str(final); self._sync_reviewed_book_final(final)
             self.current_view="result"
             for b,k in self.view_buttons: b.setChecked(k=="result")
@@ -2461,9 +3371,9 @@ class WorkbenchPage(QWidget):
         dst=Path(self.window.state.output_dir)/"final"/final_name
         try:
             dst.parent.mkdir(parents=True,exist_ok=True)
-            shutil.copy2(str(final_path),str(dst))
-        except OSError:
-            pass
+            atomic_copy_file(final_path,dst)
+        except OSError as exc:
+            logger.warning("reviewed book-final sync failed: %s",exc)
 
     def _apply_manual_reletter(self):
         ws=self._workspace()
@@ -2514,11 +3424,10 @@ class WorkbenchPage(QWidget):
             overrides["owner_transfer_mode"]=str(as_dict(project_now.get("meta")).get("transfer_mode", "") or self.window.state.config.transfer.mode)
         except Exception:
             overrides["owner_transfer_mode"]=str(self.window.state.config.transfer.mode)
-        record_review_state(page_dir, normalize_overrides(load_json(override_path) if override_path.exists() else {}), "apply_manual_reletter")
-        save_json(override_path,overrides)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            final=apply_review_page(page_dir,self.window.state.config.model_copy(deep=True))
+            tx=apply_review_overrides_transaction(page_dir,overrides,self.window.state.config.model_copy(deep=True),history_reason="apply_manual_reletter")
+            final=tx.final_reviewed
             self.window.state.last_result_path=str(final)
             pair=self.window.current_pair(); page_id=page_id_for_pair(pair) if pair is not None else ""
             p=self.window.state.projects_by_page.get(page_id)
@@ -2550,11 +3459,10 @@ class WorkbenchPage(QWidget):
             overrides["owner_transfer_mode"]=str(as_dict(project_now.get("meta")).get("transfer_mode", "") or self.window.state.config.transfer.mode)
         except Exception:
             overrides["owner_transfer_mode"]=str(self.window.state.config.transfer.mode)
-        record_review_state(page_dir, normalize_overrides(load_json(override_path) if override_path.exists() else {}), f"candidate_{action}")
-        save_json(override_path,overrides)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            final=apply_review_page(page_dir,self.window.state.config.model_copy(deep=True)); self.window.state.last_result_path=str(final)
+            tx=apply_review_overrides_transaction(page_dir,overrides,self.window.state.config.model_copy(deep=True),history_reason=f"candidate_{action}")
+            final=tx.final_reviewed; self.window.state.last_result_path=str(final)
             pair=self.window.current_pair(); page_id=page_id_for_pair(pair) if pair is not None else ""; p=self.window.state.projects_by_page.get(page_id)
             if p is not None: p.artifacts["final"]=str(final)
             self._sync_reviewed_book_final(final)
@@ -2573,6 +3481,8 @@ class WorkbenchPage(QWidget):
             self.image.set_image(None); self.page_caption.setText("未选择页面"); self.page_counter.setText("0 / 0")
             self.prev_page.setEnabled(False); self.next_page.setEnabled(False); self.view_status.setText("")
             self.manual_target.clear(); self.manual_effect_candidate_target.clear(); self.manual_status.setText("当前页没有待复核气泡"); self.manual_effect_status.setText("当前页暂无人工补漏区域"); self.manual_effect_candidate_status.setText("暂无待处理彩色/复杂文字候选")
+            self.region_composite.setEnabled(False)
+            self.open_text_box.setEnabled(False); self.open_text_box.setVisible(False); self.open_text_box_hint.setVisible(False)
             self.add_manual_effect.setEnabled(False); self.add_manual_effect_candidate.setEnabled(False); self.undo_manual_effect.setEnabled(False)
             return
         idx=max(0,min(s.selected_index,total-1)); pair=s.pairs[idx]
@@ -2582,6 +3492,12 @@ class WorkbenchPage(QWidget):
         self.prev_page.setEnabled(idx>0); self.next_page.setEnabled(idx<total-1)
         page_root=ws.page_root if ws else None
         current_mode=str(((ws.meta or {}).get("transfer_mode") if ws is not None else "") or self.window.state.config.transfer.mode or "").strip().lower()
+        open_text_box_available = current_mode in {"mask_replace", "hybrid"}
+        self.open_text_box.setVisible(open_text_box_available)
+        self.open_text_box_hint.setVisible(open_text_box_available)
+        if open_text_box_available:
+            mode_label = "精准蒙版" if current_mode == "mask_replace" else "精准蒙版+OCR"
+            self.open_text_box_hint.setText(f"{mode_label}：自动检测漏掉开放式文字时，直接框住文字。只迁移 SOURCE 中文原字形，不 OCR、不整块贴背景。")
         ocr_editor_enabled=bool(page_root and is_ocr_edit_mode(current_mode))
         if hasattr(self,"open_ocr_block_editor"):
             self.open_ocr_block_editor.setEnabled(ocr_editor_enabled)
@@ -2674,6 +3590,8 @@ class WorkbenchPage(QWidget):
             if ci>=0: self.manual_effect_candidate_target.setCurrentIndex(ci)
         self.manual_effect_candidate_target.blockSignals(False)
         can_manual=bool(page_root and (page_root/"project.json").exists())
+        self.region_composite.setEnabled(bool(can_manual))
+        self.open_text_box.setEnabled(bool(can_manual and open_text_box_available))
         self.undo_manual_effect.setEnabled(bool(effect_rows)); self.add_manual_effect.setEnabled(can_manual); self.add_manual_effect_candidate.setEnabled(bool(effect_candidates) and can_manual); self.manual_effect_candidate_target.setEnabled(bool(effect_candidates)); self.reprocess_current.setEnabled(can_manual)
         current_id=self.manual_target.currentData() if self.manual_target.count() else None
         self.manual_target.blockSignals(True); self.manual_target.clear()
@@ -3034,6 +3952,8 @@ class StudioWindow(QMainWindow):
             self.project.apply_type.setEnabled(not busy)
             self.project.reset_type.setEnabled(not busy)
             self.project.page_type.setEnabled(not busy)
+            if hasattr(self.project, "set_processing_busy"):
+                self.project.set_processing_busy(busy)
         if hasattr(self, "workbench"):
             self.workbench.set_processing_busy(busy)
         if hasattr(self, "export"):
@@ -3537,15 +4457,12 @@ def main():
     logger.info("GUI starting log_dir=%s", paths.directory)
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName(APP_NAME); app.setOrganizationName("Folirina")
-    icon = _application_icon()
-    if not icon.isNull():
-        app.setWindowIcon(icon)
+    apply_application_icon(app=app)
     app.setStyleSheet(style_for_theme(_saved_theme_name()))
     if sys.platform == "darwin":
         font=QFont("SF Pro Text"); font.setPointSize(12); app.setFont(font)
     win = StudioWindow()
-    if not icon.isNull():
-        win.setWindowIcon(icon)
+    apply_application_icon(app=app, window=win)
     win.show()
     result = int(app.exec())
     logger.info("GUI stopped exit_code=%s", result)

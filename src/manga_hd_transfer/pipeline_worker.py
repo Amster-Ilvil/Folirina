@@ -5,7 +5,6 @@ from __future__ import annotations
 Separated from widgets so GUI pages do not own pipeline execution semantics.
 """
 
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +19,7 @@ from .page_review_state import has_reapplicable_review_state, clear_reprocess_ge
 from .review_apply import apply_review_page
 from .schema_compat import as_dict
 from .io_utils import load_json
+from .result_state import atomic_copy_file
 
 class PipelineWorker(QThread):
     done = Signal(object, str)
@@ -93,7 +93,7 @@ class PipelineWorker(QThread):
                     if final_path.exists() or Path(reviewed).exists():
                         try:
                             final_path.parent.mkdir(parents=True, exist_ok=True)
-                            shutil.copy2(str(reviewed), str(final_path))
+                            atomic_copy_file(reviewed, final_path)
                             emitted_path = str(final_path)
                         except OSError:
                             emitted_path = str(reviewed)

@@ -483,9 +483,7 @@ def _apply_mask_replace_review(page_dir: Path, project: dict, cfg: PipelineConfi
     write_image(reviewed_base_path, base)
 
     reviewed_bgra = bgra.copy(); reviewed_bgra[:, :, 3] = alpha
-    ok, data = cv2.imencode(".png", reviewed_bgra)
-    if not ok: raise ValueError("could not encode reviewed transfer layer")
-    data.tofile(transfer_reviewed)
+    write_image(transfer_reviewed, reviewed_bgra)
 
     rendered, manual_masks, manual_applied = _apply_manual_reletters(rendered, target, page_dir, project, overrides, cfg)
     rendered, effect_layer, effect_clear_mask, effect_applied = _apply_manual_effect_regions(rendered, target, page_dir, project, overrides, cfg)
@@ -856,7 +854,12 @@ def apply_review_page(page_dir: str | Path, config: PipelineConfig | None = None
             f"Review state belongs to transfer mode '{review_owner}', but current page mode is '{project_mode}'. "
             "Recreate or explicitly convert the review state instead of silently mixing modes."
         )
-    manual_effect_rows = _dict_rows(overrides.get("manual_effect_regions"))
+    manual_effect_rows_all = _dict_rows(overrides.get("manual_effect_regions"))
+    manual_effect_rows = [
+        row for row in manual_effect_rows_all
+        if not str(row.get("owner_transfer_mode", "") or "").strip().lower()
+        or str(row.get("owner_transfer_mode", "") or "").strip().lower() == project_mode
+    ]
     manual_force_present = (page_dir / "manual_force_transfer_mask.png").exists()
     if manual_effect_rows or manual_force_present:
         _ensure_manual_effect_stable_base(page_dir)

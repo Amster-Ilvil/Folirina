@@ -14,10 +14,38 @@ from PySide6.QtGui import QPixmap, QPainter, QColor, QImageReader, QIcon
 from PySide6.QtWidgets import (
     QApplication, QDialog, QWidget, QFrame, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QRadioButton, QSizePolicy, QGraphicsView, QGraphicsScene, QListWidget, QListWidgetItem, QComboBox, QMenu, QLineEdit, QAbstractItemView,
+    QSpinBox, QDoubleSpinBox, QSlider,
 )
 
 from .gui_theme import MUTED
 
+
+class StableSpinBox(QSpinBox):
+    """Integer editor whose value can never be changed by the mouse wheel.
+
+    Trackpad/wheel gestures are commonly used to scroll Folirina's long inspector
+    panels.  Qt's default spin box consumes those gestures and silently changes
+    the current value, even when the user only intended to move the panel.  Keep
+    explicit keyboard entry and the arrow buttons, but hand wheel gestures back
+    to the parent scroll area.
+    """
+
+    def wheelEvent(self, event):  # noqa: N802 - Qt API
+        event.ignore()
+
+
+class StableDoubleSpinBox(QDoubleSpinBox):
+    """Floating-point counterpart of :class:`StableSpinBox`."""
+
+    def wheelEvent(self, event):  # noqa: N802 - Qt API
+        event.ignore()
+
+
+class StableSlider(QSlider):
+    """Drag-only parameter slider; wheel gestures belong to panel scrolling."""
+
+    def wheelEvent(self, event):  # noqa: N802 - Qt API
+        event.ignore()
 
 
 class StableComboBox(QComboBox):
@@ -38,6 +66,11 @@ class StableComboBox(QComboBox):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._stable_popup: QMenu | None = None
+
+    def wheelEvent(self, event):  # noqa: N802 - Qt API
+        # Scrolling an inspector must never change a mode/model/enum selection.
+        # Ignore the wheel so the enclosing scroll area can consume it.
+        event.ignore()
 
     def _popup_anchor_and_width(self) -> tuple[QPoint, int]:
         # QWidget.mapToGlobal() is not consistently useful for children embedded
@@ -687,4 +720,4 @@ class ZoomPreviewView(QGraphicsView):
     def mouseDoubleClickEvent(self, event):
         self.fit_to_window(); event.accept()
 
-__all__ = ['StableThumbnailList', 'ImageView', 'Card', 'PageHero', 'OptionRow', 'PathRow', 'ZoomPreviewView', '_fit_scene_rect', '_configure_responsive_dialog']
+__all__ = ['StableThumbnailList', 'ImageView', 'Card', 'PageHero', 'OptionRow', 'PathRow', 'ZoomPreviewView', 'StableComboBox', 'StableSpinBox', 'StableDoubleSpinBox', 'StableSlider', '_fit_scene_rect', '_configure_responsive_dialog']

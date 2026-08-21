@@ -42,10 +42,7 @@ WIN_HOME = re.compile(r"(?i)[A-Z]:\\Users\\(?!Public\\|runneradmin\\|<|USER\\|us
 
 
 def tracked_files() -> list[str]:
-    proc = subprocess.run(
-        ["git", "ls-files", "-z"], cwd=ROOT,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
-    )
+    proc = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     if proc.returncode != 0:
         raise SystemExit("privacy audit requires a git checkout")
     return [item.decode("utf-8", "surrogateescape") for item in proc.stdout.split(b"\0") if item]
@@ -54,9 +51,7 @@ def tracked_files() -> list[str]:
 def path_violations(paths: list[str]) -> list[str]:
     problems: list[str] = []
     for raw in paths:
-        p = PurePosixPath(raw)
-        name = p.name.lower()
-        parts = {part.lower() for part in p.parts}
+        p = PurePosixPath(raw); name = p.name.lower(); parts = {part.lower() for part in p.parts}
         if name.startswith(".env") and name not in ALLOWED_ENV_TEMPLATES:
             problems.append(f"forbidden tracked environment file: {raw}")
         if name in FORBIDDEN_NAMES:
@@ -86,17 +81,11 @@ def text_violations(paths: list[str]) -> list[str]:
             continue
         text = data.decode("utf-8", "ignore")
         for label, pattern in SECRET_PATTERNS:
-            if pattern.search(text):
-                problems.append(f"possible {label} in tracked file: {raw}")
-        for label, pattern in (
-            ("macOS home path", MAC_HOME),
-            ("Linux home path", LINUX_HOME),
-            ("Windows home path", WIN_HOME),
-        ):
+            if pattern.search(text): problems.append(f"possible {label} in tracked file: {raw}")
+        for label, pattern in (("macOS home path", MAC_HOME), ("Linux home path", LINUX_HOME), ("Windows home path", WIN_HOME)):
             for match in pattern.finditer(text):
                 start = text.rfind("\n", 0, match.start()) + 1
-                end = text.find("\n", match.end())
-                end = len(text) if end < 0 else end
+                end = text.find("\n", match.end()); end = len(text) if end < 0 else end
                 line = text[start:end].lower()
                 if "re.compile" in line or "regex" in line or "pattern" in line:
                     continue
@@ -110,8 +99,7 @@ def main() -> int:
     problems = sorted(set(path_violations(paths) + text_violations(paths)))
     if problems:
         print("PRIVACY AUDIT FAILED", file=sys.stderr)
-        for item in problems:
-            print(f"- {item}", file=sys.stderr)
+        for item in problems: print(f"- {item}", file=sys.stderr)
         return 1
     print(f"Privacy audit passed: {len(paths)} tracked files checked; no blocked private/local artifacts detected.")
     return 0

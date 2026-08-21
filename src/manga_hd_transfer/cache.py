@@ -723,8 +723,8 @@ def load_completed_page(page_dir: str | Path, pair: PagePair, config: Any, final
     if need_sync:
         final_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            import shutil
-            shutil.copy2(chosen, final_path)
+            from .result_state import atomic_copy_file
+            atomic_copy_file(chosen, final_path)
         except OSError:
             return None
     # ``final`` remains the page-local artifact; the book mirror has its own key.

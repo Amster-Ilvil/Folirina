@@ -19,6 +19,7 @@ from .modes.base import ModeContract
 from .modes.registry import (
     ACTIVE_MODE_ORDER, LEGACY_MODE_ORDER, SUPPORTED_MODE_ORDER, SUPPORTED_MODES, get_mode_spec,
 )
+from .review_artifacts import STATIC_REVIEW_INPUTS, existing_review_input_paths
 
 def get_mode_contract(mode: str) -> ModeContract:
     return get_mode_spec(mode).contract
@@ -41,6 +42,8 @@ COMMON_DERIVED_ARTIFACTS = (
     "editable.ora", "editable.psd", "inpainted.png",
     "text_layer.png", "text_layer_reviewed.png", "chinese_transfer_layer.png",
     "review_overrides.template.json", "removed_text_preview.png", "remove_text_stage.json",
+    "aligned_overlay_reveal_diff_mask.png", "aligned_overlay_reveal_judgment.png",
+    "aligned_overlay_reveal_validation.json",
 )
 
 # Generated evidence bundles that belong to the last automatic pass.  Manual
@@ -145,72 +148,105 @@ def review_owner_compatible(owner_mode: str | None, requested_mode: str) -> bool
 
 # User-authored review inputs are mode-owned. They are archived, not deleted, when
 # the user switches automatic transfer mode for an already-processed page.
-MODE_OWNED_REVIEW_INPUTS = (
-    "review_overrides.json",
-    "review_history.json",
-    "manual_force_transfer_mask.png",
-    "manual_force_auto_target_override.png",
-    "manual_force_settings.json",
-    "manual_clear_mask.png",
-    "manual_japanese_clear_mask.png",
-    "manual_transfer_mask.png",
-    "manual_direct_patch_regions.png",
-    "manual_target_layer_erase_mask.png",
-    "manual_target_layer_restore_mask.png",
-)
+MODE_OWNED_REVIEW_INPUTS = STATIC_REVIEW_INPUTS
 
 
 def archive_review_state_if_mode_changed(page_root: str | Path, requested_mode: str) -> dict:
-    """Archive incompatible manual review inputs on an explicit mode switch.
+    """Transactionally archive incompatible manual review inputs on mode switch.
 
-    Automatic reruns in the *same* mode retain review inputs so the GUI can
-    reapply them. A switch from e.g. Mask→Reletter archives those inputs under
-    ``review_archive/<old>_to_<new>/``. This keeps user work recoverable while
-    preventing stale geometry/masks from silently contaminating the new mode.
+    A partial move is worse than no archive at all: the new renderer could see
+    half of the previous mode's masks/history while the other half has already
+    disappeared. Stage complete copies first, then remove the live inputs, then
+    publish the archive. Any failure restores the live review inputs and aborts
+    the mode switch.
     """
-    import json
+    import os
     import shutil
+    import tempfile
+    import uuid
+
+    from .io_utils import load_json, save_json
 
     root = Path(page_root)
     project_path = root / "project.json"
     if not project_path.exists():
         return {"changed": False, "old_mode": "", "new_mode": str(requested_mode), "archived": []}
     try:
-        obj = json.loads(project_path.read_text(encoding="utf-8"))
-        old_mode = str(((obj.get("meta") or {}).get("transfer_mode") or "")).strip().lower()
+        obj = load_json(project_path)
+        old_mode = str(((obj.get("meta") or {}).get("transfer_mode") or "")).strip().lower() if isinstance(obj, dict) else ""
     except Exception:
         old_mode = ""
     new_mode = str(requested_mode or "").strip().lower()
     if not old_mode or old_mode == new_mode:
         return {"changed": False, "old_mode": old_mode, "new_mode": new_mode, "archived": []}
 
-    archive = root / "review_archive" / f"{old_mode}_to_{new_mode}"
-    archive.mkdir(parents=True, exist_ok=True)
-    archived: list[str] = []
-    for name in MODE_OWNED_REVIEW_INPUTS:
-        src = root / name
-        if not src.exists() or not src.is_file():
-            continue
-        dst = archive / name
-        try:
-            if dst.exists():
-                dst.unlink()
-            shutil.move(str(src), str(dst))
-            archived.append(name)
-        except OSError:
-            pass
-    # Preserve a tiny human-readable manifest for manual recovery.
+    sources = existing_review_input_paths(root)
+    review_root = root / "review_archive"
+    if review_root.is_symlink():
+        raise RuntimeError("review archive path is an unsafe symlink")
+    if review_root.exists() and not review_root.is_dir():
+        raise RuntimeError("review archive path exists but is not a directory")
+    review_root.mkdir(parents=True, exist_ok=True)
     try:
-        (archive / "archive_manifest.json").write_text(json.dumps({
-            "schema": "manga_hd_translation_transfer.review_mode_archive.v1",
-            "old_mode": old_mode,
-            "new_mode": new_mode,
-            "files": archived,
-        }, ensure_ascii=False, indent=2), encoding="utf-8")
-    except OSError:
-        pass
-    return {"changed": True, "old_mode": old_mode, "new_mode": new_mode, "archived": archived, "archive_dir": str(archive)}
+        review_root.resolve().relative_to(root.resolve())
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError(f"review archive path escapes page workspace: {exc}") from exc
+    archive = review_root / f"{old_mode}_to_{new_mode}"
+    stage = Path(tempfile.mkdtemp(prefix=f".txn-{old_mode}-to-{new_mode}-", dir=str(review_root)))
+    removed_sources: list[Path] = []
+    published: list[str] = []
+    try:
+        try:
+            for src in sources:
+                shutil.copy2(src, stage / src.name)
+        except OSError as exc:
+            raise RuntimeError(f"review archive staging failed: {exc}") from exc
 
+        try:
+            for src in sources:
+                src.unlink()
+                removed_sources.append(src)
+        except OSError as exc:
+            for src in removed_sources:
+                try:
+                    shutil.copy2(stage / src.name, src)
+                except OSError:
+                    pass
+            raise RuntimeError(f"review archive source removal failed: {exc}") from exc
+
+        try:
+            archive.mkdir(parents=True, exist_ok=True)
+            for src in sources:
+                staged = stage / src.name
+                dst = archive / src.name
+                tmp = archive / f".{src.name}.{uuid.uuid4().hex}.tmp"
+                shutil.copy2(staged, tmp)
+                os.replace(tmp, dst)
+                published.append(src.name)
+            save_json(archive / "archive_manifest.json", {
+                "schema": "manga_hd_translation_transfer.review_mode_archive.v2",
+                "old_mode": old_mode,
+                "new_mode": new_mode,
+                "files": published,
+            })
+        except Exception as exc:
+            # The archive is recovery-only. The live page state is authoritative:
+            # restore every source before propagating the failure so processing
+            # cannot continue with a half-switched review contract.
+            for src in sources:
+                if not src.exists():
+                    try:
+                        shutil.copy2(stage / src.name, src)
+                    except OSError:
+                        pass
+            raise RuntimeError(f"review archive publish failed: {exc}") from exc
+
+        return {
+            "changed": True, "old_mode": old_mode, "new_mode": new_mode,
+            "archived": published, "archive_dir": str(archive),
+        }
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
 
 def mode_scoped_config_payload(config: object) -> dict:
     """Return only configuration namespaces that can affect the selected mode.

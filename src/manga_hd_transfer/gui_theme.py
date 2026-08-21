@@ -157,6 +157,19 @@ QPushButton#softPrimary {{
 }}
 QPushButton#softPrimary:hover {{ background:#E7EEF8; border-color:#D4E0F0; }}
 QPushButton#softPrimary:pressed {{ background:#DCE6F3; }}
+QPushButton#pageProcessAction {{
+    color:{ACCENT_HOVER};
+    background:{BLUE_SOFT};
+    border:1px solid #CBDBF6;
+    font-weight:700;
+    min-height:38px; max-height:38px;
+    padding:0 12px;
+}}
+QPushButton#pageProcessAction:hover {{ background:#E7EEF8; border-color:#D4E0F0; }}
+QPushButton#pageProcessAction:pressed {{ background:#DCE6F3; border-color:#C5D5EA; }}
+QPushButton#pageProcessAction:disabled {{
+    color:#8A9AB0; background:#EEF4FC; border-color:#D9E4F2;
+}}
 QPushButton#danger {{ color:{RED}; border-color:#E7AEB7; background:{RED_SOFT}; font-weight:650; }}
 QPushButton#danger:hover {{ background:#FFE4E8; border-color:#DA8C99; }}
 QPushButton#danger:pressed {{ background:#E7AEB7; }}

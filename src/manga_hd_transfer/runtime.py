@@ -232,7 +232,12 @@ def device_info(preferred: str = "auto", *, probe_torch: bool = True) -> DeviceI
         except Exception:
             name = "CUDA"
         return DeviceInfo(preferred, selected, True, name, True, mps_built=mps_built, mps_available=mps_available)
-    note = "MPS 不可用。" if preferred == "mps" else "CPU 模式。"
+    if preferred == "mps":
+        note = "MPS 不可用，已回退 CPU。"
+    elif preferred == "cuda":
+        note = "CUDA 不可用，已回退 CPU。"
+    else:
+        note = "未检测到可用 CUDA/MPS，使用 CPU。"
     return DeviceInfo(preferred, "cpu", True, "CPU", True, mps_built=mps_built, mps_available=mps_available, note=note)
 
 

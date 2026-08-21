@@ -11,8 +11,12 @@ page images or automatic pipeline artifacts are duplicated.
 from copy import deepcopy
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
+import tempfile
 from typing import Any
+
+from .io_utils import save_json
 
 _HISTORY_NAME = "review_history.json"
 _OVERRIDES_NAME = "review_overrides.json"
@@ -29,10 +33,49 @@ def _load_json(path: Path, default: Any) -> Any:
 
 
 def _save_json(path: Path, obj: Any) -> None:
+    # Use the shared unique-temp atomic writer. A fixed ``.tmp`` filename can be
+    # trampled by rapid GUI/CLI review actions on the same page.
+    save_json(path, obj)
+
+
+def _capture_pair(root: Path) -> dict[str, tuple[bool, bytes]]:
+    out: dict[str, tuple[bool, bytes]] = {}
+    for name in (_OVERRIDES_NAME, _HISTORY_NAME):
+        path = root / name
+        if path.exists() and path.is_file():
+            out[name] = (True, path.read_bytes())
+        else:
+            out[name] = (False, b"")
+    return out
+
+
+def _restore_raw(path: Path, existed: bool, payload: bytes) -> None:
+    if not existed:
+        path.unlink(missing_ok=True)
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".history-rollback", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        os.replace(tmp_name, path)
+        tmp_name = ""
+    finally:
+        if tmp_name:
+            try:
+                Path(tmp_name).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _restore_pair(root: Path, snapshot: dict[str, tuple[bool, bytes]]) -> None:
+    for name, (existed, payload) in snapshot.items():
+        _restore_raw(root / name, existed, payload)
 
 
 def _entry(state: dict, reason: str) -> dict:
@@ -78,15 +121,20 @@ def undo_review_state(page_root: str | Path) -> dict | None:
     undo = list(hist.get("undo") or [])
     if not undo:
         return None
+    snapshot = _capture_pair(root)
     current = _current_overrides(root)
     entry = undo.pop()
     redo = list(hist.get("redo") or [])
     redo.append(_entry(current, f"redo:{entry.get('reason','edit')}"))
     restored = deepcopy(entry.get("state") or {})
-    _save_json(root / _OVERRIDES_NAME, restored)
-    hist["undo"] = undo
-    hist["redo"] = redo[-_MAX_HISTORY:]
-    _save_json(root / _HISTORY_NAME, hist)
+    try:
+        _save_json(root / _OVERRIDES_NAME, restored)
+        hist["undo"] = undo
+        hist["redo"] = redo[-_MAX_HISTORY:]
+        _save_json(root / _HISTORY_NAME, hist)
+    except Exception:
+        _restore_pair(root, snapshot)
+        raise
     return restored
 
 
@@ -96,15 +144,20 @@ def redo_review_state(page_root: str | Path) -> dict | None:
     redo = list(hist.get("redo") or [])
     if not redo:
         return None
+    snapshot = _capture_pair(root)
     current = _current_overrides(root)
     entry = redo.pop()
     undo = list(hist.get("undo") or [])
     undo.append(_entry(current, f"undo:{entry.get('reason','edit')}"))
     restored = deepcopy(entry.get("state") or {})
-    _save_json(root / _OVERRIDES_NAME, restored)
-    hist["undo"] = undo[-_MAX_HISTORY:]
-    hist["redo"] = redo
-    _save_json(root / _HISTORY_NAME, hist)
+    try:
+        _save_json(root / _OVERRIDES_NAME, restored)
+        hist["undo"] = undo[-_MAX_HISTORY:]
+        hist["redo"] = redo
+        _save_json(root / _HISTORY_NAME, hist)
+    except Exception:
+        _restore_pair(root, snapshot)
+        raise
     return restored
 
 

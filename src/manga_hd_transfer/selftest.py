@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 import json
+import os
 import socket
 import threading
 import tomllib
@@ -28,6 +29,17 @@ from .font_catalog import discover_fonts
 from .version import __version__
 from .workspace_guard import PageRunGuard, PageRunBusyError, cleanup_orphan_temp_files
 from .workspace_integrity import validate_page_workspace
+
+
+def _selftest_stage(name: str) -> None:
+    """Optional zero-dependency stage marker for release-gate diagnostics."""
+    target = str(os.environ.get("FOLIRINA_SELFTEST_STAGE_FILE", "") or "").strip()
+    if not target:
+        return
+    try:
+        Path(target).write_text(str(name), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def _page(width=1000, height=1400):
@@ -59,9 +71,10 @@ def run_selftest() -> dict:
         sp,tp=root/"cn.png",root/"jp.png"; write_image(sp,source); write_image(tp,target)
         sblock=TextBlock("s",[(sb[0],sb[1]),(sb[2],sb[1]),(sb[2],sb[3]),(sb[0],sb[3])],"这是离线自检中文译文。",.99,reading_order=0)
         tblock=TextBlock("t",[(box[0],box[1]),(box[2],box[1]),(box[2],box[3]),(box[0],box[3])],"日本語",.99,reading_order=0)
-        cfg=PipelineConfig(); cfg.transfer.mode="reletter"; cfg.registration.backend="opencv"; cfg.registration.min_matches=6; cfg.registration.review_confidence=.35; cfg.qa.registration_min_confidence=.35; cfg.matching.review_confidence=.35; cfg.qa.match_min_confidence=.35; cfg.export.layer_bundle=False
+        cfg=PipelineConfig(); cfg.transfer.mode="reletter"; cfg.registration.backend="opencv"; cfg.registration.feature="orb"; cfg.registration.min_matches=6; cfg.registration.review_confidence=.35; cfg.qa.registration_min_confidence=.35; cfg.matching.review_confidence=.35; cfg.qa.match_min_confidence=.35; cfg.export.layer_bundle=False
         p=TransferPipeline(cfg,InjectedOCRBackend([sblock]),InjectedOCRBackend([tblock]))
         pair=PagePair(str(sp),str(tp),0,0,.99,.01,[])
+        _selftest_stage("reletter_pipeline")
         project=p.process_page(pair,root/"out")
         summary=qa_summary(project.qa)
         checks={
@@ -73,12 +86,24 @@ def run_selftest() -> dict:
             "project_exists": (root/"out"/"project.json").exists(),
         }
 
+        # Use a same-size mask fixture so the release selftest validates the
+        # full Mask route without depending on repeated SIFT calls.  Some
+        # OpenCV/Linux builds can deadlock in SIFT after repeated CI processes;
+        # production defaults remain unchanged.  ORB on this fixture still
+        # exercises real feature registration and a real applied mask candidate.
+        mask_target=target.copy(); mask_source=target.copy()
+        cv2.rectangle(mask_source,(box[0],box[1]),(box[2],box[3]),(255,255,255),-1); _fake_text(mask_source,box,2)
+        msp,mtp=root/"mask_cn.png",root/"mask_jp.png"; write_image(msp,mask_source); write_image(mtp,mask_target)
+        msblock=TextBlock("ms",[(box[0],box[1]),(box[2],box[1]),(box[2],box[3]),(box[0],box[3])],"这是离线自检中文译文。",.99,reading_order=0)
+        mtblock=TextBlock("mt",[(box[0],box[1]),(box[2],box[1]),(box[2],box[3]),(box[0],box[3])],"日本語",.99,reading_order=0)
+        mask_pair=PagePair(str(msp),str(mtp),0,0,.99,.01,[])
         mcfg=cfg.model_copy(deep=True); mcfg.transfer.mode="mask_replace"
         mcfg.mask_replace.min_match_confidence=.30; mcfg.mask_replace.min_mask_iou=.58
         mcfg.mask_replace.min_target_coverage=.86; mcfg.mask_replace.max_spill_ratio=.18
         mcfg.mask_replace.local_fit="bbox"; mcfg.mask_replace.feather_px=0
-        mp=TransferPipeline(mcfg,InjectedOCRBackend([sblock]),InjectedOCRBackend([tblock]))
-        mproject=mp.process_page(pair,root/"mask_out")
+        mp=TransferPipeline(mcfg,InjectedOCRBackend([msblock]),InjectedOCRBackend([mtblock]))
+        _selftest_stage("mask_pipeline")
+        mproject=mp.process_page(mask_pair,root/"mask_out")
         mask_meta = mproject.meta.get("mask_replace", {})
         mask_records = list(mask_meta.get("records", []) or [])
         mask_checks={
@@ -113,8 +138,9 @@ def run_selftest() -> dict:
 
         dsp,dtp=root/"direct_cn.png",root/"direct_jp.png"
         write_image(dsp,direct_page(True)); write_image(dtp,direct_page(False))
-        dcfg=PipelineConfig(); dcfg.transfer.mode="direct_patch"; dcfg.registration.backend="opencv"; dcfg.registration.min_matches=6; dcfg.export.layer_bundle=False; dcfg.qa.fail_empty_mask_replace=False
+        dcfg=PipelineConfig(); dcfg.transfer.mode="direct_patch"; dcfg.registration.backend="opencv"; dcfg.registration.feature="orb"; dcfg.registration.min_matches=6; dcfg.export.layer_bundle=False; dcfg.qa.fail_empty_mask_replace=False
         dp=TransferPipeline(dcfg)
+        _selftest_stage("direct_pipeline")
         dproject=dp.process_page(PagePair(str(dsp),str(dtp),0,0,.99,.01,[]),root/"direct_out")
         dmeta=dproject.meta.get("direct_patch",{})
         direct_checks={
@@ -149,6 +175,7 @@ def run_selftest() -> dict:
         })
         fm=np.zeros((fh,fw),np.uint8); cv2.rectangle(fm,(286,75),(345,150),255,-1); write_image(froot/"manual_force_transfer_mask.png",fm)
         fcfg=PipelineConfig(); fcfg.inpainting.backend="opencv"
+        _selftest_stage("manual_force_review")
         ffinal=apply_manual_force_transfer_review(froot,fcfg); fres=read_image(ffinal)
         outside=np.ones((fh,fw),bool); outside[60:165,260:370]=False
         gap_gray=[]
@@ -187,6 +214,7 @@ def run_selftest() -> dict:
         })
         am=np.zeros((ah,aw),np.uint8); cv2.circle(am,(205,112),5,255,-1); write_image(aroot/"manual_force_transfer_mask.png",am)
         save_json(aroot/"manual_force_settings.json",{"use_auto_evidence":True})
+        _selftest_stage("manual_force_auto_evidence")
         afinal=apply_manual_force_transfer_review(aroot,fcfg); ares=read_image(afinal); agray=cv2.cvtColor(ares,cv2.COLOR_BGR2GRAY)
         aaudit=load_json(aroot/"manual_force_transfer.json")
         auto_checks={
@@ -247,9 +275,10 @@ def run_selftest() -> dict:
         for x in (300,320,340,360,380): cv2.rectangle(rt,(x,205),(x+8,305),(0,0,0),-1)
         for y in (225,250,275): cv2.rectangle(rs,(260,y),(400,y+9),(0,0,0),-1)
         rsp,rtp=rroot/"cn.png",rroot/"jp.png"; write_image(rsp,rs); write_image(rtp,rt)
-        rcfg=PipelineConfig(); rcfg.transfer.mode="reletter"; rcfg.registration.backend="opencv"; rcfg.registration.min_matches=6
+        rcfg=PipelineConfig(); rcfg.transfer.mode="reletter"; rcfg.registration.backend="opencv"; rcfg.registration.feature="orb"; rcfg.registration.min_matches=6
         rcfg.registration.review_confidence=.35; rcfg.qa.registration_min_confidence=.35; rcfg.matching.review_confidence=.35; rcfg.qa.match_min_confidence=.35
         rcfg.export.layer_bundle=False; rcfg.mask_replace.paired_diff_enabled=True; rcfg.mask_replace.paired_diff_skip_ocr=True
+        _selftest_stage("reletter_paired_pipeline")
         rproject=TransferPipeline(rcfg,_FakeRegionTextOCR(),NullOCRBackend()).process_page(PagePair(str(rsp),str(rtp),0,0,.99,.01,[]),rroot/"out")
         rcache=dict(rproject.meta.get("cache") or {})
         rmeta=dict(rproject.meta.get("reletter") or {})
@@ -404,6 +433,7 @@ def run_selftest() -> dict:
         save_json(aroot/"review_overrides.json",{"manual_reletter":[{"text":"旧模式文字"}]})
         save_json(aroot/"review_history.json",{"schema":"mhd.review.history.v1","undo":[{"state":{"owner_transfer_mode":"mask_replace"}}],"redo":[]})
         amask=np.zeros((40,50),np.uint8); amask[10:20,15:30]=255; write_image(aroot/"manual_force_transfer_mask.png",amask)
+        _selftest_stage("mode_switch_archive")
         archive_diag=archive_review_state_if_mode_changed(aroot,"reletter")
         mode_contract_checks.update({
             "mode_switch_detected": bool(archive_diag.get("changed")),
@@ -420,6 +450,7 @@ def run_selftest() -> dict:
         write_image(proot/"mask_transfer_mask.png",np.ones((20,20),np.uint8)*255)
         write_image(proot/"jp_layer_rgba.png",np.ones((20,20,4),np.uint8)*255)
         pcfg=PipelineConfig(); pcfg.transfer.mode="direct_patch"; pcfg.export.layer_bundle=False
+        _selftest_stage("passthrough_pipeline")
         pproj=TransferPipeline(pcfg).process_page(
             fp_pair, proot, page_mark=PageMark(page_type="skip",origin="manual",reason="selftest")
         )
@@ -454,6 +485,7 @@ def run_selftest() -> dict:
                 "status":"reviewed_with_manual_reletter",
                 "owner_transfer_mode":"reletter",
             })
+            _selftest_stage("manual_reletter_apply")
             edited_path=apply_review_page(outdir,cfg)
             edited_img=read_image(edited_path)
             edited_report=load_json(outdir/"review_applied.json")
@@ -485,7 +517,9 @@ def run_selftest() -> dict:
         save_json(hroot/"review_overrides.json",h0); record_review_state(hroot,h0,"first")
         save_json(hroot/"review_overrides.json",h1); record_review_state(hroot,h1,"second")
         save_json(hroot/"review_overrides.json",h2)
+        _selftest_stage("review_history")
         undo_state=undo_review_state(hroot); redo_state=redo_review_state(hroot); hist_counts=review_history_counts(hroot)
+        _selftest_stage("font_catalog")
         font_rows=discover_fonts(limit=20)
         project_root=Path(__file__).resolve().parents[2]
         try:
@@ -496,6 +530,7 @@ def run_selftest() -> dict:
         # stale locks recover, interrupted atomic-write debris is cleaned, and
         # every route receives the same post-run integrity validation.
         groot=root/"page_guard"; groot.mkdir(parents=True,exist_ok=True)
+        _selftest_stage("page_guard")
         g1=PageRunGuard(groot,"reletter"); g1_diag=g1.acquire()
         nested=PageRunGuard(groot,"review:test"); nested_diag=nested.acquire(); nested.release()
         concurrent_result={"blocked":False}
@@ -505,7 +540,7 @@ def run_selftest() -> dict:
                 g.acquire(); g.release()
             except PageRunBusyError:
                 concurrent_result["blocked"]=True
-        t=threading.Thread(target=_try_other_thread); t.start(); t.join(timeout=3)
+        t=threading.Thread(target=_try_other_thread, daemon=True); t.start(); t.join(timeout=3)
         concurrent_blocked=bool(concurrent_result.get("blocked"))
         g1.release()
         stale_lock=groot/".page_processing.lock"
@@ -560,9 +595,22 @@ def run_selftest() -> dict:
 
 def main() -> int:
     import json
-    report = run_selftest()
+    # The release selftest exercises several OpenCV registration/morphology
+    # paths in one short process.  Some OpenCV builds may oversubscribe their
+    # native worker pool under repeated CI invocations, making an otherwise
+    # deterministic selftest take minutes.  Keep the selftest single-threaded
+    # only for this diagnostic process; production rendering keeps its normal
+    # OpenCV thread policy.
+    previous_threads = int(cv2.getNumThreads())
+    try:
+        cv2.setNumThreads(1)
+        report = run_selftest()
+    finally:
+        cv2.setNumThreads(previous_threads)
+    passed = bool(report.get("pass"))
+    _selftest_stage("complete_pass" if passed else "complete_fail")
     print(json.dumps(report, ensure_ascii=False, indent=2))
-    return 0 if report.get("pass") else 1
+    return 0 if passed else 1
 
 
 if __name__ == "__main__":

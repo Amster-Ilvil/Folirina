@@ -200,7 +200,10 @@ def cleanup_orphan_temp_files(page_root: str | Path) -> dict:
     if not root.exists():
         return {"removed": removed, "count": 0}
     try:
-        candidates = list(root.glob(".*.tmp"))
+        # io_utils uses ``.*.tmp`` while result-state atomic mirrors use
+        # ``.*.tmp-sync``. Both are crash-only staging artifacts and neither
+        # should accumulate in a page workspace after an interrupted publish.
+        candidates = list(root.glob(".*.tmp")) + list(root.glob(".*.tmp-sync"))
     except OSError:
         candidates = []
     for p in candidates:

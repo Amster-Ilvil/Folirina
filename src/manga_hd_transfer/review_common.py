@@ -9,6 +9,7 @@ manual-force/manual-effect workflows.
 from pathlib import Path
 import cv2
 import numpy as np
+from .io_utils import write_image
 
 from .io_utils import read_image
 from .models import BubbleInstance, TextBlock, TextUnit
@@ -121,10 +122,7 @@ def _project_text_ink_mask(image: np.ndarray, rows) -> tuple[np.ndarray, int]:
     return out, used
 
 def _write_bgra(path: Path, bgra: np.ndarray) -> None:
-    ok, data = cv2.imencode(".png", bgra)
-    if not ok:
-        raise ValueError(f"could not encode {path.name}")
-    data.tofile(path)
+    write_image(path, bgra)
 
 def _alpha_over_bgra(bottom: np.ndarray, top: np.ndarray) -> np.ndarray:
     """Alpha-composite one BGRA manual layer over an existing BGRA layer."""

@@ -14,17 +14,33 @@ from .config import PipelineConfig
 from .export import export_openraster, export_psd_imagemagick, make_text_layer_rgba, write_rgba
 from .inpainting import inpaint_image
 from .io_utils import read_image, save_json, write_image
-from .manual_effect import (
-    build_manual_effect_masks, apply_reveal_window, estimate_source_background,
-    composite_source_text_delta, strip_border_ring_components, clean_manual_target_text,
-    white_container_safe_mask,
-)
+from . import manual_effect as _legacy_manual_effect
 from .result_state import ensure_manual_baseline, manual_baseline_path, commit_reviewed_result
 from .schema_compat import as_list
 from .text_only_transfer import clear_to_target_paper, target_text_mask_in_container
 from .review_target_layer import _apply_target_layer_erase_to_rendered, _apply_target_layer_restore_to_rendered
 from .review_common import _dict_rows, _source_for_review, _write_bgra, _alpha_over_bgra
 from .review_manual_force import _apply_manual_force_transfer_mask
+from .region_composite import is_region_mode, apply_region_action
+from .review_artifacts import safe_page_artifact_path
+
+
+def _manual_effect_ops_for_project(project: dict):
+    """Return the mode-owned manual pixel engine for the current page.
+
+    Mask Replace and Hybrid intentionally use separate source files so fixes to
+    one mode cannot change the other mode's open-text behavior. Other legacy
+    routes keep the historical shared helper for backward compatibility.
+    """
+    meta = project.get("meta", {}) if isinstance(project, dict) else {}
+    mode = str(meta.get("transfer_mode", "") or "").strip().lower() if isinstance(meta, dict) else ""
+    if mode == "mask_replace":
+        from .modes.mask_replace import open_text_manual as ops
+        return ops
+    if mode == "hybrid":
+        from .modes.hybrid import open_text_manual as ops
+        return ops
+    return _legacy_manual_effect
 
 def _load_reveal_commit_patch(page_dir: Path, row: dict, shape: tuple[int, int]) -> np.ndarray | None:
     """Load an exact sparse preview patch saved by the Qt Reveal editor.
@@ -35,8 +51,8 @@ def _load_reveal_commit_patch(page_dir: Path, row: dict, shape: tuple[int, int])
     name = str(row.get("reveal_patch_file", "") or "").strip()
     if not name:
         return None
-    path = page_dir / name
-    if not path.exists():
+    path = safe_page_artifact_path(page_dir, name)
+    if path is None or not path.exists():
         return None
     patch = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
     if patch is None or patch.ndim != 3 or patch.shape[2] != 4 or patch.shape[:2] != shape:
@@ -68,11 +84,106 @@ def _apply_manual_effect_regions(
         return rendered, empty_layer, empty_mask, []
 
     source = _source_for_review(page_dir, project)
+    ops = _manual_effect_ops_for_project(project)
+    build_manual_effect_masks = ops.build_manual_effect_masks
+    apply_reveal_window = ops.apply_reveal_window
+    estimate_source_background = ops.estimate_source_background
+    composite_source_text_delta = ops.composite_source_text_delta
+    strip_border_ring_components = ops.strip_border_ring_components
+    clean_manual_target_text = ops.clean_manual_target_text
+    white_container_safe_mask = ops.white_container_safe_mask
+    project_mode = str((project.get("meta", {}) or {}).get("transfer_mode", "") or "").strip().lower()
     out = rendered.copy()
     effect_layer = np.zeros((h, w, 4), np.uint8)
     all_clear = np.zeros((h, w), np.uint8)
     applied: list[dict] = []
     for index, row in enumerate(rows):
+        row_owner = str(row.get("owner_transfer_mode", "") or "").strip().lower()
+        if row_owner and row_owner != project_mode:
+            applied.append({
+                "id": str(row.get("id", f"manual-effect-{index:03d}")),
+                "success": False,
+                "reason": "manual_region_owned_by_other_mode",
+                "owner_transfer_mode": row_owner,
+                "project_transfer_mode": project_mode,
+                "skipped": True,
+            })
+            continue
+        mode = str(row.get("mode", "effect_text") or "effect_text")
+        if is_region_mode(mode):
+            try:
+                out, region_layer, region_clear, rec = apply_region_action(out, target, source, project, row, cfg, page_dir=page_dir)
+            except Exception as exc:
+                applied.append({
+                    "id": str(row.get("id", f"manual-effect-{index:03d}")),
+                    "success": False, "reason": str(exc), "mode": mode,
+                    "region_composite": True,
+                })
+                continue
+            effect_layer = _alpha_over_bgra(effect_layer, region_layer)
+            if region_clear.shape == target.shape[:2]:
+                all_clear = np.maximum(all_clear, region_clear)
+            applied.append(rec)
+            continue
+        if mode == "open_text_box" and project_mode not in {"mask_replace", "hybrid"}:
+            applied.append({
+                "id": str(row.get("id", f"manual-effect-{index:03d}")),
+                "success": False,
+                "reason": "open_text_box_requires_mask_or_hybrid",
+                "project_transfer_mode": project_mode,
+                "skipped": True,
+            })
+            continue
+        if mode == "open_text_box":
+            try:
+                manual = ops.render_open_text_box(source, target, project, row, cfg)
+            except Exception as exc:
+                applied.append({
+                    "id": str(row.get("id", f"manual-effect-{index:03d}")),
+                    "success": False, "reason": str(exc), "mode": mode,
+                    "owner_transfer_mode": row_owner or project_mode,
+                })
+                continue
+            write_mask = np.asarray(manual.get("write_mask"), np.uint8)
+            source_mask = np.asarray(manual.get("source_mask"), np.uint8)
+            clear_mask = np.asarray(manual.get("target_clear_mask"), np.uint8)
+            rendered_region = np.asarray(manual.get("rendered"), np.uint8)
+            aligned_source = np.asarray(manual.get("aligned_source"), np.uint8)
+            if write_mask.shape != target.shape[:2] or rendered_region.shape != target.shape:
+                applied.append({
+                    "id": str(row.get("id", f"manual-effect-{index:03d}")),
+                    "success": False, "reason": "open_text_box_result_shape_mismatch", "mode": mode,
+                })
+                continue
+            sel = write_mask > 0
+            if not np.any(sel):
+                applied.append({
+                    "id": str(row.get("id", f"manual-effect-{index:03d}")),
+                    "success": False, "reason": "open_text_box_empty_write", "mode": mode,
+                    "diagnostics": dict(manual.get("diagnostics") or {}),
+                })
+                continue
+            out[sel] = rendered_region[sel]
+            if clear_mask.shape == target.shape[:2]:
+                all_clear = np.maximum(all_clear, clear_mask)
+            if source_mask.shape == target.shape[:2] and aligned_source.shape == target.shape:
+                top=np.zeros_like(effect_layer)
+                sm=source_mask>0
+                top[sm,:3]=aligned_source[sm]
+                top[sm,3]=source_mask[sm]
+                effect_layer=_alpha_over_bgra(effect_layer,top)
+            applied.append({
+                "id": str(row.get("id", f"manual-effect-{index:03d}")),
+                "success": True, "mode": mode,
+                "owner_transfer_mode": row_owner or project_mode,
+                "target_bbox": as_list(row.get("target_bbox")),
+                "source_pixels": int(cv2.countNonZero(source_mask)) if source_mask.shape == target.shape[:2] else 0,
+                "target_clear_pixels": int(cv2.countNonZero(clear_mask)) if clear_mask.shape == target.shape[:2] else 0,
+                "write_pixels": int(cv2.countNonZero(write_mask)),
+                "ocr_used": False,
+                "diagnostics": dict(manual.get("diagnostics") or {}),
+            })
+            continue
         try:
             masks = build_manual_effect_masks(source, target, project, row, cfg)
         except Exception as exc:
@@ -85,7 +196,7 @@ def _apply_manual_effect_regions(
         reveal_patch = None
         if mode == "reveal_text":
             mask_name = str(row.get("reveal_mask_file", "") or "")
-            mask_path = page_dir / mask_name if mask_name else None
+            mask_path = safe_page_artifact_path(page_dir, mask_name) if mask_name else None
             reveal = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE) if mask_path is not None and mask_path.exists() else None
             if reveal is None or reveal.shape != target.shape[:2]:
                 applied.append({

@@ -36,11 +36,59 @@ def add_data_args() -> list[str]:
         path = ROOT / directory
         if path.is_dir():
             result += ["--add-data", f"{path}{sep}{directory}"]
+    # Runtime QApplication/QMainWindow icons are loaded through
+    # importlib.resources, so package assets must be collected into the same
+    # package-relative location inside PyInstaller bundles.
+    package_assets = ROOT / "src" / "manga_hd_transfer" / "assets"
+    if package_assets.is_dir():
+        result += ["--add-data", f"{package_assets}{sep}manga_hd_transfer/assets"]
     for filename in ("README.md", "LICENSE"):
         path = ROOT / filename
         if path.is_file():
             result += ["--add-data", f"{path}{sep}."]
     return result
+
+
+def platform_icon(system: str) -> Path:
+    filename = {
+        "Darwin": "icon.icns",
+        "Windows": "icon.ico",
+        "Linux": "icon.png",
+    }[system]
+    path = ROOT / "assets" / filename
+    if not path.is_file():
+        raise SystemExit(f"Required {system} icon is missing: {path}")
+    return path
+
+
+def write_windows_version_file(version: str) -> Path:
+    parts = [int(p) if p.isdigit() else 0 for p in version.split(".")[:4]]
+    while len(parts) < 4:
+        parts.append(0)
+    version_tuple = tuple(parts[:4])
+    path = BUILD / "folirina-version-info.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"""VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers={version_tuple!r},
+    prodvers={version_tuple!r},
+    mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([StringTable('040904B0', [
+      StringStruct('CompanyName', 'Amster-Ilvil'),
+      StringStruct('FileDescription', 'Folirina Manga Translation Transfer Studio'),
+      StringStruct('FileVersion', '{version}'),
+      StringStruct('InternalName', 'Folirina'),
+      StringStruct('OriginalFilename', 'Folirina.exe'),
+      StringStruct('ProductName', 'Folirina'),
+      StringStruct('ProductVersion', '{version}')
+    ])]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)
+""", encoding="utf-8")
+    return path
 
 
 def main() -> None:
@@ -78,17 +126,13 @@ def main() -> None:
         *add_data_args(),
     ]
 
-    icon_candidates = [
-        ROOT / "assets" / "icon.ico",
-        ROOT / "assets" / "icon.icns",
-        ROOT / "assets" / "icon.png",
-    ]
-    icon = next((path for path in icon_candidates if path.is_file()), None)
-    if icon is not None:
-        cmd += ["--icon", str(icon)]
+    icon = platform_icon(system)
+    cmd += ["--icon", str(icon)]
 
     if system == "Darwin":
         cmd += ["--osx-bundle-identifier", BUNDLE_ID]
+    elif system == "Windows":
+        cmd += ["--version-file", str(write_windows_version_file(version))]
 
     cmd += [str(ROOT / "run_gui.py")]
     run(cmd)
@@ -102,14 +146,26 @@ def main() -> None:
             raise SystemExit(f"Expected app executable not found: {executable}")
         plist = app / "Contents" / "Info.plist"
         if plist.exists():
-            subprocess.run(
-                ["/usr/libexec/PlistBuddy", "-c", f"Set :CFBundleShortVersionString {version}", str(plist)],
-                check=False,
-            )
-            subprocess.run(
-                ["/usr/libexec/PlistBuddy", "-c", f"Set :CFBundleVersion {version}", str(plist)],
-                check=False,
-            )
+            commands = [
+                f"Set :CFBundleShortVersionString {version}",
+                f"Set :CFBundleVersion {version}",
+                f"Set :CFBundleDisplayName {APP_NAME}",
+                f"Set :CFBundleName {APP_NAME}",
+            ]
+            for command in commands:
+                subprocess.run(["/usr/libexec/PlistBuddy", "-c", command, str(plist)], check=False)
+            # PyInstaller creates CFBundleIconFile from --icon.  Fail the build
+            # if the plist/resource linkage disappeared, because a window icon
+            # alone is not sufficient for Finder/Dock branding.
+            icon_name = subprocess.check_output(
+                ["/usr/libexec/PlistBuddy", "-c", "Print :CFBundleIconFile", str(plist)],
+                text=True,
+            ).strip()
+            if not icon_name:
+                raise SystemExit("macOS bundle is missing CFBundleIconFile")
+            resource_icon = app / "Contents" / "Resources" / icon_name
+            if not resource_icon.is_file():
+                raise SystemExit(f"macOS bundle icon resource missing: {resource_icon}")
             subprocess.run(["plutil", "-lint", str(plist)], check=True)
     else:
         app_dir = DIST / APP_NAME
@@ -118,6 +174,15 @@ def main() -> None:
         executable = app_dir / (f"{APP_NAME}.exe" if system == "Windows" else APP_NAME)
         if not executable.is_file():
             raise SystemExit(f"Expected executable not found: {executable}")
+        if system == "Linux":
+            shutil.copy2(ROOT / "assets" / "icon.png", app_dir / "folirina.png")
+            desktop = app_dir / "Folirina.desktop"
+            desktop.write_text(
+                "[Desktop Entry]\nType=Application\nName=Folirina\n"
+                "Exec=./Folirina\nIcon=folirina\nTerminal=false\n"
+                "Categories=Graphics;Utility;\n",
+                encoding="utf-8",
+            )
 
     print(f"Build complete: {DIST}")
 

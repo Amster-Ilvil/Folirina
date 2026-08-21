@@ -31,8 +31,6 @@ mkdir -p "$PACKAGE_DIR" dmg-stage
 
 xattr -cr "$APP" || true
 
-# Ad-hoc sign nested Mach-O files first, then nested bundles and the app itself.
-# This keeps the public build self-contained without requiring Developer ID secrets.
 while IFS= read -r -d '' f; do
   if /usr/bin/file "$f" | grep -q 'Mach-O'; then
     /usr/bin/codesign --force --sign - --timestamp=none "$f" || true
@@ -50,12 +48,7 @@ ditto -c -k --sequesterRsrc --keepParent "$APP" "$APP_ZIP"
 
 ditto "$APP" "dmg-stage/${PRODUCT_NAME}.app"
 ln -s /Applications "dmg-stage/Applications"
-hdiutil create \
-  -volname "$PRODUCT_NAME" \
-  -srcfolder dmg-stage \
-  -ov \
-  -format UDZO \
-  "$DMG"
+hdiutil create -volname "$PRODUCT_NAME" -srcfolder dmg-stage -ov -format UDZO "$DMG"
 hdiutil verify "$DMG"
 
 (
@@ -70,6 +63,8 @@ hdiutil verify "$DMG"
     echo "Built: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     echo "Signing: ad-hoc (not notarized)"
     echo "Optional OCR/ML runtimes bundled: no (managed on demand by Folirina)"
+    echo "Acceleration: Apple Silicon supports PyTorch MPS when optional Torch runtime is installed; CPU fallback remains available"
+    echo "App icon: native ICNS embedded in .app / Finder / Dock"
     echo
     cat SHA256SUMS.txt
   } > BUILD-INFO.txt

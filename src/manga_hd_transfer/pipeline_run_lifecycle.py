@@ -12,7 +12,7 @@ from .models import PagePair, PageProject, QAItem
 from .qa import qa_summary
 from .result_state import (
     create_run_snapshot, discard_run_snapshot, invalidate_manual_review_state,
-    restore_run_snapshot,
+    restore_run_snapshot, run_snapshot_has_existing,
 )
 from .run_trace import PageRunTrace
 from .run_receipt import write_run_receipt
@@ -53,20 +53,24 @@ def run_page_lifecycle(
     trace = PageRunTrace(root, mode=mode)
     previous_trace = get_trace()
     set_trace(trace)
-    snapshot = create_run_snapshot(root, trace.run_id)
-    trace.event(
-        "run_start",
-        selected_mode=mode, version=version,
-        source=str(pair.source_path), target=str(pair.target_path),
-        ocr_source=str(getattr(config.ocr, "source_backend", None) or getattr(config.ocr, "backend", "")),
-        ocr_target=str(getattr(config.ocr, "target_backend", None) or getattr(config.ocr, "backend", "")),
-        registration_backend=str(getattr(config.registration, "backend", "")),
-        previous_result_snapshot=bool(snapshot),
-    )
+    snapshot = None
     try:
+        # The lock must precede the snapshot.  Otherwise a second request can
+        # copy a page while the active writer is midway through publication and
+        # can also leak a pointless full-page backup before PageRunBusyError.
         with PageRunGuard(root, mode):
             orphan_cleanup = cleanup_orphan_temp_files(root)
             trace.event("workspace_guard_acquired", orphan_temp_cleanup=orphan_cleanup)
+            snapshot = create_run_snapshot(root, trace.run_id)
+            trace.event(
+                "run_start",
+                selected_mode=mode, version=version,
+                source=str(pair.source_path), target=str(pair.target_path),
+                ocr_source=str(getattr(config.ocr, "source_backend", None) or getattr(config.ocr, "backend", "")),
+                ocr_target=str(getattr(config.ocr, "target_backend", None) or getattr(config.ocr, "backend", "")),
+                registration_backend=str(getattr(config.registration, "backend", "")),
+                previous_result_snapshot=run_snapshot_has_existing(snapshot),
+            )
             try:
                 impl_kwargs = {"page_mark": page_mark, "cancel_cb": cancel_cb}
                 # Preserve compatibility with plugins/subclasses written before
@@ -94,19 +98,29 @@ def run_page_lifecycle(
                 except Exception:
                     pass
                 restored = restore_run_snapshot(root, snapshot)
+                if restored.get("success"):
+                    discard_run_snapshot(snapshot)
+                    snapshot = None
                 trace.exception("run_failed", exc, previous_result_restore=restored)
-                save_json(root / "last_run_state.json", {
-                    "schema": "manga_hd_translation_transfer.run_state.v2",
-                    "status": "failed",
-                    "mode": mode,
-                    "run_id": trace.run_id,
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                    "previous_result_restored": restored,
-                    "run_log": str(trace.text_path),
-                    "run_trace": str(trace.jsonl_path),
-                    "orphan_temp_cleanup": orphan_cleanup,
-                })
+                try:
+                    save_json(root / "last_run_state.json", {
+                        "schema": "manga_hd_translation_transfer.run_state.v2",
+                        "status": "failed",
+                        "mode": mode,
+                        "run_id": trace.run_id,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                        "previous_result_restored": restored,
+                        "recovery_backup_retained": bool(snapshot),
+                        "run_log": str(trace.text_path),
+                        "run_trace": str(trace.jsonl_path),
+                        "orphan_temp_cleanup": orphan_cleanup,
+                    })
+                except Exception:
+                    # Diagnostics must never mask the processing exception that
+                    # explains why the page failed. The append-only run trace
+                    # has already received the failure when writable.
+                    pass
                 raise
 
             try:
@@ -158,6 +172,9 @@ def run_page_lifecycle(
                 except Exception:
                     pass
                 restored = restore_run_snapshot(root, snapshot)
+                if restored.get("success"):
+                    discard_run_snapshot(snapshot)
+                    snapshot = None
                 trace.exception("run_commit_failed", exc, previous_result_restore=restored)
                 try:
                     save_json(root / "last_run_state.json", {
@@ -165,6 +182,7 @@ def run_page_lifecycle(
                         "status": "failed", "stage": "commit", "mode": mode,
                         "run_id": trace.run_id, "error_type": type(exc).__name__, "error": str(exc),
                         "previous_result_restored": restored,
+                        "recovery_backup_retained": bool(snapshot),
                         "run_log": str(trace.text_path), "run_trace": str(trace.jsonl_path),
                         "orphan_temp_cleanup": orphan_cleanup,
                     })
@@ -172,6 +190,7 @@ def run_page_lifecycle(
                     pass
                 raise
             discard_run_snapshot(snapshot)
+            snapshot = None
             return project
     finally:
         set_trace(previous_trace)

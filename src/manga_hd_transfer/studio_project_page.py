@@ -21,14 +21,16 @@ from PySide6.QtWidgets import (
 
 from .gui_components import (
     _configure_responsive_dialog, Card, PathRow, ImageView, StableThumbnailList,
-    ZoomPreviewView, StableComboBox,
+    ZoomPreviewView, StableComboBox, StableSpinBox, StableDoubleSpinBox,
 )
 
 QComboBox = StableComboBox
+QSpinBox = StableSpinBox
+QDoubleSpinBox = StableDoubleSpinBox
 from .gui_theme import semantic_palette
 from .font_catalog import discover_fonts
 from .io_utils import load_json
-from .direct_patch_status import summarize_direct_patch_payload  # compatibility/public import
+from .direct_patch_status import summarize_direct_patch_payload  # compatibility/public import; runtime uses safe wrapper
 from . import direct_patch_status as _direct_patch_status
 from .pairing import pairing_method
 from .schema_compat import as_dict, normalize_project
@@ -37,6 +39,34 @@ from .modes.registry import active_mode_ui_items, compact_mode_ui_label, get_mod
 from .page_management import (
     PAGE_TYPE_INFO, MANUAL_PAGE_TYPES, page_type_color, page_type_label,
 )
+
+
+def _safe_direct_patch_summary(page_dir: str | Path) -> dict:
+    """Never let a stale/mixed GUI module crash page selection.
+
+    Historical in-place upgrades could leave ``studio_project_page`` referring
+    to a function name that was not imported, which made selecting a thumbnail
+    raise ``NameError``.  Resolve the status helper from its module object and
+    fail closed to a small diagnostic payload if the workspace/status file is
+    malformed.  Status rendering must never make page navigation unusable.
+    """
+    try:
+        fn = getattr(_direct_patch_status, "summarize_direct_patch_payload", None)
+        if callable(fn):
+            return dict(fn(page_dir) or {})
+    except Exception as exc:
+        return {
+            "payload": {}, "used": False, "accepted": False,
+            "applied_count": 0, "region_count": 0, "missing_files": [],
+            "reason": f"status_summary_error:{type(exc).__name__}",
+            "strategy": "direct_borderless_overlay",
+        }
+    return {
+        "payload": {}, "used": False, "accepted": False,
+        "applied_count": 0, "region_count": 0, "missing_files": [],
+        "reason": "status_summary_unavailable",
+        "strategy": "direct_borderless_overlay",
+    }
 
 
 class AlignedCheckOption(QWidget):
@@ -53,27 +83,29 @@ class AlignedCheckOption(QWidget):
     def __init__(self, text: str, parent: QWidget | None = None):
         super().__init__(parent)
         self._checkbox = QCheckBox()
-        # Qt/macOS gives an empty QCheckBox the global 27px control height while
-        # its 16px indicator is painted against a different native baseline.
-        # Force the indicator into a small, centered box and give the text the
-        # same row height so the square and label sit on one horizontal axis.
-        self._checkbox.setFixedSize(20, 20)
+        # Keep the indicator itself on an explicit 18x18 logical-pixel grid.
+        # Relying on the native empty-QCheckBox size is not stable on macOS:
+        # font/DPR changes can shift the painted square vertically even though
+        # the surrounding widget has the same height.  A local indicator rule
+        # makes every project-option square share the exact same center line.
+        self._checkbox.setFixedSize(22, 22)
         self._checkbox.setStyleSheet(
-            "QCheckBox { min-height:20px; max-height:20px; min-width:20px; "
-            "max-width:20px; padding:0; margin:0; spacing:0; }"
+            "QCheckBox { min-height:22px; max-height:22px; min-width:22px; "
+            "max-width:22px; padding:0; margin:0; spacing:0; } "
+            "QCheckBox::indicator { width:18px; height:18px; margin:2px; }"
         )
         self._label = QLabel(text)
         self._label.setWordWrap(False)
-        self._label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self._label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
-        self._label.setFixedHeight(20)
+        self._label.setFixedHeight(22)
         self._label.setCursor(Qt.CursorShape.PointingHandCursor)
         self._label.mousePressEvent = self._label_mouse_press_event
         row = QHBoxLayout(self); row.setContentsMargins(0, 0, 0, 0); row.setSpacing(6)
-        row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
-        row.addWidget(self._checkbox, 0, Qt.AlignmentFlag.AlignCenter)
+        row.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        row.addWidget(self._checkbox, 0, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
         row.addWidget(self._label, 1, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
-        self.setFixedHeight(22)
+        self.setFixedHeight(24)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setFocusProxy(self._checkbox)
         self._checkbox.toggled.connect(self.toggled.emit)
@@ -102,6 +134,49 @@ class AlignedCheckOption(QWidget):
         super().setToolTip(text)
         self._checkbox.setToolTip(text)
         self._label.setToolTip(text)
+
+
+class CompactSection(QFrame):
+    """Small collapsible settings section used by the Page Manager.
+
+    Keeps low-frequency renderer options available without forcing every mode to
+    show its full configuration at once.  Collapsing changes UI geometry only;
+    the underlying widgets/configuration remain alive and unchanged.
+    """
+
+    toggled = Signal(bool)
+
+    def __init__(self, title: str, summary: str = "", *, expanded: bool = False, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._title = str(title)
+        self.setObjectName("compactSection")
+        root = QVBoxLayout(self); root.setContentsMargins(8,6,8,7); root.setSpacing(5)
+        head = QHBoxLayout(); head.setContentsMargins(0,0,0,0); head.setSpacing(7)
+        self.toggle = QPushButton(); self.toggle.setObjectName("collapseToggle")
+        self.toggle.setCheckable(True); self.toggle.setChecked(bool(expanded))
+        self.toggle.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self.summary = QLabel(str(summary or "")); self.summary.setObjectName("quiet")
+        self.summary.setWordWrap(False); self.summary.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        self.summary.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        head.addWidget(self.toggle, 0); head.addWidget(self.summary, 1)
+        root.addLayout(head)
+        self.body = QWidget(); self.content_layout = QVBoxLayout(self.body)
+        self.content_layout.setContentsMargins(0,2,0,0); self.content_layout.setSpacing(6)
+        root.addWidget(self.body)
+        self.toggle.toggled.connect(self.setExpanded)
+        self.setExpanded(bool(expanded))
+
+    def setSummary(self, text: str) -> None:
+        self.summary.setText(str(text or ""))
+        self.summary.setVisible(bool(str(text or "").strip()))
+
+    def setExpanded(self, expanded: bool) -> None:
+        expanded = bool(expanded)
+        self.toggle.blockSignals(True); self.toggle.setChecked(expanded); self.toggle.blockSignals(False)
+        self.toggle.setText(("▾ " if expanded else "▸ ") + self._title)
+        self.body.setVisible(expanded)
+        self.toggled.emit(expanded)
+        self.updateGeometry()
 
 
 class PagePreviewDialog(QDialog):
@@ -305,8 +380,12 @@ class ProjectPage(QWidget):
         self.prefer_order_pair.setToolTip("可选加速：对等长区间按自然排序一一对应。默认关闭，避免插页/缺页造成连锁错位。")
         self.remake_pair_verify = AlignedCheckOption("重制增强配对 · AKAZE 二次核验"); self.remake_pair_verify.setChecked(False)
         self.remake_pair_verify.setToolTip("对低置信智能配对做模型无关的局部特征 + RANSAC 二次核验。只在强证据成立时提高置信度；不会自动删除、重排页面。默认关闭以保持旧项目行为完全不变。")
-        pair_opts.addWidget(self.prefer_name_pair, 0, 0); pair_opts.addWidget(self.prefer_order_pair, 0, 1)
-        pair_opts.addWidget(self.remake_pair_verify, 1, 0, 1, 2); pair_opts.setColumnStretch(2, 1)
+        pair_align = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        pair_opts.addWidget(self.prefer_name_pair, 0, 0, alignment=pair_align)
+        pair_opts.addWidget(self.prefer_order_pair, 0, 1, alignment=pair_align)
+        pair_opts.addWidget(self.remake_pair_verify, 1, 0, 1, 2, alignment=pair_align)
+        pair_opts.setRowMinimumHeight(0, 24); pair_opts.setRowMinimumHeight(1, 24)
+        pair_opts.setColumnStretch(0, 1); pair_opts.setColumnStretch(1, 1)
         project_body_layout.addLayout(pair_opts)
 
         pair_row = QHBoxLayout(); pair_row.setSpacing(8)
@@ -396,6 +475,8 @@ class ProjectPage(QWidget):
         mode.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         self.mode = QComboBox(); self.mode.setObjectName("routeSelector"); [self.mode.addItem(label, key) for label, key in active_mode_ui_items()]; self._last_mode_key = str(self.window.state.config.transfer.mode or "direct_patch")
         mode.layout.addWidget(self.mode)
+        self.mode_summary = QLabel(""); self.mode_summary.setObjectName("hint"); self.mode_summary.setWordWrap(True); self.mode_summary.setMaximumHeight(42)
+        mode.layout.addWidget(self.mode_summary)
         # HD reletter typography is now a first-class setting instead of a hidden
         # config/CLI-only option.  Pixel/mask transfer modes ignore this field.
         reletter_box = QFrame(); reletter_box.setObjectName("typographyPanel")
@@ -446,15 +527,20 @@ class ProjectPage(QWidget):
 
         layout_grid = QGridLayout(); layout_grid.setContentsMargins(0,0,0,0); layout_grid.setHorizontalSpacing(7); layout_grid.setVerticalSpacing(6)
         layout_grid.addWidget(QLabel("断句"), 0, 0); layout_grid.addWidget(self.reletter_break_mode, 0, 1)
-        layout_grid.addWidget(QLabel("适配"), 0, 2); layout_grid.addWidget(self.reletter_layout_mode, 0, 3)
-        size_box = QWidget(); size_lay = QHBoxLayout(size_box); size_lay.setContentsMargins(0,0,0,0); size_lay.setSpacing(4)
-        size_lay.addWidget(self.reletter_min_font); dash = QLabel("—"); dash.setObjectName("quiet"); size_lay.addWidget(dash); size_lay.addWidget(self.reletter_max_font)
-        layout_grid.addWidget(QLabel("字号"), 1, 0); layout_grid.addWidget(size_box, 1, 1)
-        layout_grid.addWidget(QLabel("行距"), 1, 2); layout_grid.addWidget(self.reletter_line_spacing, 1, 3)
-        layout_grid.addWidget(self.reletter_koharu_flow_cells, 2, 0, 1, 4)
-        layout_grid.setColumnStretch(1, 1); layout_grid.setColumnStretch(3, 1)
+        layout_grid.addWidget(QLabel("适配"), 1, 0); layout_grid.addWidget(self.reletter_layout_mode, 1, 1)
+        size_box = QWidget(); size_lay = QHBoxLayout(size_box); size_lay.setContentsMargins(0,0,0,0); size_lay.setSpacing(5)
+        self.reletter_min_font.setMinimumWidth(78); self.reletter_max_font.setMinimumWidth(78); self.reletter_line_spacing.setMinimumWidth(82)
+        size_lay.addWidget(QLabel("最小")); size_lay.addWidget(self.reletter_min_font)
+        size_lay.addWidget(QLabel("最大")); size_lay.addWidget(self.reletter_max_font)
+        size_lay.addSpacing(6); size_lay.addWidget(QLabel("行距")); size_lay.addWidget(self.reletter_line_spacing)
+        size_lay.addStretch(1)
+        layout_grid.addWidget(QLabel("字号"), 2, 0); layout_grid.addWidget(size_box, 2, 1)
+        layout_grid.addWidget(self.reletter_koharu_flow_cells, 3, 0, 1, 2)
+        layout_grid.setColumnStretch(1, 1)
         rbl.addLayout(layout_grid)
-        mode.layout.addWidget(reletter_box)
+        self.reletter_section = CompactSection("OCR重排 · 字体与排版", "字体、断句、字号与行距 · 低频设置默认收起", expanded=False)
+        self.reletter_section.content_layout.addWidget(reletter_box)
+        mode.layout.addWidget(self.reletter_section)
         self.transparent_backend = QComboBox()
         for label, value in [
             ("后备检测 · 自动", "auto"), ("仅 Koharu Layout", "koharu_layout"), ("后备 · MangaLens", "mangalens"),
@@ -498,7 +584,9 @@ class ProjectPage(QWidget):
         tbl.addWidget(self.transparent_ocr_text_presence, 6, 0, 1, 4)
         tbl.addWidget(self.transparent_restore_source_evidence, 7, 0, 1, 4)
         tbl.setColumnStretch(1, 1); tbl.setColumnStretch(3, 1)
-        mode.layout.addWidget(self.transparent_box)
+        self.transparent_section = CompactSection("透明挖孔设置", "真正修改 TARGET alpha；与整页对齐挖孔路线独立", expanded=False)
+        self.transparent_section.content_layout.addWidget(self.transparent_box)
+        mode.layout.addWidget(self.transparent_section)
 
         # v2.2 semantic front-end: this never replaces Direct/Mask/Reveal renderers.
         self.semantic_box = QFrame(); self.semantic_box.setObjectName("cardBlue")
@@ -523,7 +611,9 @@ class ProjectPage(QWidget):
         sgl.addWidget(QLabel("语义策略"), 2, 0); sgl.addWidget(self.semantic_strategy, 2, 1, 1, 3)
         sgl.addWidget(self.semantic_apply_reveal, 3, 0, 1, 4)
         sgl.addWidget(self.semantic_save_overlay, 4, 0, 1, 4)
-        mode.layout.addWidget(self.semantic_box)
+        self.semantic_section = CompactSection("高级 · 漫画语义版面", "页码/页眉忽略、正文 ROI 与调试叠加图", expanded=False)
+        self.semantic_section.content_layout.addWidget(self.semantic_box)
+        mode.layout.addWidget(self.semantic_section)
 
         self.show_experimental = QCheckBox("显示旧版实验兼容项")
         self.experimental_warning = QLabel("整页模式现已使用独立 aligned_overlay_reveal 路线；不会再映射到 Transparent Reveal。")
@@ -558,19 +648,21 @@ class ProjectPage(QWidget):
             _w.setChecked(True); _w.setEnabled(False); dcl.addWidget(_w)
         dcn = QLabel("以上 4 项属于 Direct 默认合同；除非明确修改 Direct 模式，否则不得改变。")
         dcn.setObjectName("quiet"); dcn.setWordWrap(True); dcl.addWidget(dcn)
-        mode.layout.addWidget(self.direct_contract_box)
+        self.direct_contract_section = CompactSection("Direct 流程说明", "SOURCE 中文上层 · TARGET 边框权威 · 方向锁定", expanded=False)
+        self.direct_contract_section.content_layout.addWidget(self.direct_contract_box)
+        mode.layout.addWidget(self.direct_contract_section)
 
         self.direct_clarity_box = QFrame(); self.direct_clarity_box.setObjectName("cardBlue")
         dql = QVBoxLayout(self.direct_clarity_box); dql.setContentsMargins(9,8,9,8); dql.setSpacing(5)
-        dqt = QLabel("白气泡 Direct 清晰增强"); dqt.setStyleSheet("font-weight:650;"); dql.addWidget(dqt)
+        dqt = QLabel("白气泡中文清晰增强"); dqt.setStyleSheet("font-weight:650;"); dql.addWidget(dqt)
         self.direct_white_clarity_enabled = QCheckBox("启用漂白清底 + 中文文字掩膜清晰化")
         self.direct_white_clarity_enabled.setToolTip("参考夸克类净页思路：对白气泡区域先漂白清底、去灰底、压噪点，再保留 SOURCE 中文黑字。对白气泡场景下的 Direct / 精准蒙版 / 精准蒙版+OCR 生效：先漂白清底、去灰底、压噪点，再保留 SOURCE 中文黑字；彩页与非白气泡仍走原有安全路径。")
         dql.addWidget(self.direct_white_clarity_enabled)
-        dqh = QLabel("仅用于白气泡 Direct：清理低清中文版带来的灰底与噪点，同时适度增强黑字字芯，减少贴到高清日文页后发糊、发灰的感觉。")
+        dqh = QLabel("用于 Direct / 精准蒙版 / 精准蒙版+OCR 的白气泡：优先清理 SOURCE 灰底与扫描噪点，默认保留中文版原始圆润字形。")
         dqh.setObjectName("quiet"); dqh.setWordWrap(True); dql.addWidget(dqh)
         self.direct_clarity_summary = QLabel("")
         self.direct_clarity_summary.setObjectName("hint"); self.direct_clarity_summary.setWordWrap(True); dql.addWidget(self.direct_clarity_summary)
-        dqf = QFormLayout(); dqf.setContentsMargins(0,0,0,0); dqf.setSpacing(6)
+        dqf = QGridLayout(); dqf.setContentsMargins(0,0,0,0); dqf.setHorizontalSpacing(8); dqf.setVerticalSpacing(6)
         self.direct_white_clarity_alpha_gamma = QDoubleSpinBox(); self.direct_white_clarity_alpha_gamma.setDecimals(2); self.direct_white_clarity_alpha_gamma.setRange(0.40, 1.20); self.direct_white_clarity_alpha_gamma.setSingleStep(0.02)
         self.direct_white_clarity_alpha_gamma.setToolTip("文字边缘灰阶曲线。1.00 保留中文版原始圆润抗锯齿；小于 1.00 才会主动加硬。默认 1.00。")
         self.direct_white_clarity_black_boost = QSpinBox(); self.direct_white_clarity_black_boost.setRange(0, 48); self.direct_white_clarity_black_boost.setSingleStep(1)
@@ -579,18 +671,23 @@ class ProjectPage(QWidget):
         self.direct_white_clarity_pure_white_floor.setToolTip("白底最低亮度。数值越高，背景越接近纯白。默认 248。")
         self.direct_white_clarity_min_text_pixels = QSpinBox(); self.direct_white_clarity_min_text_pixels.setRange(1, 400); self.direct_white_clarity_min_text_pixels.setSingleStep(1)
         self.direct_white_clarity_min_text_pixels.setToolTip("最小文字像素门槛。过小区域不做增强，避免误对白纸块做无意义处理。默认 18。")
+        for _spin in (self.direct_white_clarity_alpha_gamma, self.direct_white_clarity_black_boost, self.direct_white_clarity_pure_white_floor, self.direct_white_clarity_min_text_pixels):
+            _spin.setMinimumWidth(88); _spin.setMaximumWidth(124)
         _dcfg = self.window.state.config.direct_patch
         self.direct_white_clarity_enabled.setChecked(bool(getattr(_dcfg, "direct_white_clarity_enhance_enabled", True)))
         self.direct_white_clarity_alpha_gamma.setValue(float(getattr(_dcfg, "direct_white_clarity_alpha_gamma", 1.0)))
         self.direct_white_clarity_black_boost.setValue(int(getattr(_dcfg, "direct_white_clarity_black_boost", 0)))
         self.direct_white_clarity_pure_white_floor.setValue(int(getattr(_dcfg, "direct_white_clarity_pure_white_floor", 248)))
         self.direct_white_clarity_min_text_pixels.setValue(int(getattr(_dcfg, "direct_white_clarity_min_text_pixels", 18)))
-        dqf.addRow("字边清晰", self.direct_white_clarity_alpha_gamma)
-        dqf.addRow("黑字强化", self.direct_white_clarity_black_boost)
-        dqf.addRow("白底亮度", self.direct_white_clarity_pure_white_floor)
-        dqf.addRow("最小文字像素", self.direct_white_clarity_min_text_pixels)
+        dqf.addWidget(QLabel("字边清晰"), 0, 0); dqf.addWidget(self.direct_white_clarity_alpha_gamma, 0, 1)
+        dqf.addWidget(QLabel("黑字强化"), 0, 2); dqf.addWidget(self.direct_white_clarity_black_boost, 0, 3)
+        dqf.addWidget(QLabel("白底亮度"), 1, 0); dqf.addWidget(self.direct_white_clarity_pure_white_floor, 1, 1)
+        dqf.addWidget(QLabel("最小文字像素"), 1, 2); dqf.addWidget(self.direct_white_clarity_min_text_pixels, 1, 3)
+        dqf.setColumnStretch(1, 1); dqf.setColumnStretch(3, 1)
         dql.addLayout(dqf)
-        mode.layout.addWidget(self.direct_clarity_box)
+        self.direct_clarity_section = CompactSection("白气泡中文清晰增强", "漂白清底 + 保留 SOURCE 原始中文字形", expanded=False)
+        self.direct_clarity_section.content_layout.addWidget(self.direct_clarity_box)
+        mode.layout.addWidget(self.direct_clarity_section)
 
         self.hybrid_ocr_contract_box = QFrame(); self.hybrid_ocr_contract_box.setObjectName("cardBlue")
         hol = QVBoxLayout(self.hybrid_ocr_contract_box); hol.setContentsMargins(9,8,9,8); hol.setSpacing(4)
@@ -602,11 +699,18 @@ class ProjectPage(QWidget):
             _w.setChecked(True); _w.setEnabled(False); hol.addWidget(_w)
         hon = QLabel("蒙版结果即使进入 REVIEW 或回滚 TARGET，也仍然拥有该区域；系统不会擅自用 OCR 覆盖。需要 OCR 时可在人工 OCR 编辑器中手动框选。")
         hon.setObjectName("quiet"); hon.setWordWrap(True); hol.addWidget(hon)
-        mode.layout.addWidget(self.hybrid_ocr_contract_box)
+        self.hybrid_ocr_contract_section = CompactSection("精准蒙版+OCR · OCR 合同", "有蒙版不自动 OCR · 无蒙版才 OCR · 人工框选强制", expanded=False)
+        self.hybrid_ocr_contract_section.content_layout.addWidget(self.hybrid_ocr_contract_box)
+        mode.layout.addWidget(self.hybrid_ocr_contract_section)
 
         self.diff_check = QCheckBox("优先使用成对差异提取中文气泡/文本框"); self.diff_check.setChecked(True)
         self.exact_check = QCheckBox("同源页面启用像素级精确覆盖"); self.exact_check.setChecked(True)
-        mode.layout.addWidget(self.diff_check); mode.layout.addWidget(self.exact_check)
+        self.mode_core_box = QFrame(); self.mode_core_box.setObjectName("compactOptions")
+        core_l = QVBoxLayout(self.mode_core_box); core_l.setContentsMargins(8,5,8,5); core_l.setSpacing(4)
+        core_l.addWidget(self.diff_check); core_l.addWidget(self.exact_check)
+        # Put high-frequency switches directly below the mode summary; all longer
+        # renderer panels stay in collapsible sections below.
+        mode.layout.insertWidget(2, self.mode_core_box)
         right_col.addWidget(mode, 0)
 
         # Selected-page detail is a collapsible, vertically elastic inspector.
@@ -677,17 +781,32 @@ class ProjectPage(QWidget):
         # batch semantics are now explicit buttons instead of a confusing toggle.
         self.resume_check = QCheckBox("断点续跑 / 跳过已完成页面"); self.resume_check.setChecked(True); self.resume_check.setVisible(False)
         self.cache_check = QCheckBox("复用配准、OCR 与气泡缓存"); self.cache_check.setChecked(True)
-        self.run_page = QPushButton("处理当前页"); self.run_page.setObjectName("softPrimary")
-        self.run_book = QPushButton("从头处理整本"); self.run_book.setObjectName("compactAction")
-        self.continue_book = QPushButton("继续处理整本"); self.continue_book.setObjectName("primary"); self.continue_book.setMinimumHeight(40)
-        self.cancel = QPushButton("停止"); self.cancel.setObjectName("danger"); self.cancel.setEnabled(False); self.cancel.setMaximumWidth(88)
-        action_opts = QHBoxLayout(); action_opts.setContentsMargins(0,0,0,0); action_opts.setSpacing(8)
-        action_opts.addWidget(self.cache_check); action_opts.addStretch(1); action_opts.addWidget(self.cancel)
+        self.run_page = QPushButton("处理当前页")
+        self.run_book = QPushButton("从头处理整本")
+        self.continue_book = QPushButton("继续处理整本")
+        self.cancel = QPushButton("停止"); self.cancel.setEnabled(False)
+        # The four processing actions are one semantic group.  Keep identical
+        # height, width policy and palette so current-page/batch semantics do
+        # not accidentally turn into a visual priority hierarchy.
+        for _btn in (self.run_page, self.cancel, self.run_book, self.continue_book):
+            _btn.setObjectName("pageProcessAction")
+            _btn.setMinimumHeight(38); _btn.setMaximumHeight(38)
+            _btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        # Two-by-two grid guarantees equal button widths in both rows, including
+        # the Stop button which used to carry a fixed 96..132px width.
+        process_grid = QGridLayout(); process_grid.setContentsMargins(0,0,0,0)
+        process_grid.setHorizontalSpacing(8); process_grid.setVerticalSpacing(8)
+        process_grid.addWidget(self.run_page, 0, 0)
+        process_grid.addWidget(self.cancel, 0, 1)
+        process_grid.addWidget(self.run_book, 1, 0)
+        process_grid.addWidget(self.continue_book, 1, 1)
+        process_grid.setColumnStretch(0, 1); process_grid.setColumnStretch(1, 1)
+        actions.layout.addLayout(process_grid)
+
+        action_opts = QHBoxLayout(); action_opts.setContentsMargins(0,2,0,0); action_opts.setSpacing(8)
+        action_opts.addWidget(self.cache_check); action_opts.addStretch(1)
         actions.layout.addLayout(action_opts)
-        actions.layout.addWidget(self.continue_book)
-        secondary = QHBoxLayout(); secondary.setContentsMargins(0,0,0,0); secondary.setSpacing(8)
-        secondary.addWidget(self.run_page, 1); secondary.addWidget(self.run_book, 1)
-        actions.layout.addLayout(secondary)
         right_col.addWidget(actions, 0)
         # Only the current-page inspector may absorb spare right-column height.
         # This prevents migration/actions cards from being stretched into large
@@ -723,6 +842,21 @@ class ProjectPage(QWidget):
         self._update_direct_result_status()
         self.apply_type.clicked.connect(self._apply_selected_type); self.reset_type.clicked.connect(self._reset_selected_type)
         self._update_experimental_status()
+
+    def set_processing_busy(self, busy: bool) -> None:
+        """Lock renderer settings while a worker is running.
+
+        The action card stays interactive so the Stop button remains usable; only
+        settings that could make the running job diverge from the visible UI are
+        locked.
+        """
+        busy = bool(busy)
+        if hasattr(self, "mode_card"):
+            self.mode_card.setEnabled(not busy)
+        if hasattr(self, "cache_check"):
+            self.cache_check.setEnabled(not busy)
+        if not busy and hasattr(self, "mode"):
+            self._update_mode_specific_controls()
 
     def _set_detail_expanded(self, expanded: bool | None = None):
         if expanded is None:
@@ -839,12 +973,7 @@ class ProjectPage(QWidget):
             self.direct_result_status.setText("当前页 Direct 结果：暂无工作区。请先处理当前页。")
             self.direct_result_status.setStyleSheet(self._tone_style("orange"))
             return
-        try:
-            summary = summarize_direct_patch_payload(page_dir)
-        except NameError:
-            # Defensive recovery for mixed/stale GUI modules left by an in-place
-            # source update. Fresh v2.3.10 installs take the normal imported path.
-            summary = _direct_patch_status.summarize_direct_patch_payload(page_dir)
+        summary = _safe_direct_patch_summary(page_dir)
         self.direct_result_status.setVisible(True)
         if not summary.get("payload"):
             self.direct_result_status.setText("当前页 Direct 结果：暂无 direct_patch 产物。请重新处理当前页；已有旧结果不会自动切换到新 Direct 合同。")
@@ -952,33 +1081,88 @@ class ProjectPage(QWidget):
             self.experimental_result_status.setText("当前页实验结果：未应用挖洞。原因：" + self._aligned_overlay_reason_label(reason) + "。TARGET 已保持原样；可按原因调整配准/页面配对或转人工补漏。")
             self.experimental_result_status.setStyleSheet(self._tone_style("orange"))
 
-    def _update_mode_specific_controls(self):
-        """Expose only controls that belong to the currently selected renderer.
+    def _mode_summary_text(self, mode: str) -> str:
+        summaries = {
+            "direct_patch": "直接贴图 · SOURCE 中文在上、TARGET 日文在下 · 只写受控内层，TARGET 边框保持权威",
+            "mask_replace": "精准蒙版 · 只在气泡/文本框的安全蒙版内迁移 SOURCE 中文，背景和结构由 TARGET 保留",
+            "hybrid": "精准蒙版+OCR · 有任何蒙版候选就不自动 OCR；仅无蒙版区域或人工框选才使用 OCR",
+            "aligned_overlay_reveal": "整页对齐挖孔显中文 · 上层 TARGET 裁掉气泡/文本框，显示下层整页对齐 SOURCE",
+            "reletter": "OCR重排 · OCR 识别后重新排字；字体、断句和字号集中在下方折叠设置",
+            "transparent_bubble_reveal": "透明挖孔 · 真实修改 TARGET alpha 显示下层 SOURCE；与整页对齐挖孔路线完全独立",
+        }
+        return summaries.get(str(mode or ""), compact_mode_ui_label(str(mode or "direct_patch")))
 
-        This is UI-level isolation only; the core mode contract remains the final
-        authority. Hiding/locking unrelated settings prevents users from assuming
-        that changing a Reletter font can affect Direct/Mask output, or that a
-        Transparent-Reveal option is active while another mode is selected.
-        """
+    def _reorder_mode_sections(self, mode: str) -> None:
+        if not hasattr(self, "mode_card"):
+            return
+        layout = self.mode_card.layout
+        sections = [
+            getattr(self, "direct_clarity_section", None),
+            getattr(self, "direct_contract_section", None),
+            getattr(self, "hybrid_ocr_contract_section", None),
+            getattr(self, "reletter_section", None),
+            getattr(self, "transparent_section", None),
+            getattr(self, "semantic_section", None),
+        ]
+        for section in sections:
+            if section is not None:
+                layout.removeWidget(section)
+        order = {
+            "direct_patch": ["direct_clarity_section", "direct_contract_section", "semantic_section"],
+            "mask_replace": ["direct_clarity_section", "semantic_section"],
+            "hybrid": ["direct_clarity_section", "hybrid_ocr_contract_section", "reletter_section", "semantic_section"],
+            "reletter": ["reletter_section", "semantic_section"],
+            "aligned_overlay_reveal": ["semantic_section"],
+            "transparent_bubble_reveal": ["transparent_section", "semantic_section"],
+        }.get(mode, ["semantic_section"])
+        insert_at = 3  # mode selector + summary + compact core switches
+        for name in order:
+            section = getattr(self, name, None)
+            if section is not None:
+                layout.insertWidget(insert_at, section)
+                insert_at += 1
+
+    def _update_mode_specific_controls(self):
+        """Show a compact, mode-specific control surface without changing config semantics."""
         mode = str(self.mode.currentData() or "direct_patch") if hasattr(self, "mode") else "direct_patch"
-        if hasattr(self, "reletter_box"):
-            self.reletter_box.setVisible(mode in {"reletter", "hybrid"})
-        if hasattr(self, "direct_contract_box"):
-            self.direct_contract_box.setVisible(mode == "direct_patch")
-        if hasattr(self, "direct_clarity_box"):
-            self.direct_clarity_box.setVisible(mode in {"direct_patch", "mask_replace", "hybrid"})
+        if hasattr(self, "mode_summary"):
+            self.mode_summary.setText(self._mode_summary_text(mode))
+
+        # High-frequency rules: hidden when they do not apply instead of leaving
+        # disabled rows that consume vertical space.
+        diff_visible = mode in {"mask_replace", "hybrid", "reletter"}
+        exact_visible = mode in {"direct_patch", "mask_replace", "hybrid"}
+        if hasattr(self, "diff_check"):
+            self.diff_check.setVisible(diff_visible); self.diff_check.setEnabled(diff_visible)
+        if hasattr(self, "exact_check"):
+            self.exact_check.setVisible(exact_visible); self.exact_check.setEnabled(exact_visible)
+        if hasattr(self, "mode_core_box"):
+            self.mode_core_box.setVisible(diff_visible or exact_visible)
+
+        reletter_active = mode in {"reletter", "hybrid"}
+        if hasattr(self, "reletter_section"):
+            self.reletter_section.setVisible(reletter_active)
+        if hasattr(self, "direct_contract_section"):
+            self.direct_contract_section.setVisible(mode == "direct_patch")
+        clarity_active = mode in {"direct_patch", "mask_replace", "hybrid"}
+        if hasattr(self, "direct_clarity_section"):
+            self.direct_clarity_section.setVisible(clarity_active)
             self._update_direct_clarity_controls()
+        if hasattr(self, "hybrid_ocr_contract_section"):
+            self.hybrid_ocr_contract_section.setVisible(mode == "hybrid")
         if hasattr(self, "hybrid_ocr_contract_box"):
             self.hybrid_ocr_contract_box.setVisible(mode == "hybrid")
         transparent_active = mode == "transparent_bubble_reveal"
-        if hasattr(self, "transparent_box"):
-            self.transparent_box.setVisible(transparent_active)
+        if hasattr(self, "transparent_section"):
+            self.transparent_section.setVisible(transparent_active)
         for widget in getattr(self, "transparent_widgets", []):
             widget.setEnabled(transparent_active)
-        if hasattr(self, "diff_check"):
-            self.diff_check.setEnabled(mode in {"mask_replace", "hybrid", "reletter"})
-        if hasattr(self, "exact_check"):
-            self.exact_check.setEnabled(mode in {"direct_patch", "mask_replace", "hybrid"})
+        # Semantic analysis remains accessible as a collapsed advanced section;
+        # it does not occupy the screen unless explicitly opened.
+        if hasattr(self, "semantic_section"):
+            self.semantic_section.setVisible(True)
+
+        self._reorder_mode_sections(mode)
         if hasattr(self.window, "models") and hasattr(self.window.models, "apply_transfer_mode_ocr_lock"):
             self.window.models.apply_transfer_mode_ocr_lock(mode)
         if hasattr(self, "mode_card"):
@@ -1003,13 +1187,18 @@ class ProjectPage(QWidget):
             if not active:
                 self.direct_clarity_summary.setText("当前仅在 Direct / 精准蒙版 / 精准蒙版+OCR 模式下可用。")
             elif enabled:
-                self.direct_clarity_summary.setText(
-                    f"已启用：字边清晰 {self.direct_white_clarity_alpha_gamma.value():.2f} · "
-                    f"黑字强化 {int(self.direct_white_clarity_black_boost.value())} · "
-                    f"白底亮度 {int(self.direct_white_clarity_pure_white_floor.value())}"
+                detail = (
+                    f"字边 {self.direct_white_clarity_alpha_gamma.value():.2f} · "
+                    f"黑字 {int(self.direct_white_clarity_black_boost.value())} · "
+                    f"白底 {int(self.direct_white_clarity_pure_white_floor.value())}"
                 )
+                self.direct_clarity_summary.setText("已启用：" + detail)
+                if hasattr(self, "direct_clarity_section"):
+                    self.direct_clarity_section.setSummary("已启用 · " + detail)
             else:
                 self.direct_clarity_summary.setText("已关闭：白气泡将沿用当前模式原始像素贴图，不做漂白清底与字边增强。")
+                if hasattr(self, "direct_clarity_section"):
+                    self.direct_clarity_section.setSummary("已关闭 · 沿用当前模式原始 SOURCE 像素")
 
     def _refresh_reletter_font_catalog(self):
         if not hasattr(self,"reletter_font_catalog"):

@@ -86,6 +86,8 @@ def _active_mode_private_file_checks(package_root: Path) -> dict[str, bool]:
         "reletter_private_stack": all((modes_root / "reletter" / f).exists() for f in ("executor.py","binding.py","regions.py","flow_cells.py","layout_policy.py","text_transfer.py","ocr_edit_blocks.py","ocr_edit_render.py","lettering_ops.py","manual_effect_ops.py","masking_ops.py","inpainting_ops.py","ocr_cleanup.py")),
         "direct_private_runtime_stack": all((modes_root / "direct_patch" / f).exists() for f in ("masking_ops.py","inpainting_ops.py","pixel_stage.py","execution_stage.py")),
         "mask_private_runtime_stack": all((modes_root / "mask_replace" / f).exists() for f in ("masking_ops.py","inpainting_ops.py","pixel_stage.py","execution_stage.py")),
+        "mask_private_open_text_tool": (modes_root / "mask_replace" / "open_text_manual.py").exists(),
+        "hybrid_private_open_text_tool": (modes_root / "hybrid" / "open_text_manual.py").exists(),
         "hybrid_private_stage_stack": all((modes_root / "hybrid" / f).exists() for f in ("pixel_stage.py","execution_stage.py")),
         "reletter_private_stage_stack": all((modes_root / "reletter" / f).exists() for f in ("pixel_stage.py","execution_stage.py")),
         "aligned_private_stack": all((modes_root / "aligned_overlay_reveal" / f).exists() for f in ("renderer.py","core.py","hole_renderer.py","bridge.py","validator.py","contract.py","runner.py")),

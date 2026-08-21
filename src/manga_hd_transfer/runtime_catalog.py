@@ -57,6 +57,23 @@ def probe_components(config: PipelineConfig | None = None, *, deep: bool = False
 
     rows: dict[str, ComponentStatus] = {}
     rows["mps"] = ComponentStatus("mps", "Apple MPS", mps_ready, torch_ok, mps_detail, "accelerator")
+    if deep and torch_ok:
+        from .runtime import device_info
+        cuda_dev = device_info("cuda")
+        cuda_ready = bool(cuda_dev.selected == "cuda" and cuda_dev.available)
+        cuda_detail = f"{cuda_dev.name} · {cuda_dev.note}"
+    else:
+        # A shallow GUI refresh must never claim CUDA is ready merely because
+        # the torch package exists.  Real CUDA availability is verified by the
+        # background deep probe / job startup without blocking the GUI.
+        cuda_ready = False
+        if not torch_ok:
+            cuda_detail = "PyTorch 未安装。"
+        elif platform.system() == "Darwin":
+            cuda_detail = "macOS Studio 默认使用 Apple MPS；Windows/Linux NVIDIA 显卡在任务启动时再验证。"
+        else:
+            cuda_detail = "PyTorch 已检测；任务启动时再验证 NVIDIA CUDA，失败自动回退 CPU。"
+    rows["cuda"] = ComponentStatus("cuda", "NVIDIA CUDA", cuda_ready, torch_ok, cuda_detail, "accelerator")
     local_models = model_local_paths()
     lg_weights = local_models["lightglue"].is_file()
     loftr_weights = local_models["loftr"].is_file()

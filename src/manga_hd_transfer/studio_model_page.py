@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox, QLineEdit, QProgressBar, QButtonGroup, QCheckBox,
 )
 
-from .gui_components import Card, OptionRow, StableComboBox
+from .gui_components import Card, OptionRow, StableComboBox, StableSpinBox, StableDoubleSpinBox
 from .gui_workers import ComponentProbeWorker, ModelDownloadWorker, DependencyInstallWorker, ModelNetworkProbeWorker
 from .model_downloads import (
     apply_config_updates, model_home, model_local_paths, import_builtin_model,
@@ -33,6 +33,8 @@ from .platform_support import desktop_platform_summary, platform_family
 from .mode_contracts import get_mode_contract
 
 QComboBox = StableComboBox
+QSpinBox = StableSpinBox
+QDoubleSpinBox = StableDoubleSpinBox
 
 logger = logging.getLogger(__name__)
 
@@ -430,7 +432,7 @@ class ModelPage(QWidget):
         self.mps_memory_label.setVisible(self._platform_family == "macos"); self.mps_fraction.setVisible(self._platform_family == "macos")
         hardware_layout.addLayout(hform)
         self.device_status = QLabel(); self.device_status.setObjectName("hint"); self.device_status.setWordWrap(True); hardware_layout.addWidget(self.device_status)
-        route = QLabel("自动按平台使用 MPS / CUDA；不可用时回退 CPU。整册 Worker 常驻，模型只加载一次。")
+        route = QLabel("自动按平台使用 Mac Apple MPS / Windows·Linux NVIDIA CUDA；不可用时自动回退 CPU。整册 Worker 常驻，模型只加载一次。")
         route.setObjectName("quiet"); route.setWordWrap(True); hardware_layout.addWidget(route)
         hardware_layout.addStretch(1)
         self.start_processing = QPushButton("处理当前页"); self.start_processing.setObjectName("softPrimary"); self.start_processing.setMinimumHeight(36)
@@ -995,12 +997,14 @@ class ModelPage(QWidget):
     def _apply_probe_statuses(self, statuses):
         cfg=self.window.state.config
         mps=statuses["mps"]
+        cuda=statuses.get("cuda")
         if self._platform_family == "macos":
             selected=cfg.runtime.device.upper() if cfg.runtime.device != "auto" else ("MPS" if mps.ready else "CPU / 自动")
             detail=mps.detail
         else:
-            selected=cfg.runtime.device.upper() if cfg.runtime.device != "auto" else "CUDA / CPU 自动"
-            detail="CUDA 可用性在任务启动时由 PyTorch 验证；不可用时自动回退 CPU。"
+            auto_selected = "CUDA" if bool(cuda and cuda.ready) else "CPU / 自动"
+            selected=cfg.runtime.device.upper() if cfg.runtime.device != "auto" else auto_selected
+            detail=(cuda.detail if cuda is not None else "CUDA 可用性在任务启动时由 PyTorch 验证；不可用时自动回退 CPU。")
         self.device_status.setText(f"计划设备：{selected} · {detail}")
         try:
             selected_key=str(self.paddle_model_profile.currentData() or getattr(cfg.ocr,"paddle_model_profile","ppocr_v6_medium"))

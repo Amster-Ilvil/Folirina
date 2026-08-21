@@ -10,6 +10,7 @@ from typing import Iterable, Any
 
 from .io_utils import load_json, save_json, write_image
 from .schema_compat import as_dict, normalize_project
+from .review_artifacts import STATIC_REVIEW_INPUTS, dynamic_review_artifact_names
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,62 +38,236 @@ _RUN_SNAPSHOT_FILES = (
     "hybrid_text_layer.png", "hybrid_text_layer_reviewed.png", "reletter_text_layer.png", "reletter_text_layer_reviewed.png", "reletter.json",
     "direct_patch_layer.png", "direct_patch_layer_reviewed.png", "direct_patch_regions.png", "direct_patch.json",
     "aligned_overlay_reveal.json", "aligned_overlay_reveal_layer.png", "aligned_overlay_reveal_mask.png",
+    "aligned_overlay_reveal_hole_mask.png", "aligned_overlay_reveal_erase_mask.png",
+    "aligned_overlay_reveal_regions.png", "aligned_overlay_reveal_source_ink.png",
+    "aligned_overlay_reveal_diff_mask.png", "aligned_overlay_reveal_judgment.png",
+    "aligned_overlay_reveal_validation.json",
     "transparent_bubble_reveal.json", "final_rgba.png", "jp_layer_rgba.png", "cn_layer_rgb.png",
     "target_layer_erase_base.png", "target_layer_erase_effective_mask.png", "target_layer_erase_preview.png", "target_layer_erase.json",
     "target_layer_restore_base.png", "target_layer_restore_effective_mask.png", "target_layer_restore_preview.png", "target_layer_restore.json",
-)
+) + STATIC_REVIEW_INPUTS
+
+# These paths are written in-place by the frozen Aligned Reveal compatibility
+# renderer. They must be real copies in a rollback snapshot; a hard link would
+# share the same inode and be truncated together with the live artifact.
+_RUN_SNAPSHOT_COPY_NAMES = {
+    "final.png", "review_preview.png",
+    # The isolated Direct compatibility renderer still encodes directly into
+    # these published files. Keep the frozen renderer untouched and make the
+    # transaction boundary copy-on-snapshot instead.
+    "direct_patch_layer.png", "direct_patch_regions.png",
+    "aligned_overlay_reveal_layer.png", "aligned_overlay_reveal_mask.png",
+    "aligned_overlay_reveal_hole_mask.png", "aligned_overlay_reveal_erase_mask.png",
+    "aligned_overlay_reveal_regions.png", "aligned_overlay_reveal_source_ink.png",
+    "aligned_overlay_reveal_diff_mask.png", "aligned_overlay_reveal_judgment.png",
+    "jp_layer_rgba.png", "cn_layer_rgb.png",
+}
 
 
-def create_run_snapshot(page_dir: str | Path, run_id: str) -> Path | None:
+def create_run_snapshot(page_dir: str | Path, run_id: str) -> Path:
+    """Snapshot the full published-state *presence contract* for one page run.
+
+    The caller must already hold :class:`PageRunGuard`.  This keeps the backup at
+    one coherent point in time instead of racing a concurrent writer.  A failed
+    snapshot creation is self-cleaning: a partial ``.run_backup`` directory must
+    never accumulate or later be mistaken for a recoverable transaction.
+
+    Large image artifacts use hard links because Folirina publishes them through
+    atomic sibling replacement. JSON metadata is copied instead: a few frozen or
+    compatibility writers still truncate JSON in place, which would mutate a
+    hard-linked backup inode and make rollback ineffective.
+    """
     page_dir = Path(page_dir)
-    existing = [page_dir / name for name in _RUN_SNAPSHOT_FILES if (page_dir / name).exists()]
-    if not existing:
-        return None
     backup = page_dir / ".run_backup" / str(run_id)
     backup.mkdir(parents=True, exist_ok=True)
-    manifest = []
-    for src in existing:
-        dst = backup / src.name
+    manifest: list[dict[str, Any]] = []
+    try:
+        snapshot_names = tuple(dict.fromkeys((*_RUN_SNAPSHOT_FILES, *dynamic_review_artifact_names(page_dir))))
+        for name in snapshot_names:
+            src = page_dir / name
+            existed = src.exists() and src.is_file()
+            row: dict[str, Any] = {"name": name, "existed": bool(existed), "method": "absent"}
+            if existed:
+                dst = backup / name
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if src.suffix.casefold() == ".json" or name in _RUN_SNAPSHOT_COPY_NAMES:
+                    shutil.copy2(src, dst)
+                    row["method"] = "copy"
+                else:
+                    try:
+                        # Atomic image publication replaces the destination inode, so
+                        # a hard link safely preserves the old image at near-zero cost.
+                        os.link(src, dst)
+                        row["method"] = "hardlink"
+                    except OSError:
+                        shutil.copy2(src, dst)
+                        row["method"] = "copy"
+            manifest.append(row)
+        # The review archive is recovery state too. A mode switch may publish
+        # an archive successfully and then fail later in the renderer/commit
+        # path. Snapshot the whole small archive tree so rollback restores the
+        # page *and* its recovery history to the exact pre-run state.
+        archive_root = page_dir / "review_archive"
+        archive_backup = backup / "review_archive"
+        if archive_root.is_symlink():
+            raise RuntimeError("unsafe review_archive symlink")
+        archive_existed = archive_root.exists() and archive_root.is_dir()
+        if archive_root.exists() and not archive_existed:
+            raise RuntimeError("review_archive exists but is not a directory")
+        archive_files: list[dict[str, Any]] = []
+        if archive_existed:
+            for src in sorted(archive_root.rglob("*")):
+                if not src.is_file() or src.is_symlink():
+                    continue
+                rel = src.relative_to(archive_root)
+                dst = archive_backup / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if src.suffix.casefold() == ".json":
+                    shutil.copy2(src, dst)
+                    method = "copy"
+                else:
+                    try:
+                        os.link(src, dst)
+                        method = "hardlink"
+                    except OSError:
+                        shutil.copy2(src, dst)
+                        method = "copy"
+                archive_files.append({"name": rel.as_posix(), "method": method})
+
+        save_json(backup / "manifest.json", {
+            "schema": "manga_hd_translation_transfer.run_snapshot.v3",
+            "files": manifest,
+            "review_archive": {
+                "existed": bool(archive_existed),
+                "files": archive_files,
+            },
+        })
+        return backup
+    except Exception:
+        # A snapshot without a complete manifest is not a safe recovery point.
+        shutil.rmtree(backup, ignore_errors=True)
+        parent = backup.parent
         try:
-            # Hard links make the temporary safety snapshot essentially free on
-            # the normal same-volume workspace; copy is the portable fallback.
-            os.link(src, dst)
-            method = "hardlink"
+            if parent.exists() and not any(parent.iterdir()):
+                parent.rmdir()
         except OSError:
-            shutil.copy2(src, dst)
-            method = "copy"
-        manifest.append({"name": src.name, "method": method})
-    save_json(backup / "manifest.json", {"files": manifest})
-    return backup
+            pass
+        raise
+
+
+def run_snapshot_has_existing(backup: str | Path | None) -> bool:
+    if not backup:
+        return False
+    path = Path(backup) / "manifest.json"
+    try:
+        payload = load_json(path) if path.exists() else {}
+        rows = payload.get("files", []) if isinstance(payload, dict) else []
+        return any(bool(row.get("existed", True)) for row in rows if isinstance(row, dict))
+    except Exception:
+        return False
 
 
 def restore_run_snapshot(page_dir: str | Path, backup: str | Path | None) -> dict[str, Any]:
+    """Restore a run snapshot and report whether recovery was complete.
+
+    A backup is discarded only when ``success`` is true.  Any unreadable
+    manifest, missing expected backup artifact, failed replacement, or failed
+    removal of a file that was absent before the run keeps the snapshot around
+    for manual recovery and diagnostics.
+    """
     page_dir = Path(page_dir)
+    failed: list[dict[str, str]] = []
     if not backup:
-        return {"restored": 0, "backup": ""}
+        return {"restored": 0, "removed_new": 0, "failed": failed, "success": True, "backup": ""}
     backup = Path(backup)
     if not backup.exists():
-        return {"restored": 0, "backup": str(backup)}
-    restored = 0
+        failed.append({"name": "manifest.json", "operation": "locate_backup", "error": "backup_missing"})
+        return {"restored": 0, "removed_new": 0, "failed": failed, "success": False, "backup": str(backup)}
+
+    manifest_path = backup / "manifest.json"
     try:
-        payload = load_json(backup / "manifest.json") if (backup / "manifest.json").exists() else {}
+        if not manifest_path.exists():
+            raise FileNotFoundError(manifest_path)
+        payload = load_json(manifest_path)
         rows = payload.get("files", []) if isinstance(payload, dict) else []
-    except Exception:
-        rows = []
+        if not isinstance(rows, list):
+            raise ValueError("snapshot manifest files must be a list")
+    except Exception as exc:
+        failed.append({"name": "manifest.json", "operation": "read_manifest", "error": f"{type(exc).__name__}: {exc}"})
+        return {"restored": 0, "removed_new": 0, "failed": failed, "success": False, "backup": str(backup)}
+
+    restored = 0
+    removed_new = 0
+
+    # v3 snapshots also cover the recovery archive itself. A failed mode switch
+    # must not leave a newly-created or partially-overwritten review_archive
+    # behind after the live review inputs have been restored.
+    archive_contract = payload.get("review_archive") if isinstance(payload, dict) else None
+    if isinstance(archive_contract, dict):
+        archive_dst = page_dir / "review_archive"
+        archive_src = backup / "review_archive"
+        archive_existed = bool(archive_contract.get("existed", False))
+        archive_rows = archive_contract.get("files", [])
+        if not isinstance(archive_rows, list):
+            failed.append({"name": "review_archive", "operation": "parse_manifest", "error": "archive files must be a list"})
+        else:
+            try:
+                if archive_dst.exists():
+                    if archive_dst.is_symlink() or not archive_dst.is_dir():
+                        raise NotADirectoryError(archive_dst)
+                    shutil.rmtree(archive_dst)
+                if archive_existed:
+                    archive_dst.mkdir(parents=True, exist_ok=True)
+                    for archive_row in archive_rows:
+                        rel_name = str(archive_row.get("name") or "") if isinstance(archive_row, dict) else ""
+                        rel = Path(rel_name)
+                        if (not rel_name or rel.is_absolute() or ".." in rel.parts):
+                            raise ValueError(f"unsafe review_archive entry: {rel_name!r}")
+                        src = archive_src / rel
+                        dst = archive_dst / rel
+                        if not src.is_file():
+                            raise FileNotFoundError(src)
+                        _atomic_copy(src, dst)
+                elif archive_dst.exists():
+                    shutil.rmtree(archive_dst)
+            except (OSError, ValueError) as exc:
+                failed.append({"name": "review_archive", "operation": "restore_tree", "error": f"{type(exc).__name__}: {exc}"})
+
     for row in rows:
         name = str(row.get("name") or "") if isinstance(row, dict) else ""
         if not name:
-            continue
-        src = backup / name
-        if not src.exists():
+            failed.append({"name": "", "operation": "parse_manifest", "error": "empty artifact name"})
             continue
         dst = page_dir / name
+        # v1 manifests did not carry ``existed``; every listed row represented
+        # an existing source and therefore remains backward-compatible here.
+        existed = bool(row.get("existed", True)) if isinstance(row, dict) else True
+        if not existed:
+            try:
+                if dst.exists():
+                    if not dst.is_file():
+                        raise IsADirectoryError(dst)
+                    dst.unlink()
+                    removed_new += 1
+            except OSError as exc:
+                failed.append({"name": name, "operation": "remove_new", "error": f"{type(exc).__name__}: {exc}"})
+            continue
+        src = backup / name
+        if not src.exists() or not src.is_file():
+            failed.append({"name": name, "operation": "restore", "error": "backup_artifact_missing"})
+            continue
         try:
             _atomic_copy(src, dst)
             restored += 1
-        except OSError:
-            pass
-    return {"restored": restored, "backup": str(backup)}
+        except OSError as exc:
+            failed.append({"name": name, "operation": "restore", "error": f"{type(exc).__name__}: {exc}"})
+    return {
+        "restored": restored,
+        "removed_new": removed_new,
+        "failed": failed,
+        "success": not failed,
+        "backup": str(backup),
+    }
 
 
 def discard_run_snapshot(backup: str | Path | None) -> None:
@@ -222,6 +397,17 @@ def _atomic_copy(src: Path, dst: Path) -> None:
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def atomic_copy_file(src: str | Path, dst: str | Path) -> Path:
+    """Atomically publish an existing file to another visible path."""
+    source = Path(src)
+    target = Path(dst)
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(source)
+    if source.resolve() != target.resolve():
+        _atomic_copy(source, target)
+    return target
 
 
 def ensure_manual_baseline(page_dir: str | Path, preferred_source: str | Path | None = None) -> Path:
