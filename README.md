@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/folirina_banner/part_00.jpg" alt="Folirina — Manga Translation Transfer Studio" width="12.5%"><img src="assets/folirina_banner/part_01.jpg" alt="" width="12.5%"><img src="assets/folirina_banner/part_02.jpg" alt="" width="12.5%"><img src="assets/folirina_banner/part_03.jpg" alt="" width="12.5%"><img src="assets/folirina_banner/part_04.jpg" alt="" width="12.5%"><img src="assets/folirina_banner/part_05.jpg" alt="" width="12.5%"><img src="assets/folirina_banner/part_06.jpg" alt="" width="12.5%"><img src="assets/folirina_banner/part_07.jpg" alt="" width="12.5%">
+  <img src="assets/folirina_banner.png" alt="Folirina — Manga Translation Transfer Studio" width="100%">
 </p>
 
 <h1 align="center">Folirina</h1>
