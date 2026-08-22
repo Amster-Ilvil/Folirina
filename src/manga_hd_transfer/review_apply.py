@@ -28,6 +28,7 @@ from .review_target_layer import (
     apply_target_layer_erase_review, reset_target_layer_erase_review,
     apply_target_layer_restore_review, reset_target_layer_restore_review,
 )
+from .review_clear_mask import project_automatic_clear_mask
 from .review_common import (
     _dict_or_empty, _route_meta, _dict_rows, _text_block, _text_unit, _load_target_bubbles,
     _rect_mask, _clear_region_to_paper, _source_for_review, _polygon_mask,
@@ -89,6 +90,10 @@ def _load_effective_clear_mask(page_dir: Path, shape: tuple[int, int]) -> tuple[
             continue
         base = (mask > 0).astype(np.uint8) * 255
         source = label
+        if label in {"target_clear_mask", "clear_mask"}:
+            base, projection = project_automatic_clear_mask(page_dir, base, source_name=label)
+            if bool(projection.get("projected")):
+                source = f"{label}:layout_seeded_text_projection"
         break
 
     additive = page_dir / "manual_japanese_clear_mask.png"
@@ -426,8 +431,14 @@ def _apply_mask_replace_review(page_dir: Path, project: dict, cfg: PipelineConfi
                 continue
             probe = cv2.imread(str(candidate), cv2.IMREAD_GRAYSCALE)
             if probe is not None and probe.shape == target.shape[:2]:
-                auto_clear = (probe > 0).astype(np.uint8) * 255
+                raw_auto = (probe > 0).astype(np.uint8) * 255
+                auto_clear, _auto_projection = project_automatic_clear_mask(
+                    page_dir, raw_auto, target=target, source_name=candidate.name
+                )
                 break
+        # Compare reviewer edits against the *review-safe automatic baseline*,
+        # not the renderer's broad container/write mask. Merely opening/saving
+        # the mask editor must therefore be a no-op on final pixels.
         clear_delta = cv2.absdiff((effective_clear > 0).astype(np.uint8) * 255, auto_clear)
         if cv2.countNonZero(clear_delta) > 0:
             # Small halo covers antialiased glyph edges affected by local inpaint.
@@ -438,13 +449,11 @@ def _apply_mask_replace_review(page_dir: Path, project: dict, cfg: PipelineConfi
         base = inpaint_image(target, effective_clear, cfg.inpainting).image
         heat, residual_diag = _residual_dark_heatmap(target, base, effective_clear)
         write_image(page_dir / "japanese_residual_heatmap.png", heat)
-        # The original transfer layer alpha contains both Chinese glyphs and the
-        # automatically cleared paper. When the user erases part of the clear
-        # overlay, keep only real dark Chinese raster there; otherwise the old
-        # white clear patch would silently override the manual erase.
-        pgray = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2GRAY)
-        glyph_alpha = np.where((original_alpha > 0) & (pgray <= 232), original_alpha, 0).astype(np.uint8)
-        alpha = np.maximum(glyph_alpha, np.minimum(alpha, effective_clear))
+        # TARGET clear authority and SOURCE write authority are independent.
+        # Do not shrink transfer alpha when the clear mask is narrowed: doing so
+        # re-exposes old Japanese under an otherwise-correct Direct/Mask patch.
+        # Explicit "恢复 TARGET 日文层" is the inverse tool and owns removal of
+        # Chinese/write authority in regions that should stay Japanese.
     else:
         base = target.copy()
 
@@ -516,8 +525,13 @@ def _apply_mask_replace_review(page_dir: Path, project: dict, cfg: PipelineConfi
     text_rgba = make_text_layer_rgba(target.shape[:2], manual_masks, color=cfg.lettering.fill)
     text_path = page_dir / "text_layer_reviewed.png"
     write_rgba(text_path, text_rgba)
-    export_openraster(page_dir / "editable_reviewed.ora", target, base, text_rgba, transfer_rgba)
-    psd_ok = export_psd_imagemagick(page_dir / "editable_reviewed.psd", page_dir / "target_original.png", reviewed_base_path, text_path, transfer_reviewed)
+    psd_ok = False
+    if bool(getattr(cfg.export, "layer_bundle", False)):
+        export_openraster(page_dir / "editable_reviewed.ora", target, base, text_rgba, transfer_rgba)
+        psd_ok = export_psd_imagemagick(page_dir / "editable_reviewed.psd", page_dir / "target_original.png", reviewed_base_path, text_path, transfer_reviewed)
+    else:
+        (page_dir / "editable_reviewed.ora").unlink(missing_ok=True)
+        (page_dir / "editable_reviewed.psd").unlink(missing_ok=True)
 
     unresolved = [
         x for x in review_queue
@@ -825,8 +839,8 @@ def rerun_page_with_force(page_dir: str | Path, mode: str, config: PipelineConfi
     return result
 
 
-@guarded_page_write("review_apply")
-def apply_review_page(page_dir: str | Path, config: PipelineConfig | None = None) -> Path:
+@guarded_page_write("review_apply_core")
+def _apply_review_page_core(page_dir: str | Path, config: PipelineConfig | None = None) -> Path:
     page_dir = Path(page_dir)
     cfg = config or PipelineConfig()
     override_path = page_dir / "review_overrides.json"
@@ -988,9 +1002,14 @@ def apply_review_page(page_dir: str | Path, config: PipelineConfig | None = None
     text_rgba = make_text_layer_rgba(target.shape[:2], masks, color=cfg.lettering.fill)
     write_rgba(text_path, text_rgba)
     transfer_rgba = cv2.cvtColor(effect_layer, cv2.COLOR_BGRA2RGBA) if np.any(effect_layer[:, :, 3] > 0) else None
-    export_openraster(page_dir / "editable_reviewed.ora", target, inpainted, text_rgba, transfer_rgba)
     transfer_path = page_dir / "manual_effect_transfer_layer.png" if transfer_rgba is not None else None
-    psd_ok = export_psd_imagemagick(page_dir / "editable_reviewed.psd", page_dir / "target_original.png", inpainted_path, text_path, transfer_path)
+    psd_ok = False
+    if bool(getattr(cfg.export, "layer_bundle", False)):
+        export_openraster(page_dir / "editable_reviewed.ora", target, inpainted, text_rgba, transfer_rgba)
+        psd_ok = export_psd_imagemagick(page_dir / "editable_reviewed.psd", page_dir / "target_original.png", inpainted_path, text_path, transfer_path)
+    else:
+        (page_dir / "editable_reviewed.ora").unlink(missing_ok=True)
+        (page_dir / "editable_reviewed.psd").unlink(missing_ok=True)
     save_json(
         page_dir / "review_applied.json",
         {
@@ -1011,3 +1030,224 @@ def apply_review_page(page_dir: str | Path, config: PipelineConfig | None = None
         },
     )
     return _commit_reviewed_result(page_dir, final_path)
+
+
+def _ocr_replay_modules(mode: str):
+    key = str(mode or "").strip().lower()
+    if key == "hybrid":
+        from .modes.hybrid import ocr_edit_blocks as blocks
+        from .modes.hybrid import ocr_edit_render as renderer
+        return blocks, renderer
+    if key == "reletter":
+        from .modes.reletter import ocr_edit_blocks as blocks
+        from .modes.reletter import ocr_edit_render as renderer
+        return blocks, renderer
+    from . import ocr_edit_blocks as shared_blocks
+    if shared_blocks.is_ocr_edit_mode(key):
+        from . import ocr_edit_render as shared_renderer
+        return shared_blocks, shared_renderer
+    return None, None
+
+
+def clear_ocr_review_blocks(page_dir: str | Path, config: PipelineConfig | None = None) -> Path:
+    """Remove *only* the manual OCR overlay and preserve every other review pixel.
+
+    Manual OCR is a late review overlay.  Immediately before the overlay is
+    rendered, :func:`apply_review_page` stores the exact no-OCR composite in the
+    OCR scope's ``base.png``.  That raster already contains the automatic mode
+    result plus durable Region/brush/restore edits.  Clearing OCR must therefore
+    restore that exact raster; rebuilding the page from TARGET/final_auto can
+    silently discard earlier replacement work (the v2.3.75 regression).
+
+    Safety contract:
+      * trusted ``base.png`` -> restore it byte-for-pixel, then clear OCR state;
+      * missing/invalid base -> fail closed before changing anything;
+      * automatic mode-owned artifacts are never touched;
+      * if publication fails, blocks and visible review artifacts roll back.
+    """
+    page_dir = Path(page_dir)
+    cfg = config or PipelineConfig()
+    project_path = page_dir / "project.json"
+    if not project_path.exists():
+        raise FileNotFoundError("当前页缺少 project.json，无法清空人工 OCR。")
+    project = normalize_project(load_json(project_path))
+    mode = str(_dict_or_empty(project.get("meta")).get("transfer_mode", "") or cfg.transfer.mode or "").strip().lower()
+    blocks_mod, _renderer_mod = _ocr_replay_modules(mode)
+    if blocks_mod is None:
+        raise ValueError(f"当前模式不支持人工 OCR：{mode or 'unknown'}")
+
+    rows = list(blocks_mod.load_ocr_blocks(page_dir, mode))
+    if not rows:
+        reviewed = page_dir / "final_reviewed.png"
+        return reviewed if reviewed.exists() else page_dir / "final.png"
+
+    scope_dir = Path(blocks_mod.ocr_edit_dir(page_dir, mode))
+    base_path = scope_dir / "base.png"
+    base_state_path = scope_dir / "base_state.json"
+    if not base_path.exists() or not base_state_path.exists():
+        raise RuntimeError(
+            "人工 OCR 的无 OCR 基线缺失；为避免把之前的替换/区域编辑恢复成日文，已拒绝清空。"
+            "请先重新应用一次当前人工 OCR，使程序重建安全基线后再清空。"
+        )
+    try:
+        base_state = load_json(base_state_path)
+    except Exception as exc:
+        raise RuntimeError("人工 OCR 基线状态损坏；为保护已有替换结果，已拒绝清空。") from exc
+    if str(base_state.get("schema") or "") != "folirina.ocr_edit.base.v2":
+        raise RuntimeError("人工 OCR 基线版本不可验证；为保护已有替换结果，已拒绝清空。")
+    state_mode = str(base_state.get("mode") or mode).strip().lower()
+    if state_mode and state_mode != mode:
+        raise RuntimeError("人工 OCR 基线属于其他处理模式；为保护已有替换结果，已拒绝清空。")
+
+    target_path = page_dir / "target_original.png"
+    if not target_path.exists():
+        raise FileNotFoundError("当前页缺少 target_original.png，无法验证人工 OCR 基线。")
+    no_ocr = read_image(base_path)
+    target = read_image(target_path)
+    if no_ocr.shape != target.shape:
+        raise RuntimeError("人工 OCR 基线尺寸与当前页面不一致；为保护已有替换结果，已拒绝清空。")
+
+    blocks_path = Path(blocks_mod.ocr_blocks_path(page_dir, mode))
+    mutable = [
+        blocks_path,
+        page_dir / "final_reviewed.png",
+        page_dir / "final.png",
+        page_dir / "review_sync.json",
+        page_dir / "review_replay.json",
+        project_path,
+    ]
+    previous: dict[Path, bytes | None] = {}
+    for path in mutable:
+        try:
+            previous[path] = path.read_bytes() if path.exists() else None
+        except OSError as exc:
+            raise RuntimeError(f"无法建立清空人工 OCR 的回滚快照：{path.name}") from exc
+
+    try:
+        # Publish the exact pre-OCR review composite.  Do not call
+        # apply_review_page() here: its core dispatcher is allowed to reconstruct
+        # from automatic/TARGET artifacts and was the source of the v2.3.75
+        # all-Japanese regression on Reveal pages.
+        blocks_mod.save_ocr_blocks(page_dir, mode, [])
+        reviewed = page_dir / "final_reviewed.png"
+        write_image(reviewed, no_ocr)
+        final = Path(commit_reviewed_result(page_dir, reviewed))
+        save_json(page_dir / "review_replay.json", {
+            "schema": "folirina.review_replay.v1",
+            "mode": mode,
+            "core": str(reviewed),
+            "ocr_applied": False,
+            "ocr_cleared": True,
+            "ocr_clear_restore": "exact_pre_ocr_review_base",
+            "ocr_clear_base": str(base_path),
+            "target_erase_replayed": False,
+            "target_restore_replayed": False,
+        })
+    except Exception:
+        # Restore exact bytes for every visible/state artifact touched above.
+        for path, payload in previous.items():
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if payload is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    tmp = path.with_name(path.name + ".ocr-clear-rollback.tmp")
+                    tmp.write_bytes(payload)
+                    tmp.replace(path)
+            except OSError:
+                pass
+        raise
+
+    # Only after the exact no-OCR result has been committed may the OCR raster
+    # caches be removed.  Keep blocks.json (now empty) and clear_state.json as the
+    # durable record.  Mode-owned automatic artifacts and non-OCR review state are
+    # intentionally outside this list.
+    for name in ("base.png", "base_state.json", "final.png", "render_state.json"):
+        try:
+            (scope_dir / name).unlink(missing_ok=True)
+        except OSError:
+            pass
+    save_json(scope_dir / "clear_state.json", {
+        "schema": "folirina.ocr_edit.clear_state.v2",
+        "mode": mode,
+        "cleared": True,
+        "cleared_block_count": len(rows),
+        "restore_policy": "exact_pre_ocr_review_base",
+        "final": str(final),
+    })
+    return final
+
+
+@guarded_page_write("review_apply")
+def apply_review_page(page_dir: str | Path, config: PipelineConfig | None = None) -> Path:
+    """Apply page review and deterministically replay durable downstream layers.
+
+    The core review compositor may rebuild the page from its automatic renderer
+    artifacts.  Manual OCR blocks and TARGET finishing brushes are durable user
+    decisions and must survive that rebuild.  Their fixed order is therefore:
+
+        core review -> manual OCR -> TARGET erase -> TARGET restore
+
+    TARGET restore is last by design: it is the explicit inverse authority that
+    says a region must remain the original Japanese TARGET.
+    """
+    page_dir = Path(page_dir)
+    cfg = config or PipelineConfig()
+    core_path = Path(_apply_review_page_core(page_dir, cfg))
+    project = normalize_project(load_json(page_dir / "project.json"))
+    mode = str(_dict_or_empty(project.get("meta")).get("transfer_mode", "") or cfg.transfer.mode or "").strip().lower()
+    current = core_path
+    replay_diag: dict[str, object] = {
+        "schema": "folirina.review_replay.v1",
+        "mode": mode,
+        "core": str(core_path),
+        "ocr_applied": False,
+        "target_erase_replayed": False,
+        "target_restore_replayed": False,
+    }
+
+    blocks_mod, renderer_mod = _ocr_replay_modules(mode)
+    rows = blocks_mod.load_ocr_blocks(page_dir, mode) if blocks_mod is not None else []
+    active_rows = [row for row in rows if str(row.get("render_text") or row.get("ocr_text") or "").strip()]
+    if renderer_mod is not None and active_rows:
+        # Inject the freshly rebuilt review result through the existing OCR base
+        # artifact contract instead of changing any mode-owned renderer API.
+        # Hybrid/Reletter private capsules therefore remain byte-identical.
+        scope_dir = Path(blocks_mod.ocr_edit_dir(page_dir, mode))
+        scope_dir.mkdir(parents=True, exist_ok=True)
+        replay_base = read_image(current)
+        write_image(scope_dir / "base.png", replay_base)
+        save_json(scope_dir / "base_state.json", {
+            "schema": "folirina.ocr_edit.base.v2",
+            "scope": scope_dir.name,
+            "mode": mode,
+            "rebuilt": True,
+            "reason": "review_replay_base_injection",
+            "source": str(current),
+        })
+        current = Path(renderer_mod.apply_ocr_edit_blocks(page_dir, project, cfg))
+        replay_diag["ocr_applied"] = True
+        replay_diag["ocr_block_count"] = len(active_rows)
+
+        # OCR is intentionally before TARGET finishing brushes. Reapply these
+        # masks over the fresh OCR result so residual-JP cleanup and exact TARGET
+        # restore remain the final authorities.
+        target = read_image(page_dir / "target_original.png")
+        rendered = read_image(current)
+        if (page_dir / "manual_target_layer_erase_mask.png").exists():
+            rendered, erase_diag = _apply_target_layer_erase_to_rendered(
+                page_dir, rendered, target, cfg, refresh_base=True
+            )
+            replay_diag["target_erase_replayed"] = bool(erase_diag.get("used"))
+            replay_diag["target_erase"] = erase_diag
+        if (page_dir / "manual_target_layer_restore_mask.png").exists():
+            rendered, restore_diag = _apply_target_layer_restore_to_rendered(
+                page_dir, rendered, target, refresh_base=True
+            )
+            replay_diag["target_restore_replayed"] = bool(restore_diag.get("used"))
+            replay_diag["target_restore"] = restore_diag
+        current = page_dir / "final_reviewed.png"
+        write_image(current, rendered)
+
+    save_json(page_dir / "review_replay.json", replay_diag)
+    return commit_reviewed_result(page_dir, current)

@@ -404,8 +404,13 @@ def _apply_manual_effect_only_review(page_dir: Path, project: dict, overrides: d
     empty_text = make_text_layer_rgba(target.shape[:2], [], color=cfg.lettering.fill)
     text_path = page_dir / "text_layer_reviewed.png"
     write_rgba(text_path, empty_text)
-    export_openraster(page_dir / "editable_reviewed.ora", target, clean_base, empty_text, cv2.cvtColor(layer, cv2.COLOR_BGRA2RGBA))
-    psd_ok = export_psd_imagemagick(page_dir / "editable_reviewed.psd", page_dir / "target_original.png", clean_path, text_path, transfer_path)
+    psd_ok = False
+    if bool(getattr(cfg.export, "layer_bundle", False)):
+        export_openraster(page_dir / "editable_reviewed.ora", target, clean_base, empty_text, cv2.cvtColor(layer, cv2.COLOR_BGRA2RGBA))
+        psd_ok = export_psd_imagemagick(page_dir / "editable_reviewed.psd", page_dir / "target_original.png", clean_path, text_path, transfer_path)
+    else:
+        (page_dir / "editable_reviewed.ora").unlink(missing_ok=True)
+        (page_dir / "editable_reviewed.psd").unlink(missing_ok=True)
     save_json(page_dir / "review_applied.json", {
         "mode": "manual_effect_only",
         "status": overrides.get("status", "reviewed_with_manual_effect"),

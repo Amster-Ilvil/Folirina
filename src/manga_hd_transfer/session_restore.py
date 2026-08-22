@@ -8,6 +8,7 @@ from .io_utils import load_json
 from .models import PagePair
 from .schema_compat import as_dict, normalize_project
 from .result_state import resolve_result_state
+from .pairing import pair_directories
 
 
 @dataclass(slots=True)
@@ -143,3 +144,31 @@ def scan_existing_results(selected_path: str | Path) -> RestoredSession:
         selected_path=selected.resolve(), output_root=output_root.resolve(), pages=restored,
         source_dir=_common_parent(source_files), target_dir=_common_parent(target_files), warnings=session_warnings,
     )
+
+
+def expand_restored_session_pairs(session: RestoredSession, pairing_config: Any) -> tuple[list[PagePair], list[str], list[str], bool]:
+    """Rebuild the full book pair list after restoring only completed pages.
+
+    ``scan_existing_results`` necessarily sees only page workspaces that already
+    exist.  Using that partial list as ``state.pairs`` made “继续处理整本” believe
+    a 200-page book had only (for example) 57 pages.  When the original SOURCE
+    and TARGET directories are still available, re-pair them immediately and
+    keep the restored page-root map only as the completed subset.
+    """
+    restored_pairs = [row.pair for row in session.pages]
+    if not session.source_dir or not session.target_dir:
+        return restored_pairs, [], [], False
+    try:
+        source_dir = Path(session.source_dir).expanduser()
+        target_dir = Path(session.target_dir).expanduser()
+        if not source_dir.is_dir() or not target_dir.is_dir():
+            return restored_pairs, [], [], False
+        pairs, us, ut = pair_directories(source_dir, target_dir, pairing_config)
+    except Exception:
+        return restored_pairs, [], [], False
+    # Never replace a valid restored set with a smaller/empty speculative pair
+    # result (portable page-local fallbacks can make source_dir/target_dir point
+    # inside output/pages rather than the original book directories).
+    if len(pairs) < len(restored_pairs):
+        return restored_pairs, [], [], False
+    return list(pairs), list(us), list(ut), len(pairs) > len(restored_pairs)

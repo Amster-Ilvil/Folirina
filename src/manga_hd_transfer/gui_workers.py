@@ -32,8 +32,11 @@ class PageActionWorker(QThread):
     done = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, label: str, action: Callable[[], object]):
-        super().__init__()
+    def __init__(self, label: str, action: Callable[[], object], parent=None):
+        # A QObject parent keeps the Python wrapper alive until Qt has delivered
+        # finished/deleteLater.  This matters for short page-local jobs where the
+        # dialog may otherwise be the only strong reference to the QThread.
+        super().__init__(parent)
         self.label = str(label)
         self.action = action
 

@@ -17,6 +17,7 @@ from .runtime import configure_runtime
 from .pipeline_passthrough import emit_passthrough_page
 from .pipeline_run_lifecycle import run_page_lifecycle
 from .pipeline_page_flow import run_page_flow
+from .pipeline_page_prep import prefetch_page_images
 from .pipeline_ocr_service import (
     build_ocr_backend_soft, recognize_cached, recognize_source_rectified_cached,
 )
@@ -212,6 +213,7 @@ class TransferPipeline:
         page_mark: PageMark | dict | None = None,
         cancel_cb=None,
         progress_cb=None,
+        prefetched_images=None,
     ) -> PageProject:
         """Single-page entry point for all transfer modes.
 
@@ -222,7 +224,8 @@ class TransferPipeline:
         """
         return run_page_lifecycle(
             config=self.config, pair=pair, page_root=page_root, final_path=final_path,
-            page_mark=page_mark, cancel_cb=cancel_cb, progress_cb=progress_cb, process_impl=self._process_page_impl,
+            page_mark=page_mark, cancel_cb=cancel_cb, progress_cb=progress_cb, prefetched_images=prefetched_images,
+            process_impl=self._process_page_impl,
             get_trace=lambda: getattr(self, "_run_trace", None),
             set_trace=lambda value: setattr(self, "_run_trace", value),
             version=__version__,
@@ -237,11 +240,13 @@ class TransferPipeline:
         page_mark: PageMark | dict | None = None,
         cancel_cb=None,
         progress_cb=None,
+        prefetched_images=None,
     ) -> PageProject:
         """Compatibility entry for the isolated single-page flow orchestrator."""
         return run_page_flow(
             config=self.config, pair=pair, page_root=page_root, final_path=final_path,
-            page_mark=page_mark, cancel_cb=cancel_cb, progress_cb=progress_cb, trace=getattr(self, "_run_trace", None),
+            page_mark=page_mark, cancel_cb=cancel_cb, progress_cb=progress_cb, prefetched_images=prefetched_images,
+            trace=getattr(self, "_run_trace", None),
             check_cancel=_check_cancel, passthrough_page=self._passthrough_page,
             get_source_backend=lambda: self.source_ocr,
             get_target_backend=lambda: self.target_ocr,
@@ -265,5 +270,5 @@ class TransferPipeline:
             cancelled_exception=PipelineCancelled, source_dir=source_dir,
             target_dir=target_dir, output_dir=output_dir, progress_cb=progress_cb,
             cancel_cb=cancel_cb, resume=resume, pairs_override=pairs_override,
-            page_marks=page_marks,
+            page_marks=page_marks, prefetch_page_images=prefetch_page_images,
         )

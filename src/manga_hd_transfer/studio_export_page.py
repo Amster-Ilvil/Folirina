@@ -5,6 +5,7 @@ from __future__ import annotations
 from PySide6.QtWidgets import QWidget, QLabel, QPushButton, QHBoxLayout, QVBoxLayout, QCheckBox, QMessageBox
 
 from .gui_components import Card, PathRow
+from .gui_dialogs import confirm_action
 from .workspace_cleanup import cleanup_output_workspace
 
 class ExportPage(QWidget):
@@ -37,16 +38,29 @@ class ExportPage(QWidget):
         self.window.state.config.export.save_debug=self.debug.isChecked()
         self.window.state.config.export.save_component_masks=self.component_masks.isChecked()
         self.window.state.config.export.layer_bundle=self.layers.isChecked()
+    def set_processing_busy(self, busy: bool) -> None:
+        self.run.setEnabled(not bool(busy))
+        self.cleanup.setEnabled(not bool(busy))
+
     def _cleanup_pages(self):
+        if self.window._busy_running():
+            QMessageBox.information(self, "任务进行中", "请等待当前处理、复核、模型维护或程序更新任务结束后再清理工作区。")
+            return
         out=str(self.window.state.output_dir or "").strip()
         if not out:
             QMessageBox.information(self,"没有输出目录","请先选择已有输出目录。")
             return
-        answer=QMessageBox.question(self,"清理冗余文件","将删除 pages 中可重新生成的 Debug、自动 ORA/PSD、inpainted 和逐组件 Mask。不会删除 final、原始页、Review/人工补漏结果。继续吗？")
-        if answer != QMessageBox.StandardButton.Yes:
+        if not confirm_action(
+            self, "清理冗余文件",
+            "将删除 pages 中可重新生成的 Debug、自动 ORA/PSD、inpainted 和逐组件 Mask。不会删除 final、原始页、Review/人工补漏结果。继续吗？",
+            confirm_text="清理",
+        ):
+            return
+        if self.window._busy_running():
+            QMessageBox.information(self, "任务状态已变化", "确认期间已有其它写任务启动；本次清理已取消。")
             return
         try:
-            stats=cleanup_output_workspace(out)
+            stats=cleanup_output_workspace(out, aggressive_component_masks=True)
             freed=float(stats.get("bytes_freed",0))/(1024**3)
             QMessageBox.information(self,"清理完成",f"扫描 {stats.get('pages_scanned',0)} 页，删除 {stats.get('files_removed',0)} 个文件，释放约 {freed:.2f} GB。")
         except Exception as exc:

@@ -20,6 +20,7 @@ COMMANDS = (
     ("compileall", [sys.executable, "-m", "compileall", "-q", "src", "tests", "tools", "scripts"]),
     ("pytest", [sys.executable, "-m", "pytest", "-q"]),
     ("architecture_audit", [sys.executable, "-m", "manga_hd_transfer.architecture_audit"]),
+    ("gui_interaction_audit", [sys.executable, "-m", "manga_hd_transfer.gui_interaction_audit"]),
     ("undefined_name_audit", [sys.executable, "tools/undefined_name_audit.py", "--strict"]),
     # Run filesystem/architecture health before importing the entire module
     # surface. On some native OpenCV builds, the all-module import probe can

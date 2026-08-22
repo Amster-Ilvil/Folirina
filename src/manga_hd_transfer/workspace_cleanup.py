@@ -26,7 +26,7 @@ def _review_queue_present(project: dict[str, Any]) -> bool:
     return False
 
 
-def cleanup_page_workspace(page_dir: str | Path, *, keep_review_preview: bool | None = None, keep_authority_alias: bool = False) -> dict[str, int]:
+def cleanup_page_workspace(page_dir: str | Path, *, keep_review_preview: bool | None = None, keep_authority_alias: bool = False, aggressive_component_masks: bool = False) -> dict[str, int]:
     """Remove reproducible diagnostics while preserving every manual-edit contract.
 
     This is deliberately conservative: originals, final/result-state files,
@@ -82,23 +82,29 @@ def cleanup_page_workspace(page_dir: str | Path, *, keep_review_preview: bool | 
             pass
 
     dirs_removed = 0
-    for name in ('masks', 'bubbles'):
-        d = root / name
-        if not d.exists() or not d.is_dir():
-            continue
-        try:
-            for p in d.rglob('*'):
-                if p.is_file():
-                    freed += int(p.stat().st_size)
-                    removed += 1
-            shutil.rmtree(d)
-            dirs_removed += 1
-        except OSError:
-            pass
+    # Component masks/bubble geometry are optional on disk, but when the user
+    # explicitly generated them they remain valuable review/replay authority.
+    # Automatic/page-finalization cleanup must never trade away that precision
+    # just to save space.  Only an explicitly aggressive maintenance action may
+    # remove them.
+    if aggressive_component_masks:
+        for name in ('masks', 'bubbles'):
+            d = root / name
+            if not d.exists() or not d.is_dir():
+                continue
+            try:
+                for child in d.rglob('*'):
+                    if child.is_file():
+                        freed += int(child.stat().st_size)
+                        removed += 1
+                shutil.rmtree(d)
+                dirs_removed += 1
+            except OSError:
+                pass
     return {'files_removed': removed, 'dirs_removed': dirs_removed, 'bytes_freed': freed}
 
 
-def cleanup_output_workspace(output_dir: str | Path) -> dict[str, int]:
+def cleanup_output_workspace(output_dir: str | Path, *, aggressive_component_masks: bool = False) -> dict[str, int]:
     root = Path(output_dir)
     pages = root / 'pages' if (root / 'pages').is_dir() else root
     total = {'pages_scanned': 0, 'files_removed': 0, 'dirs_removed': 0, 'bytes_freed': 0}
@@ -109,8 +115,43 @@ def cleanup_output_workspace(output_dir: str | Path) -> dict[str, int]:
     else:
         candidates = [p for p in pages.iterdir() if p.is_dir() and ((p / 'project.json').exists() or (p / 'target_original.png').exists())]
     for page in candidates:
-        row = cleanup_page_workspace(page)
+        row = cleanup_page_workspace(page, aggressive_component_masks=aggressive_component_masks)
         total['pages_scanned'] += 1
         for key in ('files_removed', 'dirs_removed', 'bytes_freed'):
             total[key] += int(row.get(key, 0))
     return total
+
+
+def page_has_active_review_state(page_dir: str | Path) -> bool:
+    root = Path(page_dir)
+    if (root / 'review_overrides.json').is_file():
+        return True
+    try:
+        project = as_dict(load_json(root / 'project.json')) if (root / 'project.json').is_file() else {}
+    except Exception:
+        project = {}
+    return _review_queue_present(project)
+
+
+def prune_stage_cache(page_dir: str | Path, *, preserve_review_pages: bool = True) -> dict[str, int | bool]:
+    """Delete only the recomputable ``.cache`` tree of a completed old page."""
+    root = Path(page_dir)
+    cache_dir = root / '.cache'
+    if not cache_dir.is_dir():
+        return {'pruned': False, 'bytes_freed': 0, 'files_removed': 0}
+    if preserve_review_pages and page_has_active_review_state(root):
+        return {'pruned': False, 'bytes_freed': 0, 'files_removed': 0}
+    total = 0
+    count = 0
+    try:
+        for child in cache_dir.rglob('*'):
+            if child.is_file():
+                try:
+                    total += int(child.stat().st_size)
+                    count += 1
+                except OSError:
+                    pass
+        shutil.rmtree(cache_dir)
+        return {'pruned': True, 'bytes_freed': total, 'files_removed': count}
+    except OSError:
+        return {'pruned': False, 'bytes_freed': 0, 'files_removed': 0}

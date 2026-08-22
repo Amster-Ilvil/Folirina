@@ -708,18 +708,53 @@ def _target_mask_is_white_container(target: np.ndarray, region_mask: np.ndarray,
     paper = white_container_paper_mask(target, region_u8, None)
     paper_ratio = float(cv2.countNonZero(paper) / max(1, pixels))
     gray = cv2.cvtColor(target, cv2.COLOR_BGR2GRAY) if target.ndim == 3 else target.astype(np.uint8)
-    vals = gray[region_u8 > 0]
-    robust_spread = float(np.percentile(vals, 90.0) - np.percentile(vals, 10.0)) if vals.size > 0 else 255.0
+    # Measure paper uniformity on the detected paper support rather than on the
+    # whole bubble. Japanese glyphs are intentionally dark and previously pushed
+    # the p10/p90 spread above the white-container threshold, making the white-
+    # bubble master switch ineffective on exactly the pages it was meant to own.
+    paper_vals = gray[(paper > 0) & (region_u8 > 0)]
+    robust_spread = float(np.percentile(paper_vals, 90.0) - np.percentile(paper_vals, 10.0)) if paper_vals.size > 0 else 255.0
     min_ratio = float(getattr(cfg, "white_container_full_clear_min_paper_ratio", 0.68))
     max_spread = float(getattr(cfg, "white_container_full_clear_max_robust_spread", 14.0))
-    ok = bool(paper_ratio >= min_ratio and robust_spread <= max_spread)
+    # A near-total white-paper support is itself strong evidence. JPEG edges,
+    # antialiased JP glyphs and photographed paper can keep the robust spread a
+    # little above the strict uniformity threshold even though >94% of the region
+    # is detected as white paper (real page 099 is ~99.6%).
+    high_paper_ratio = paper_ratio >= max(0.94, min_ratio)
+    ok = bool(paper_ratio >= min_ratio and (robust_spread <= max_spread or high_paper_ratio))
     return ok, {
         "is_white": ok,
-        "reason": "paper_ratio_and_spread" if ok else "not_uniform_white",
+        "reason": ("paper_ratio_high_confidence" if high_paper_ratio and robust_spread > max_spread else "paper_ratio_and_spread") if ok else "not_uniform_white",
         "paper_ratio": paper_ratio,
         "robust_spread": robust_spread,
         "min_paper_ratio": min_ratio,
         "max_robust_spread": max_spread,
+    }
+
+
+def _white_bubble_enhancement_policy(
+    target_image: np.ndarray,
+    target_region_mask: np.ndarray,
+    cfg: MaskReplaceConfig,
+) -> dict[str, object]:
+    """Resolve the white-bubble enhancement master switch for this private mode.
+
+    v2.3.67 makes the UI switch authoritative.  Previously disabling the
+    ``white-bubble Chinese enhancement`` path only disabled the newer clarity
+    normaliser while the photo-pair crisp/pixel/ink ladders could still rebuild
+    exactly the same Chinese glyphs.  A verified white TARGET container now has
+    one master policy: OFF means preserve the aligned SOURCE glyph raster and
+    bypass every optional glyph enhancement/reconstruction stage.  Japanese
+    clearing, mask geometry and TARGET structure restoration remain unaffected.
+    """
+    enabled = bool(getattr(cfg, "direct_white_clarity_enhance_enabled", False))
+    white_ok, white_diag = _target_mask_is_white_container(target_image, target_region_mask, cfg)
+    bypass = bool(white_ok and not enabled)
+    return {
+        "enabled": enabled,
+        "target_region": white_diag,
+        "master_bypass": bypass,
+        "policy": "enhance_enabled" if enabled else ("preserve_source_raster" if bypass else "not_white_container"),
     }
 
 
@@ -738,9 +773,14 @@ def _maybe_apply_white_source_clarity(
     separate target-space white-container mask. Never index an original SOURCE
     image with TARGET geometry when the editions have different dimensions.
     """
-    enabled = bool(getattr(cfg, "direct_white_clarity_enhance_enabled", True))
-    white_ok, white_diag = _target_mask_is_white_container(target_image, target_region_mask, cfg)
-    diag: dict[str, object] = {"enabled": enabled, "target_region": white_diag, "applied": False, "reason": "disabled" if not enabled else "target_not_white"}
+    policy = _white_bubble_enhancement_policy(target_image, target_region_mask, cfg)
+    enabled = bool(policy["enabled"])
+    white_ok = bool((policy.get("target_region") or {}).get("is_white", False))
+    diag: dict[str, object] = {
+        **policy,
+        "applied": False,
+        "reason": "disabled_master_bypass" if bool(policy.get("master_bypass")) else ("disabled" if not enabled else "target_not_white"),
+    }
     if not enabled or not white_ok:
         return source_image.copy(), diag
     sm = target_region_mask if source_region_mask is None else np.asarray(source_region_mask)
@@ -767,14 +807,18 @@ def _maybe_apply_white_source_clarity(
 def _hybrid_source_structure_guard(
     source: np.ndarray,
     source_mask: np.ndarray,
-    cfg: MaskReplaceConfig,
+    cfg: HybridMaskConfig,
 ) -> tuple[np.ndarray, dict[str, object]]:
-    """Reject SOURCE balloon outlines/tails/burst rays without touching glyphs.
+    """Protect SOURCE lettering while rejecting only actual boundary artwork.
 
-    The translated page is lettering authority, not structure authority.  This
-    guard only removes dark connected components that are both boundary-attached
-    and structurally line/art-like; compact CJK components stay untouched even
-    when they sit fairly close to the container edge.
+    v2.3.59 fixes an over-conservative failure mode where a bubble outline/ray and
+    nearby Chinese glyphs became one connected component.  Older code rejected
+    the *entire* component once any part touched the boundary, which silently
+    deleted valid SOURCE lettering.  Structural classification may still inspect
+    the whole component, but ordinary ambiguous components contribute only their
+    boundary-near pixels to the guard.  Only unmistakably thin/long line art may
+    be rejected as a whole.  Burst/spiky containers keep their explicit boundary
+    annulus so radial artwork remains SOURCE-structure, never lettering.
     """
     out = np.zeros(source_mask.shape, np.uint8)
     enabled = bool(getattr(cfg, "hybrid_source_structure_guard_enabled", True))
@@ -794,6 +838,14 @@ def _hybrid_source_structure_guard(
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (band_px * 2 + 1, band_px * 2 + 1))
     inner = cv2.erode(use, k, iterations=1)
     boundary = (use > 0) & (inner == 0)
+    # A wider annulus is used only for clipping ambiguous connected components.
+    # This prevents a border-connected CJK cluster from being deleted deep inside
+    # the speech balloon while still removing antialiased outline/tail fragments.
+    clip_px = max(band_px, min(max_px * 2, band_px * 2))
+    ck = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (clip_px * 2 + 1, clip_px * 2 + 1))
+    clip_inner = cv2.erode(use, ck, iterations=1)
+    boundary_clip = (use > 0) & (clip_inner == 0)
+
     gray = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY) if source.ndim == 3 else source.astype(np.uint8)
     vals = gray[use > 0]
     paper = float(np.percentile(vals, 78.0)) if vals.size else 245.0
@@ -805,6 +857,8 @@ def _hybrid_source_structure_guard(
     min_aspect = float(getattr(cfg, "hybrid_source_structure_min_aspect", 2.6))
     min_span = float(getattr(cfg, "hybrid_source_structure_min_span_ratio", 0.16))
     kept = 0
+    clipped_components = 0
+    full_line_components = 0
     for lab in range(1, n):
         x, y, ww, hh, area = [int(v) for v in stats[lab]]
         if area < min_area:
@@ -820,18 +874,32 @@ def _hybrid_source_structure_guard(
         large_art = bool(area >= max(36, int(round(region_area * 0.018))) and boundary_fraction >= 0.12)
         line_art = bool(boundary_fraction >= 0.18 and (aspect >= min_aspect or span >= min_span))
         outline_art = bool(boundary_fraction >= 0.10 and span >= 0.34 and fill <= 0.55)
-        if line_art or outline_art or large_art:
-            out[comp] = 255
+        if not (line_art or outline_art or large_art):
+            continue
+        # Only unmistakably thin/long rules/rays are safe to reject wholesale.
+        # Large mixed components are clipped to the boundary annulus because they
+        # may contain both the bubble outline and legitimate Chinese glyphs.
+        strong_line = bool(
+            aspect >= max(4.2, min_aspect * 1.55)
+            and span >= max(0.24, min_span)
+            and fill <= 0.30
+            and boundary_fraction >= 0.06
+        )
+        if strong_line:
+            sel = comp
+            full_line_components += 1
+        else:
+            sel = comp & boundary_clip
+            clipped_components += 1
+        if np.any(sel):
+            out[sel] = 255
             kept += 1
+
     spiky_profile = _hybrid_spiky_container_profile(source_mask)
     spiky_band_px = 0
     spiky_band_pixels = 0
     if bool(spiky_profile.get("spiky", False)):
         spiky_band_px = max(1, int(getattr(cfg, "hybrid_source_spiky_boundary_band_px", 14)))
-        # SOURCE is lettering authority only. For a burst/spiky container the
-        # boundary itself is structural artwork, so reject the complete inner
-        # boundary band instead of trying to classify thousands of individual
-        # rays as glyph components. Chinese dialogue is central in these regions.
         bk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (spiky_band_px * 2 + 1, spiky_band_px * 2 + 1))
         spiky_inner = cv2.erode(use, bk, iterations=1)
         spiky_band = (use > 0) & (spiky_inner == 0)
@@ -840,17 +908,38 @@ def _hybrid_source_structure_guard(
     if cv2.countNonZero(out) > 0:
         out = cv2.dilate(out, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
         out[use == 0] = 0
+
+    # SOURCE lettering is an independent authority.  The text selector is run
+    # on the original SOURCE raster before any structure veto; compact glyphs
+    # are then relieved from the structural guard, including a true burst's
+    # boundary annulus.  This preserves edge-near Chinese without copying rays.
+    lettering_relief = np.zeros_like(out)
+    lettering_relief_enabled = bool(getattr(cfg, "hybrid_source_lettering_relief_enabled", True))
+    lettering_relief_dilate = max(0, int(getattr(cfg, "hybrid_source_lettering_relief_dilate_px", 1)))
+    if lettering_relief_enabled:
+        lettering_relief = target_text_mask_in_container(source, source_mask)
+        if lettering_relief_dilate > 0 and cv2.countNonZero(lettering_relief) > 0:
+            lk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (lettering_relief_dilate * 2 + 1, lettering_relief_dilate * 2 + 1))
+            lettering_relief = cv2.dilate(lettering_relief, lk, iterations=1)
+            lettering_relief = cv2.bitwise_and(lettering_relief, (use * 255).astype(np.uint8))
+        if cv2.countNonZero(lettering_relief) > 0:
+            out[lettering_relief > 0] = 0
     diag.update({
         "guard_pixels": int(cv2.countNonZero(out)),
         "components": int(kept),
+        "clipped_components": int(clipped_components),
+        "full_line_components": int(full_line_components),
         "band_px": int(band_px),
+        "component_clip_band_px": int(clip_px),
         "dark_threshold": int(dark_thr),
         "spiky": bool(spiky_profile.get("spiky", False)),
         "spiky_boundary_band_px": int(spiky_band_px),
         "spiky_boundary_band_pixels": int(spiky_band_pixels),
+        "source_lettering_relief_enabled": bool(lettering_relief_enabled),
+        "source_lettering_relief_pixels": int(cv2.countNonZero(lettering_relief)),
+        "source_lettering_relief_dilate_px": int(lettering_relief_dilate),
     })
     return out, diag
-
 
 def _hybrid_target_immutable_boundary_band(
     target_mask: np.ndarray,
@@ -922,9 +1011,16 @@ def _hybrid_target_immutable_boundary_band(
 def _hybrid_target_structure_guard(
     target: np.ndarray,
     target_mask: np.ndarray,
-    cfg: MaskReplaceConfig,
+    cfg: HybridMaskConfig,
 ) -> tuple[np.ndarray, dict[str, object]]:
-    """Protect TARGET HD outline/tail/structural ink for every white container."""
+    """Protect actual TARGET HD structure without freezing Japanese glyphs.
+
+    v2.3.59 separates structure authority from target-language clear authority.
+    Boundary-connected dark components are no longer restored wholesale merely
+    because they touch the balloon edge: mixed outline+glyph components are
+    clipped to a narrow boundary annulus.  Only unmistakably thin/long rules are
+    preserved in full.
+    """
     out = np.zeros(target_mask.shape, np.uint8)
     enabled = bool(getattr(cfg, "hybrid_target_structure_guard_enabled", True))
     diag: dict[str, object] = {"enabled": enabled, "guard_pixels": 0, "components": 0}
@@ -939,14 +1035,16 @@ def _hybrid_target_structure_guard(
         probe = cv2.dilate(probe, pk, iterations=1)
     base = target_container_border_mask(target, probe, band_px=max(5, probe_px + 2))
 
-    # Supplement the long-line detector with boundary-connected dark structure so
-    # speech-bubble tails and irregular burst tips are also immutable. Central JP
-    # glyphs are excluded because they do not touch this narrow boundary zone.
     inner_px = max(2, min(5, probe_px + 1))
     ik = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (inner_px * 2 + 1, inner_px * 2 + 1))
     inner = cv2.erode((use > 0).astype(np.uint8), ik, iterations=1)
-    outer = (probe > 0)
+    outer = probe > 0
     ring = outer & (inner == 0)
+    clip_px = max(inner_px + 2, min(12, inner_px * 2))
+    ck = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (clip_px * 2 + 1, clip_px * 2 + 1))
+    clip_inner = cv2.erode((use > 0).astype(np.uint8), ck, iterations=1)
+    ring_clip = outer & (clip_inner == 0)
+
     gray = cv2.cvtColor(target, cv2.COLOR_BGR2GRAY) if target.ndim == 3 else target.astype(np.uint8)
     vals = gray[use > 0]
     paper = float(np.percentile(vals, 72.0)) if vals.size else 245.0
@@ -957,6 +1055,8 @@ def _hybrid_target_structure_guard(
     bx, by, bw, bh = cv2.boundingRect(nz) if nz is not None else (0, 0, target_mask.shape[1], target_mask.shape[0])
     region_area = max(1, int(cv2.countNonZero(use)))
     components = 0
+    clipped_components = 0
+    full_line_components = 0
     supplement = np.zeros_like(out)
     for lab in range(1, n):
         x, y, ww, hh, area = [int(v) for v in stats[lab]]
@@ -976,23 +1076,52 @@ def _hybrid_target_structure_guard(
             or (area >= max(30, int(round(region_area * 0.010))) and boundary_fraction >= 0.12)
             or (span >= 0.10 and fill <= 0.38 and boundary_fraction >= 0.20)
         )
-        if structural:
-            supplement[comp] = 255
+        if not structural:
+            continue
+        strong_line = bool(aspect >= 4.5 and span >= 0.24 and fill <= 0.28 and boundary_fraction >= 0.05)
+        if strong_line:
+            sel = comp
+            full_line_components += 1
+        else:
+            sel = comp & ring_clip
+            clipped_components += 1
+        if np.any(sel):
+            supplement[sel] = 255
             components += 1
     out = cv2.bitwise_or(base, supplement)
     if fringe_px > 0 and cv2.countNonZero(out) > 0:
         fk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (fringe_px * 2 + 1, fringe_px * 2 + 1))
         out = cv2.dilate(out, fk, iterations=1)
+
+    # TARGET lettering and TARGET structure are different authorities.  Relieve
+    # compact Japanese glyph support from the border/structure guard so a scan
+    # connection to an outline cannot make old text immutable.
+    text_relief = np.zeros_like(out)
+    text_relief_enabled = bool(getattr(cfg, "hybrid_target_structure_text_relief_enabled", True))
+    text_relief_dilate = max(0, int(getattr(cfg, "hybrid_target_structure_text_relief_dilate_px", 1)))
+    if text_relief_enabled:
+        text_relief = target_text_mask_in_container(target, use)
+        if text_relief_dilate > 0 and cv2.countNonZero(text_relief) > 0:
+            tk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (text_relief_dilate * 2 + 1, text_relief_dilate * 2 + 1))
+            text_relief = cv2.dilate(text_relief, tk, iterations=1)
+            text_relief = cv2.bitwise_and(text_relief, use)
+        if cv2.countNonZero(text_relief) > 0:
+            out[text_relief > 0] = 0
     diag.update({
         "guard_pixels": int(cv2.countNonZero(out)),
         "components": int(components),
+        "clipped_components": int(clipped_components),
+        "full_line_components": int(full_line_components),
         "base_border_pixels": int(cv2.countNonZero(base)),
         "probe_dilate_px": int(probe_px),
         "restore_fringe_px": int(fringe_px),
+        "component_clip_band_px": int(clip_px),
         "dark_threshold": int(thr),
+        "target_text_relief_enabled": bool(text_relief_enabled),
+        "target_text_relief_pixels": int(cv2.countNonZero(text_relief)),
+        "target_text_relief_dilate_px": int(text_relief_dilate),
     })
     return out, diag
-
 
 def _rigid_source_raster(
     source: np.ndarray,
@@ -1051,13 +1180,39 @@ def _rigid_source_raster(
     floor = float(np.clip(getattr(cfg, "rigid_container_alpha_floor", 0.055), 0.0, 0.30))
     alpha[alpha < floor] = 0.0
     alpha *= (crop_mask.astype(np.float32) / 255.0)
+    # Preserve an audit authority before any SOURCE structure suppression. This is
+    # not rendered directly; it exists so a boundary guard can never silently
+    # redefine "complete SOURCE text" after it has already deleted pixels.
+    raw_alpha_for_audit = alpha.copy()
     structure_mask = source_mask if source_structure_mask is None else source_structure_mask
     source_structure_guard, source_structure_diag = _hybrid_source_structure_guard(source, structure_mask, cfg)
     local_structure_guard = source_structure_guard[sy0:sy1, sx0:sx1] > 0
     if np.any(local_structure_guard):
         alpha[local_structure_guard] = 0.0
+    # Audit the original SOURCE lettering authority itself, including glyphs
+    # close to a bubble/burst boundary.  The former eroded-core denominator could
+    # hide exactly the failure we need to detect by eroding away clipped letters.
+    audit_thr = max(0.08, floor)
+    lettering_audit = target_text_mask_in_container(source, structure_mask)[sy0:sy1, sx0:sx1] > 0
+    raw_lettering_ink = (raw_alpha_for_audit >= audit_thr) & lettering_audit
+    guarded_lettering_ink = (alpha >= audit_thr) & lettering_audit
+    raw_core_pixels = int(np.count_nonzero(raw_lettering_ink))
+    guarded_core_pixels = int(np.count_nonzero(guarded_lettering_ink))
+    # If the conservative selector has no evidence (rare low-contrast source),
+    # fall back to all raw alpha rather than silently claiming perfect coverage.
+    if raw_core_pixels <= 0:
+        raw_lettering_ink = raw_alpha_for_audit >= audit_thr
+        guarded_lettering_ink = alpha >= audit_thr
+        raw_core_pixels = int(np.count_nonzero(raw_lettering_ink))
+        guarded_core_pixels = int(np.count_nonzero(guarded_lettering_ink))
+    source_structure_retention = float(guarded_core_pixels / max(1, raw_core_pixels)) if raw_core_pixels > 0 else 1.0
+    source_structure_diag["audit_authority"] = "raw_source_lettering_support"
+    source_structure_diag["raw_core_ink_pixels"] = int(raw_core_pixels)
+    source_structure_diag["guarded_core_ink_pixels"] = int(guarded_core_pixels)
+    source_structure_diag["source_structure_retention"] = float(source_structure_retention)
     if isinstance(clarity_diag, dict):
         clarity_diag["source_structure_guard"] = source_structure_diag
+        clarity_diag["source_structure_retention"] = float(source_structure_retention)
     if np.count_nonzero(alpha >= max(0.08, floor)) < int(getattr(cfg, "content_completeness_min_ink_pixels", 18)):
         return None
 
@@ -1226,9 +1381,11 @@ def _hybrid_spiky_container_profile(region_mask: np.ndarray) -> dict[str, float 
     # avoid misclassifying an ordinary speech-tail balloon.
     spiky = bool(
         contour_points >= 28
-        and perimeter_ratio >= 1.35
-        and solidity <= 0.94
         and compactness <= 0.45
+        and (
+            solidity <= 0.88
+            or (perimeter_ratio >= 1.55 and solidity <= 0.94)
+        )
     )
     return {
         "spiky": spiky,
@@ -1484,8 +1641,12 @@ def transfer_rigid_container_rasters(
                 "pixels": int(cv2.countNonZero(glyph_relief)),
                 "dilate_px": int(relief_dilate),
             }
-        if cv2.countNonZero(immutable_band) > 0:
-            target_structure_guard = np.maximum(target_structure_guard, immutable_band)
+        if cv2.countNonZero(glyph_relief) > 0 and cv2.countNonZero(spiky_structure_guard) > 0:
+            spiky_structure_guard[glyph_relief > 0] = 0
+        # v2.3.59: immutable boundary is a TARGET-clear boundary, not a SOURCE-write
+        # boundary.  Keeping it out of target_structure_guard prevents a wide
+        # anti-alias preservation annulus from silently clipping valid Chinese
+        # glyphs. Actual dark outline/ray pixels remain protected separately.
         target_structure_diag["immutable_boundary_band"] = immutable_band_diag
         target_structure_diag["spiky_target_glyph_relief"] = glyph_relief_diag
         if cv2.countNonZero(spiky_structure_guard) > 0:
@@ -1498,20 +1659,73 @@ def transfer_rigid_container_rasters(
             "white_full_clear_pixels": 0,
         }
         target_colored = bool(sb.meta.get("target_driven_colored"))
-        full_clear_envelope = border_safe_envelope
+        full_clear_envelope = border_safe_envelope.copy()
+        # Clear authority is allowed to approach Japanese glyphs but must never
+        # cross immutable boundary AA or actual structural TARGET ink.
+        # Ordinary balloons keep an immutable AA band.  True burst containers
+        # instead clear through the white paper up to the actual ray/outline guard:
+        # a blanket immutable annulus can contain legitimate Japanese glyphs (e.g.
+        # a final vertical column near the burst tips) and must not make them
+        # impossible to remove. Actual TARGET structure is restored byte-exactly.
+        if cv2.countNonZero(immutable_band) > 0 and not bool(spiky_profile.get("spiky", False)):
+            full_clear_envelope[immutable_band > 0] = 0
+        if cv2.countNonZero(target_structure_guard) > 0:
+            full_clear_envelope[target_structure_guard > 0] = 0
+
         if (
             not target_colored
-            and not bool(spiky_profile.get("spiky", False))
             and bool(getattr(cfg, "white_container_full_clear_enabled", True))
         ):
-            paper_mask = white_container_paper_mask(target_reference, tm, source_ink_mask)
-            candidate_clear_env, clear_env_diag = white_container_write_envelope(
-                target_reference, tm, paper_mask,
-                inset_px=max(0, int(getattr(cfg, "white_container_clear_inset_px", 0))),
-                border_guard_px=max(0, int(getattr(cfg, "white_container_clear_border_guard_px", 0))),
-            )
-            if cv2.countNonZero(candidate_clear_env) > 0:
-                full_clear_envelope = candidate_clear_env
+            clear_env_diag: dict[str, object] = {
+                "policy": "spiky_safe_core" if bool(spiky_profile.get("spiky", False)) else "ordinary_white_container",
+                "immutable_boundary_pixels": int(cv2.countNonZero(immutable_band)),
+                "actual_structure_pixels": int(cv2.countNonZero(target_structure_guard)),
+            }
+            if not bool(spiky_profile.get("spiky", False)):
+                paper_mask = white_container_paper_mask(target_reference, tm, source_ink_mask)
+                candidate_clear_env, ordinary_diag = white_container_write_envelope(
+                    target_reference, tm, paper_mask,
+                    inset_px=max(0, int(getattr(cfg, "white_container_clear_inset_px", 0))),
+                    border_guard_px=max(0, int(getattr(cfg, "white_container_clear_border_guard_px", 0))),
+                )
+                clear_env_diag.update(ordinary_diag)
+                if cv2.countNonZero(candidate_clear_env) > 0:
+                    full_clear_envelope = candidate_clear_env
+                    if cv2.countNonZero(immutable_band) > 0:
+                        full_clear_envelope[immutable_band > 0] = 0
+                    if cv2.countNonZero(target_structure_guard) > 0:
+                        full_clear_envelope[target_structure_guard > 0] = 0
+            else:
+                clear_env_diag["spiky_profile"] = dict(spiky_profile)
+                # A true burst paired-diff polygon can be a narrow/notched text
+                # lane rather than the complete white paper interior. Complete
+                # TARGET *clear* authority with a conservative bbox ellipse. The
+                # ellipse is validated by the same paper-ratio/spread gate below
+                # and does not expand SOURCE write authority.
+                if bool(getattr(cfg, "hybrid_target_spiky_safe_core_ellipse_enabled", True)):
+                    eb = _bbox_from_mask(tm_raw)
+                    if eb is not None:
+                        ex0, ey0, ex1, ey1 = eb
+                        ew, eh = max(1, ex1 - ex0), max(1, ey1 - ey0)
+                        ratio = max(0.0, float(getattr(cfg, "hybrid_target_spiky_safe_core_inset_ratio", 0.045)))
+                        inset = max(
+                            int(getattr(cfg, "hybrid_target_spiky_safe_core_min_inset_px", 6)),
+                            int(round(min(ew, eh) * ratio)),
+                        )
+                        ax = max(2, ew // 2 - inset)
+                        ay = max(2, eh // 2 - inset)
+                        ellipse = np.zeros(shape, np.uint8)
+                        cv2.ellipse(
+                            ellipse,
+                            (int(round((ex0 + ex1 - 1) * 0.5)), int(round((ey0 + ey1 - 1) * 0.5))),
+                            (int(ax), int(ay)), 0.0, 0.0, 360.0, 255, -1, cv2.LINE_8,
+                        )
+                        full_clear_envelope = np.maximum(full_clear_envelope, ellipse)
+                        if cv2.countNonZero(target_structure_guard) > 0:
+                            full_clear_envelope[target_structure_guard > 0] = 0
+                        clear_env_diag["spiky_safe_core_ellipse_pixels"] = int(cv2.countNonZero(ellipse))
+                        clear_env_diag["spiky_safe_core_ellipse_inset_px"] = int(inset)
+
             full_out, full_mask, full_clear_diag = clear_uniform_white_container_interior(
                 rendered, target_reference, full_clear_envelope,
                 min_paper_ratio=float(getattr(cfg, "white_container_full_clear_min_paper_ratio", 0.68)),
@@ -1521,8 +1735,10 @@ def transfer_rigid_container_rasters(
             if bool(full_clear_diag.get("white_full_clear_applied", False)):
                 rendered = full_out
                 clear = full_mask
+                if bool(spiky_profile.get("spiky", False)):
+                    full_clear_diag["white_full_clear_reason"] = "hybrid_spiky_safe_core_full_clear"
         elif bool(spiky_profile.get("spiky", False)):
-            full_clear_diag["white_full_clear_reason"] = "hybrid_spiky_structure_text_only_clear"
+            full_clear_diag["white_full_clear_reason"] = "hybrid_spiky_colored_or_disabled"
             full_clear_diag["spiky_profile"] = dict(spiky_profile)
 
         if not bool(full_clear_diag.get("white_full_clear_applied", False)):
@@ -1547,9 +1763,27 @@ def transfer_rigid_container_rasters(
         match_notes = ["rigid_container_text_only", "target_background_preserved", f"uniform_scale={scale:.6f}", f"ink_coverage={ink_cov:.5f}", f"mask_containment={mask_cov:.5f}"]
         gap_fill_diag = {"added_pixels": 0, "enabled": False}
         a = np.clip(alpha, 0.0, 1.0)
+        source_authority_pixels = int(cv2.countNonZero(source_ink_mask))
         a *= (border_safe_envelope.astype(np.float32) / 255.0)
         if cv2.countNonZero(target_structure_guard) > 0:
             a[target_structure_guard > 0] = 0.0
+        retained_source_mask = ((a >= 0.08) & (source_ink_mask > 0)).astype(np.uint8) * 255
+        target_write_pixels = int(cv2.countNonZero(retained_source_mask))
+        target_write_retention = float(target_write_pixels / max(1, source_authority_pixels)) if source_authority_pixels > 0 else 1.0
+        source_structure_retention = float(white_clarity_diag.get("source_structure_retention", 1.0)) if isinstance(white_clarity_diag, dict) else 1.0
+        raw_source_ink_coverage = float(np.clip(source_structure_retention * target_write_retention, 0.0, 1.0))
+        raw_source_min_coverage = float(getattr(cfg, "hybrid_raw_source_min_coverage", 0.965))
+        raw_source_fidelity_diag = {
+            "enabled": bool(getattr(cfg, "hybrid_raw_source_completeness_enabled", True)),
+            "source_structure_retention": float(source_structure_retention),
+            "target_write_retention": float(target_write_retention),
+            "raw_source_ink_coverage": float(raw_source_ink_coverage),
+            "min_raw_source_coverage": float(raw_source_min_coverage),
+            "source_authority_pixels": int(source_authority_pixels),
+            "target_write_pixels": int(target_write_pixels),
+            "complete": bool(raw_source_ink_coverage >= raw_source_min_coverage),
+            "authority_contract": "source-lettering-independent-of-target-clear-and-immutable-boundary",
+        }
         # Neutral black preserves the original Chinese raster opacity/topology but
         # cannot carry white/gray SOURCE paper or scan colour into TARGET.
         rendered = np.clip(rendered.astype(np.float32) * (1.0 - a[..., None]), 0, 255).astype(np.uint8)
@@ -1677,6 +1911,7 @@ def transfer_rigid_container_rasters(
         rec.meta["hybrid_spiky_profile"] = spiky_profile
         rec.meta["hybrid_spiky_structure_restore"] = spiky_restore_diag
         rec.meta["hybrid_target_structure_restore"] = generic_structure_restore_diag
+        rec.meta["hybrid_raw_source_fidelity"] = raw_source_fidelity_diag
         rec.meta["white_container_full_clear"] = full_clear_diag
         rec.meta["source_text_support"] = text_support_diag
         rec.meta["placed_ink_shape"] = placed_ink_diag
@@ -1698,6 +1933,13 @@ def transfer_rigid_container_rasters(
             min_source_coverage=min_cov,
             max_target_residual=max_res,
         )
+        if bool(raw_source_fidelity_diag.get("enabled", True)) and not bool(raw_source_fidelity_diag.get("complete", False)):
+            rec.content_complete = False
+            rec.content_check = "checked_raw_source_fidelity"
+            rec.review_required = True
+            rec.review_reason = "raw_source_ink_incomplete"
+            rec.restorable = True
+            rec.editable = True
         # The rigid text-only path has no target-sized SOURCE RGB patch.  Older
         # code retained a dead auto-repair branch referencing an undefined
         # ``patch_rgb``; it was guarded by ``patch is not None`` even though
@@ -2093,13 +2335,23 @@ def transfer_paired_diff_regions(
         if cfg.normalize_background:
             warped_img = _normalize_bubble_background(warped_img, tm, target, tm)
 
-        white_clarity_diag = {"enabled": bool(getattr(cfg, "direct_white_clarity_enhance_enabled", True)), "applied": False, "reason": "not_evaluated"}
-        if region_kind == "bubble":
+        white_policy = (
+            _white_bubble_enhancement_policy(target, tm, cfg)
+            if region_kind == "bubble"
+            else {"enabled": bool(getattr(cfg, "direct_white_clarity_enhance_enabled", False)), "master_bypass": False, "policy": "not_bubble"}
+        )
+        white_no_enhance_lock = bool(white_policy.get("master_bypass", False))
+        white_clarity_diag = {**white_policy, "applied": False, "reason": "disabled_master_bypass" if white_no_enhance_lock else "not_evaluated"}
+        if region_kind == "bubble" and not white_no_enhance_lock:
             warped_img, white_clarity_diag = _maybe_apply_white_source_clarity(warped_img, target, tm, cfg)
         source_fidelity_lock = bool(white_clarity_diag.get("applied", False))
+        source_enhancement_lock = bool(source_fidelity_lock or white_no_enhance_lock)
         if source_fidelity_lock:
             rec.clarity_mode = "source-faithful-white-clarity"
             rec.meta["source_raster_fidelity_lock"] = True
+        elif white_no_enhance_lock:
+            rec.clarity_mode = "source-raster-no-enhancement"
+            rec.meta["source_raster_no_enhancement_lock"] = True
 
         rec.sr_backend = str(render_source_label or "paired-dense-align")
         rec.meta["render_source"] = dict(render_source_diagnostics or {})
@@ -2121,7 +2373,7 @@ def transfer_paired_diff_regions(
         # layout, but strengthen soft antialiased edges before falling all the way
         # to binary ink reconstruction/OCR. This is most useful for clean low-res
         # scans mapped onto a higher-resolution target.
-        if (not source_fidelity_lock
+        if (not source_enhancement_lock
                 and fidelity in {"auto", "pixels"}
                 and rec.clarity_mode in {"pixels", "paired-aligned-pixels"}
                 and bool(getattr(cfg, "pixel_enhance_enabled", True))
@@ -2143,7 +2395,7 @@ def transfer_paired_diff_regions(
         # Rebuild their local Chinese ink over the clean target instead of copying
         # camera pixels. Unlike a whole-bubble clear, the supplemental target mask
         # is compact, so this is also safe for open burst bubbles/free text.
-        if photo_source and cfg.photo_pair_crisp_text_enabled and not source_fidelity_lock:
+        if photo_source and cfg.photo_pair_crisp_text_enabled and not source_enhancement_lock:
             reconstructed = None
             ink_ratio = 0.0
             # v0.8.16: if source glyph pixels cross the target mask boundary, rescue
@@ -2193,7 +2445,7 @@ def transfer_paired_diff_regions(
         # Paired transfer already knows where the translated pixels live. For
         # non-photo structural regions, use deterministic ink reconstruction only
         # when the aligned pixels are too soft.
-        elif region_kind == "bubble" and not source_fidelity_lock and (fidelity == "ink" or (fidelity == "auto" and too_soft)):
+        elif region_kind == "bubble" and not source_enhancement_lock and (fidelity == "ink" or (fidelity == "auto" and too_soft)):
             reconstructed = None
             ink_ratio = 0.0
             if cfg.ink_reconstruction_enabled:
@@ -2207,7 +2459,7 @@ def transfer_paired_diff_regions(
             else:
                 rec.clarity_mode = "paired-aligned-pixels"
         else:
-            if not source_fidelity_lock:
+            if not source_enhancement_lock:
                 rec.clarity_mode = "paired-aligned-pixels"
 
         gap_fill_diag = {"enabled": False, "iterations": 0, "added_pixels": 0}
@@ -2501,12 +2753,20 @@ def transfer_bubble_patches(
             max_scale_change = cfg.photo_pair_max_local_scale_change if is_photo_pair else cfg.max_local_scale_change
             correction_ok = abs(corr_x-1.0) <= max_scale_change and abs(corr_y-1.0) <= max_scale_change
             if correction_ok:
-                if is_photo_pair and getattr(cfg, "photo_pair_uniform_local_fit", True):
-                    # Never independently resize X/Y for photographed CJK text.
-                    # That produced the visibly squeezed/twisted glyphs reported on
-                    # real 007/009 pages. Use one local scale and center alignment.
+                # Final CJK raster is shape authority.  Geometry may refine where
+                # the destination container lives, but Mask/Hybrid must never
+                # independently stretch X/Y merely to increase mask IoU.  The
+                # v2.3.57 raw-diff fallback still used _bbox_fit_matrix here,
+                # bypassing the shape-preserving contract used by the newer
+                # paired-diff route.  Use one uniform local scale for ordinary
+                # clean scans as well as photographed pages.
+                shape_preserving_fit = (
+                    not is_photo_pair
+                    or bool(getattr(cfg, "photo_pair_uniform_local_fit", True))
+                )
+                if shape_preserving_fit:
                     axis_delta = abs(float(corr_x - corr_y))
-                    if axis_delta <= float(getattr(cfg, "photo_pair_max_axis_scale_delta", 0.10)):
+                    if (not is_photo_pair) or axis_delta <= float(getattr(cfg, "photo_pair_max_axis_scale_delta", 0.10)):
                         fit_H = _bbox_uniform_fit_matrix(
                             (sbox[0], sbox[1], sbox[2], sbox[3]),
                             (tbox[0], tbox[1], tbox[2], tbox[3]), H,
@@ -2671,20 +2931,51 @@ def transfer_bubble_patches(
 
         if cfg.normalize_background:
             warped_img = _normalize_bubble_background(warped_img, warped_mask, target, tm)
+
+        # v2.3.58 fidelity closure for the legacy/raw-diff bubble route.  The
+        # v2.3.31 source-raster lock existed in target-driven paired-diff, but
+        # raw_diff still fell through to the old sharpness ladder and could
+        # replace genuine SOURCE antialiasing with binary ink reconstruction.
+        # On a verified ordinary white TARGET container, clean SOURCE paper only
+        # with the continuous source-raster normaliser and lock the resulting
+        # glyph pixels against all later hardening/reconstruction stages.
+        white_policy = _white_bubble_enhancement_policy(target, tm, cfg)
+        white_no_enhance_lock = bool(white_policy.get("master_bypass", False))
+        white_clarity_diag = {
+            **white_policy,
+            "applied": False,
+            "reason": "disabled_master_bypass" if white_no_enhance_lock else ("photo_pair_uses_photo_fidelity_ladder" if is_photo_pair else "not_evaluated"),
+        }
+        source_fidelity_lock = bool(white_no_enhance_lock)
+        if not is_photo_pair and not white_no_enhance_lock:
+            warped_img, white_clarity_diag = _maybe_apply_white_source_clarity(
+                warped_img, target, tm, cfg, source_region_mask=warped_mask,
+            )
+            source_fidelity_lock = bool(white_clarity_diag.get("applied", False))
+        rec.meta["white_source_clarity"] = white_clarity_diag
+        if bool(white_clarity_diag.get("applied", False)):
+            rec.clarity_mode = "source-faithful-white-clarity"
+            rec.meta["source_raster_fidelity_lock"] = True
+        elif white_no_enhance_lock:
+            rec.clarity_mode = "source-raster-no-enhancement"
+            rec.meta["source_raster_no_enhancement_lock"] = True
+
         rec.sharpness = _masked_sharpness(warped_img, paste_mask)
         rec.target_sharpness = _masked_sharpness(target, paste_mask)
         rec.relative_sharpness = rec.sharpness / max(1e-6, rec.target_sharpness) if rec.target_sharpness > 0 else 1.0
 
         fidelity = (cfg.text_fidelity_mode or "auto").lower().strip()
-        if is_photo_pair and cfg.photo_pair_force_ink_reconstruction and fidelity == "auto":
+        if source_fidelity_lock and fidelity in {"auto", "pixels"}:
+            fidelity = "pixels"
+        if is_photo_pair and not source_fidelity_lock and cfg.photo_pair_force_ink_reconstruction and fidelity == "auto":
             fidelity = "ink"
-        if is_photo_pair and small_text_photo_pair and fidelity == "auto":
+        if is_photo_pair and not source_fidelity_lock and small_text_photo_pair and fidelity == "auto":
             fidelity = "ink"
 
         # Preferred v0.8.3 path: extract only registered Chinese ink and rebuild it
         # on clean target paper. This removes camera blur/glare and duplicated
         # source balloon outlines without requiring OCR or a font.
-        if is_photo_pair and cfg.photo_pair_crisp_text_enabled and fidelity != "reject":
+        if is_photo_pair and not source_fidelity_lock and cfg.photo_pair_crisp_text_enabled and fidelity != "reject":
             crisp, crisp_ratio = _reconstruct_photo_crisp_layer(
                 warped_img, target, paste_mask, dest_mask, cfg,
             )
@@ -2701,7 +2992,7 @@ def transfer_bubble_patches(
         # shading while retaining real antialiased glyph pixels. Only if the
         # normalized result remains too soft do we use deterministic ink recovery;
         # very soft/tiny text is refused and left for OCR relettering.
-        if (is_photo_pair and rec.clarity_mode != "photo-crisp-ink"
+        if (is_photo_pair and not source_fidelity_lock and rec.clarity_mode != "photo-crisp-ink"
                 and fidelity in {"auto", "pixels"} and cfg.photo_pair_normalize_text_pixels):
             normalized = _normalize_photo_text_pixels(warped_img, target, paste_mask, dest_mask, cfg)
             if normalized is not None:
@@ -2746,16 +3037,18 @@ def transfer_bubble_patches(
             continue
 
         photo_prefers_ink = bool(
-            is_photo_pair and rec.clarity_mode != "photo-crisp-ink" and (
+            is_photo_pair and not source_fidelity_lock and rec.clarity_mode != "photo-crisp-ink" and (
                 small_text_photo_pair
                 or fidelity == "ink"
                 or rec.relative_sharpness < cfg.photo_pair_prefer_ink_below_relative_sharpness
             )
         )
         should_try_ink = bool(
-            fidelity == "ink"
-            or (fidelity == "auto" and too_soft)
-            or photo_prefers_ink
+            not source_fidelity_lock and (
+                fidelity == "ink"
+                or (fidelity == "auto" and too_soft)
+                or photo_prefers_ink
+            )
         )
         if should_try_ink:
             reconstructed = None

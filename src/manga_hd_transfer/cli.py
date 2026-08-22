@@ -69,7 +69,7 @@ def run_cmd(
     config: Optional[Path] = typer.Option(None, "--config"),
     ocr_backend: Optional[str] = typer.Option(None, "--ocr-backend", help="paddle|sidecar|none"),
     registration_backend: Optional[str] = typer.Option(None, "--registration-backend", help="auto|opencv|lightglue|loftr"),
-    mode: Optional[str] = typer.Option(None, "--mode", help="direct_patch|mask_replace|aligned_overlay_reveal|hybrid|reletter (legacy: auto|transparent_bubble_reveal)"),
+    mode: Optional[str] = typer.Option(None, "--mode", help="direct_patch|mask_replace|aligned_overlay_reveal|transparent_bubble_reveal|hybrid|reletter (legacy: auto)"),
     font: Optional[Path] = typer.Option(None, "--font", help="中文字体文件路径"),
     device: str = typer.Option("auto", "--device", help="auto|mps|cuda|cpu"),
     no_resume: bool = typer.Option(False, "--no-resume", help="禁用断点续跑"),

@@ -36,6 +36,30 @@ def _trace(cb: TraceFn | None, stage: str, **payload: Any) -> None:
         cb(stage, dict(payload))
 
 
+_REGION_SEMANTIC_KEYS = (
+    "mode", "target_bbox", "selection_spec", "source_offset_x", "source_offset_y",
+    "feather_px", "inset_px", "diff_threshold", "edge_threshold", "expand_px",
+    "auto_clear_target", "render_text", "ocr_text", "target_ocr_polygons",
+    "orientation", "font_path", "font_size", "columns", "line_break_mode",
+    "layout_mode", "owner_transfer_mode",
+)
+
+
+def _same_region_action_semantics(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """Detect an exact duplicate region action while ignoring its generated id.
+
+    Brush reveal rows are deliberately excluded because two strokes can share a
+    bbox while carrying different saved patch pixels.
+    """
+    ma = str(a.get("mode", "") or "").strip().lower()
+    mb = str(b.get("mode", "") or "").strip().lower()
+    if ma != mb or not ma.startswith("region_") or ma == "region_brush_reveal":
+        return False
+    def stable(row: dict[str, Any]) -> tuple[Any, ...]:
+        return tuple(repr(row.get(key, None)) for key in _REGION_SEMANTIC_KEYS)
+    return stable(a) == stable(b)
+
+
 # Files that one manual-review commit is allowed to mutate.  Keep this list
 # review-layer-only: automatic renderer products and original inputs are never
 # rolled back here.  A failed local edit should be indistinguishable from no
@@ -262,7 +286,16 @@ def commit_manual_effect(
             if mode == "reveal_text" and int(row["reveal_patch_pixels"]) <= 0:
                 raise ValueError("Reveal 补丁为空，拒绝提交。")
 
-        rows = [dict(x) for x in as_dict_rows(overrides.get("manual_effect_regions")) if str(x.get("id", "")) != rid]
+        rows = []
+        duplicate_region_ids: list[str] = []
+        for value in as_dict_rows(overrides.get("manual_effect_regions")):
+            existing = dict(value)
+            if str(existing.get("id", "")) == rid:
+                continue
+            if _same_region_action_semantics(existing, row):
+                duplicate_region_ids.append(str(existing.get("id", "")))
+                continue
+            rows.append(existing)
         rows.append(row)
         overrides["manual_effect_regions"] = rows
         owner_mode = str(row.get("owner_transfer_mode", "") or "").strip().lower()
@@ -270,7 +303,11 @@ def commit_manual_effect(
             overrides["owner_transfer_mode"] = owner_mode
         overrides["status"] = "reviewed_with_manual_effect"
         save_json(override_path, overrides)
-        _trace(trace, "overrides_saved", row_id=rid, region_count=len(rows), reveal_patch_pixels=int(row.get("reveal_patch_pixels", 0) or 0))
+        _trace(
+            trace, "overrides_saved", row_id=rid, region_count=len(rows),
+            reveal_patch_pixels=int(row.get("reveal_patch_pixels", 0) or 0),
+            deduplicated_region_ids=duplicate_region_ids,
+        )
 
         final_reviewed = Path(apply_review_page(page_dir, config))
         _trace(trace, "review_applied", row_id=rid)
@@ -292,8 +329,14 @@ def commit_manual_effect(
         audit = normalize_review_applied(load_json(audit_path) if audit_path.exists() else {})
         got = {str(x.get("id", "")): dict(x) for x in as_dict_rows(audit.get("manual_effect_applied"))}
         rec = as_dict(got.get(rid))
+        if not rec:
+            raise RuntimeError("人工补漏区域没有进入 review_applied.json；提交结果与复核审计脱节。")
         if not bool(rec.get("success")):
-            raise RuntimeError("人工补漏区域没有进入 review_applied.json 的成功记录。")
+            reason = str(rec.get("reason") or "region_action_no_effective_authority")
+            # This transaction is about to roll back review_overrides.json,
+            # review_applied.json and published rasters.  Do not tell the user the
+            # failed row "has entered" the audit as if it will remain persisted.
+            raise RuntimeError(f"人工补漏执行记录为失败，提交已自动回滚：{reason}")
 
         preview_exact = bool(rec.get("preview_patch_exact", False))
         if mode == "reveal_text":

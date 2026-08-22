@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 
 from .app_logging import runtime_log_dir
 from .gui_components import Card, StableComboBox
+from .gui_dialogs import confirm_action
 from .platform_support import desktop_platform_summary
 from .source_update import (
     DEFAULT_BRANCH, DEFAULT_REPOSITORY, SourceUpdateInfo, SourceUpdateResult,
@@ -158,7 +159,7 @@ class SettingsPage(QWidget):
 
     @property
     def is_updating(self) -> bool:
-        return bool(self._install_worker is not None and self._install_worker.isRunning())
+        return self._install_worker is not None
 
     @property
     def is_checking_updates(self) -> bool:
@@ -208,6 +209,14 @@ class SettingsPage(QWidget):
         self.log_dir_label.setText(str(runtime_log_dir()))
         if self._update_info is not None and not self.is_updating:
             self.update_btn.setEnabled(bool(self._update_info.available) and not self.window._busy_running())
+
+    def set_processing_busy(self, busy: bool) -> None:
+        busy = bool(busy)
+        # Remote check is read-only and may remain available. Installation is a
+        # filesystem mutation and must visually match the same global write gate
+        # enforced again inside install_update().
+        if hasattr(self, "update_btn"):
+            self.update_btn.setEnabled(bool(self._update_info and self._update_info.available) and not busy and not self.is_updating)
 
     def _theme_changed(self) -> None:
         theme = str(self.theme_combo.currentData() or "light")
@@ -298,12 +307,12 @@ class SettingsPage(QWidget):
             "更新器会先校验并建立回滚点。用户项目、输出、模型、日志和 .venv 不会被删除。\n"
             "更新过程中不要强制结束程序。继续吗？"
         )
-        answer = QMessageBox.question(
-            self, "确认 Git 本地升级", text,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
+        if not confirm_action(
+            self, "确认 Git 本地升级", text, confirm_text="升级", destructive=True,
+        ):
+            return
+        if self.window._busy_running():
+            QMessageBox.information(self, "任务状态已变化", "确认期间已有其它写任务启动；本次升级已取消。")
             return
         self.check_btn.setEnabled(False); self.update_btn.setEnabled(False)
         self.update_status.setText("正在执行事务式 Git 本地升级…")
@@ -328,13 +337,11 @@ class SettingsPage(QWidget):
         self._append_log(f"更新完成：v{result.old_version} → v{result.new_version} · {result.commit[:10]} · {result.method}")
         self.update_status.setText(f"更新完成：v{result.new_version} · 需要重新启动程序")
         self.remote_detail.setText(f"已安装 commit {result.commit[:10]} · {result.method}")
-        answer = QMessageBox.question(
+        if confirm_action(
             self, "更新完成",
             f"本地代码已升级到 v{result.new_version}。\n\n需要重新启动才能载入新代码。现在重启吗？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes,
-        )
-        if answer == QMessageBox.StandardButton.Yes:
+            confirm_text="立即重启", destructive=False,
+        ):
             started = QProcess.startDetached(sys.executable, ["-m", "manga_hd_transfer.launcher"], str(result.project_root))
             ok = bool(started[0]) if isinstance(started, tuple) else bool(started)
             if ok:

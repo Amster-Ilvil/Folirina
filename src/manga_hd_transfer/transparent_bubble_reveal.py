@@ -2008,6 +2008,12 @@ def _auto_candidate_safe(target: np.ndarray, row: BubbleInstance, backend: str) 
     backend = str(backend or "").strip().lower()
     if backend == "target_text_contour":
         return bool(_bubble_is_white(target, mask) or _effect_container_candidate_safe(target, mask))
+    if backend == "koharu_layout":
+        # Koharu's `bubble` label is already semantic closed-container evidence.
+        # v2.3.69 accidentally had no Koharu branch here, so every primary
+        # Koharu bubble was detected and then rejected by the final destructive
+        # gate. Keep the pixel safety check, but honor the semantic authority.
+        return bool(_bubble_is_white(target, mask) or _effect_container_candidate_safe(target, mask))
     if backend in {"seeded_white", "unseeded_white", "unseeded"}:
         return _fallback_white_candidate_safe(target, mask)
     # Model-based bubble detectors are still constrained before destructive use.
@@ -2473,6 +2479,30 @@ def _white_container_source_translation_evidence(
     }
 
 
+
+
+def _closed_transparent_container_authority(backend: str) -> bool:
+    """Whether this detector family is allowed to own a full transparent hole.
+
+    Open text contours/seeds are search corridors only.  A bright patch is not
+    sufficient evidence for a whole-container alpha hole; the candidate must
+    originate from a detector that actually models a closed bubble/text box.
+    """
+    key=str(backend or "").strip().lower()
+    if key=="test":
+        return True
+    return key in {
+        "koharu_layout",
+        "seeded_white",
+        "unseeded_white",
+        "unseeded",
+        "text_seed_white_container",
+        "text_seed_white_rect",
+        "mangalens",
+        "rtdetr_v2",
+        "sam2",
+    }
+
 def _full_reveal_has_text_anchor(region: TransparentBubbleRegion) -> bool:
     backend = str(region.backend or "").strip().lower()
     # Internal synthetic tests use backend=test; production paths require a
@@ -2886,8 +2916,13 @@ def build_transparent_bubble_plan(
         if bool(getattr(cfg, "require_source_translation_evidence", False)) and not evidence_ok:
             skipped_source_evidence += 1
             continue
-        if backend_name == "text_seed_fallback":
-            mode = "full_bubble" if base_is_neutral_white else "text_only"
+        if backend_name in {"text_seed_fallback", "target_text_contour"}:
+            # Open/effect text never owns a whole transparent container, even if
+            # the user selected the strict full-bubble preference.  Its geometry
+            # is only a search corridor; the actual alpha authority is compact
+            # TARGET text ink.  This prevents white/open panels from becoming
+            # oversized transparent windows.
+            mode = "text_only"
         elif mode == "hybrid" and backend_name in {"text_seed_white_container", "text_seed_white_rect"}:
             # These backends only exist after the strict seeded-container quality
             # gate has recovered a closed neutral-white container. Treat that
@@ -2895,7 +2930,11 @@ def build_transparent_bubble_plan(
             # than degrading it back to open/text_only.
             mode = "full_bubble"
         elif mode == "hybrid":
-            mode = "full_bubble" if (
+            # Hybrid means: only a detector with explicit closed-container
+            # authority AND a neutral-white interior may own a whole transparent
+            # region. Bright/open text corridors stay text-only.
+            closed_authority=_closed_transparent_container_authority(backend_name)
+            mode = "full_bubble" if closed_authority and (
                 _flat_white_full_reveal_safe(target, base)
                 or _neutral_white_full_reveal_safe(target, base)
             ) else "text_only"
@@ -3170,12 +3209,12 @@ def _text_only_region_envelope(region: TransparentBubbleRegion, shape: tuple[int
     bh = max(1, y1 - y0)
     span = max(1, int(max(bw, bh)))
     effect_like = str(region.backend or '').strip().lower() == 'target_text_contour'
-    radius = max(8, min(34 if effect_like else 52, int(round(span * (0.12 if effect_like else 0.18)))))
+    radius = max(6, min(24 if effect_like else 40, int(round(span * (0.09 if effect_like else 0.14)))))
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1))
     env = cv2.dilate(seed, k)
 
-    pad_x = max(6, min(18 if effect_like else 28, int(round(bw * (0.16 if effect_like else 0.24)))))
-    pad_y = max(8, min(26 if effect_like else 34, int(round(bh * (0.18 if effect_like else 0.28)))))
+    pad_x = max(4, min(12 if effect_like else 20, int(round(bw * (0.10 if effect_like else 0.16)))))
+    pad_y = max(6, min(18 if effect_like else 24, int(round(bh * (0.12 if effect_like else 0.20)))))
     cx0 = max(0, x0 - pad_x); cy0 = max(0, y0 - pad_y)
     cx1 = min(w, x1 + pad_x); cy1 = min(h, y1 + pad_y)
     cap = np.zeros((h, w), np.uint8)
@@ -3485,7 +3524,7 @@ def _target_linear_structure_guard(
 
 
 
-def _effect_text_bbox_mask(region: TransparentBubbleRegion, shape: tuple[int, int], *, pad_x: int = 8, pad_y: int = 12) -> np.ndarray:
+def _effect_text_bbox_mask(region: TransparentBubbleRegion, shape: tuple[int, int], *, pad_x: int = 5, pad_y: int = 8) -> np.ndarray:
     """Return a tight text corridor for open/effect text.
 
     Inspired by BallonsTranslator's text-block-bounded mask generation: the
@@ -3791,7 +3830,11 @@ def _apply_text_only_region(
         # boxes where CN uses a taller or wider layout than JP.  Only a genuinely
         # neutral/white TARGET paper field may broaden SOURCE discovery; pale
         # coloured effect frames stay on the effect-safe route.
-        if paper_env_neutral and paper_pixels >= max(900, int(round(base_pixels * 0.34))):
+        if (
+            _closed_transparent_container_authority(region.backend)
+            and paper_env_neutral
+            and paper_pixels >= max(900, int(round(base_pixels * 0.34)))
+        ):
             envelope = paper_env
             forced = cv2.bitwise_and((region.clear_mask > 0).astype(np.uint8) * 255, envelope)
             use_paper_envelope = True
@@ -3807,7 +3850,9 @@ def _apply_text_only_region(
         "boundary_geometry_pixels": 0,
     }
     if use_paper_envelope or target_is_white:
-        text_surface = paper_env if cv2.countNonZero(paper_env) > 0 else envelope
+        # Open text on white artwork stays inside its tight text corridor. Only
+        # a detector with closed-container authority may broaden to paper_env.
+        text_surface = paper_env if use_paper_envelope and cv2.countNonZero(paper_env) > 0 else envelope
         complete_target_text = target_white_container_text_mask(target, text_surface)
         complete_target_text, boundary_geometry_guard, boundary_geometry_diag = _split_boundary_geometry_from_text_mask(
             complete_target_text, text_surface
@@ -4043,6 +4088,7 @@ def execute_transparent_bubble(
             # This keeps skin/art byte-exact while still exposing all CN text in
             # the recovered white interior.
             anchor_ok = _full_reveal_has_text_anchor(region)
+            closed_authority = _closed_transparent_container_authority(region.backend)
             min_coverage = 0.10 if explicit_full else 0.18
             effect_like = bool((not base_white) and _effect_container_candidate_safe(target, base_mask_u8))
             recovered_rect_like = bool(_mask_bbox_fill_ratio(reveal_mask_u8) >= 0.86)
@@ -4053,7 +4099,7 @@ def execute_transparent_bubble(
             # coloured/starburst effect frame from becoming a full SOURCE window.
             raw_or_recovered_container_ok = bool(base_white or recovered_rect_like or recovered_from_rect_seed)
             allow_full = bool(
-                anchor_ok and recovered_white and candidate_coverage >= min_coverage
+                closed_authority and anchor_ok and recovered_white and candidate_coverage >= min_coverage
                 and raw_or_recovered_container_ok and not effect_like
             )
         if allow_full:
@@ -4079,7 +4125,7 @@ def execute_transparent_bubble(
             local_region = TransparentBubbleRegion(
                 id=region.id, target_bbox=region.target_bbox, polygon=region.polygon, clear_mask=region.clear_mask,
                 confidence=region.confidence, backend=region.backend, triage=region.triage, reason=region.reason,
-                applied=region.applied, clear_mode="text_only",
+                applied=region.applied, clear_mode="text_only", text_bbox=region.text_bbox,
             )
         diag, write_mask, cleared_pixels, cn_ink_pixels = _apply_text_only_region(
             final, target, aligned, alpha, local_region, cfg

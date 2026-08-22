@@ -549,8 +549,8 @@ class ProjectPage(QWidget):
         ]: self.transparent_backend.addItem(label, value)
         self.transparent_clear_mode = QComboBox()
         self.transparent_clear_mode.addItem("混合：白色封闭框整区透明 / 彩色效果仅文字（推荐）", "hybrid")
-        self.transparent_clear_mode.addItem("白色封闭气泡/文本框整区透明（严格）", "full_bubble")
-        self.transparent_clear_mode.addItem("仅日文墨迹透明", "text_only")
+        self.transparent_clear_mode.addItem("封闭白气泡/文本框整区透明（开放文字仍只透明文字）", "full_bubble")
+        self.transparent_clear_mode.addItem("全页仅文字墨迹透明（最保守）", "text_only")
         self.transparent_protect_border = QCheckBox("透明洞保护气泡边框")
         self.transparent_protect_border.setChecked(True)
         self.transparent_suppress_page_furniture = QCheckBox("过滤页眉 / 页脚文字（推荐）")
@@ -584,7 +584,7 @@ class ProjectPage(QWidget):
         tbl.addWidget(self.transparent_ocr_text_presence, 6, 0, 1, 4)
         tbl.addWidget(self.transparent_restore_source_evidence, 7, 0, 1, 4)
         tbl.setColumnStretch(1, 1); tbl.setColumnStretch(3, 1)
-        self.transparent_section = CompactSection("透明挖孔设置", "真正修改 TARGET alpha；与整页对齐挖孔路线独立", expanded=False)
+        self.transparent_section = CompactSection("整页对齐透明显中文 · 设置", "独立透明 Reveal：TARGET RGBA 上层透明，下层为整页对齐 SOURCE；不调用挖孔模式", expanded=False)
         self.transparent_section.content_layout.addWidget(self.transparent_box)
         mode.layout.addWidget(self.transparent_section)
 
@@ -658,7 +658,7 @@ class ProjectPage(QWidget):
         self.direct_white_clarity_enabled = QCheckBox("启用漂白清底 + 中文文字掩膜清晰化")
         self.direct_white_clarity_enabled.setToolTip("参考夸克类净页思路：对白气泡区域先漂白清底、去灰底、压噪点，再保留 SOURCE 中文黑字。对白气泡场景下的 Direct / 精准蒙版 / 精准蒙版+OCR 生效：先漂白清底、去灰底、压噪点，再保留 SOURCE 中文黑字；彩页与非白气泡仍走原有安全路径。")
         dql.addWidget(self.direct_white_clarity_enabled)
-        dqh = QLabel("用于 Direct / 精准蒙版 / 精准蒙版+OCR 的白气泡：优先清理 SOURCE 灰底与扫描噪点，默认保留中文版原始圆润字形。")
+        dqh = QLabel("用于 Direct / 精准蒙版 / 精准蒙版+OCR 的白气泡。精准蒙版与精准蒙版+OCR 默认关闭；关闭时保留对齐后的 SOURCE 中文字形，不再进入锐化 / photo-crisp / ink 重建。")
         dqh.setObjectName("quiet"); dqh.setWordWrap(True); dql.addWidget(dqh)
         self.direct_clarity_summary = QLabel("")
         self.direct_clarity_summary.setObjectName("hint"); self.direct_clarity_summary.setWordWrap(True); dql.addWidget(self.direct_clarity_summary)
@@ -832,6 +832,8 @@ class ProjectPage(QWidget):
         self.reletter_font.textChanged.connect(self._sync_config); self.reletter_min_font.valueChanged.connect(self._sync_config); self.reletter_max_font.valueChanged.connect(self._sync_config); self.reletter_line_spacing.valueChanged.connect(self._sync_config); self.reletter_break_mode.currentIndexChanged.connect(self._sync_config); self.reletter_layout_mode.currentIndexChanged.connect(self._sync_config); self.reletter_koharu_flow_cells.toggled.connect(self._sync_config)
         self.reletter_font_pick.clicked.connect(self._pick_reletter_font); self.reletter_font_default.clicked.connect(self._clear_reletter_font)
         self.reletter_font_preset.currentIndexChanged.connect(self._apply_reletter_font_preset)
+        self.reletter_font_refresh.clicked.connect(self._refresh_reletter_font_catalog)
+        self.reletter_font_catalog.currentIndexChanged.connect(self._apply_reletter_catalog_font)
         self.transparent_backend.currentIndexChanged.connect(self._sync_config); self.transparent_clear_mode.currentIndexChanged.connect(self._sync_config); self.transparent_protect_border.toggled.connect(self._sync_config); self.transparent_suppress_page_furniture.toggled.connect(self._sync_config); self.transparent_verify_text_presence.toggled.connect(self._sync_config); self.transparent_ocr_text_presence.toggled.connect(self._sync_config); self.transparent_restore_source_evidence.toggled.connect(self._sync_config); self.transparent_expand.valueChanged.connect(self._sync_config); self.transparent_feather.valueChanged.connect(self._sync_config)
         self.semantic_enabled.toggled.connect(self._sync_config); self.semantic_backend.currentIndexChanged.connect(self._sync_config); self.semantic_strategy.currentIndexChanged.connect(self._sync_config); self.semantic_apply_reveal.toggled.connect(self._sync_config); self.semantic_save_overlay.toggled.connect(self._sync_config)
         self.prefer_name_pair.toggled.connect(self._sync_config); self.prefer_order_pair.toggled.connect(self._sync_config); self.remake_pair_verify.toggled.connect(self._sync_config)
@@ -1088,7 +1090,7 @@ class ProjectPage(QWidget):
             "hybrid": "精准蒙版+OCR · 有任何蒙版候选就不自动 OCR；仅无蒙版区域或人工框选才使用 OCR",
             "aligned_overlay_reveal": "整页对齐挖孔显中文 · 上层 TARGET 裁掉气泡/文本框，显示下层整页对齐 SOURCE",
             "reletter": "OCR重排 · OCR 识别后重新排字；字体、断句和字号集中在下方折叠设置",
-            "transparent_bubble_reveal": "透明挖孔 · 真实修改 TARGET alpha 显示下层 SOURCE；与整页对齐挖孔路线完全独立",
+            "transparent_bubble_reveal": "整页对齐透明显中文 · TARGET 为独立 RGBA 上层，透明区域显示整页对齐 SOURCE 下层；不调用挖孔 renderer",
         }
         return summaries.get(str(mode or ""), compact_mode_ui_label(str(mode or "direct_patch")))
 
@@ -1282,7 +1284,8 @@ class ProjectPage(QWidget):
                 self.diff_check.setChecked(bool(getattr(candidate, "paired_diff_enabled", True)))
                 self.exact_check.setChecked(bool(getattr(candidate, "exact_identity_copy", True)))
                 if mode in {"direct_patch", "mask_replace", "hybrid"}:
-                    self.direct_white_clarity_enabled.setChecked(bool(getattr(candidate, "direct_white_clarity_enhance_enabled", True)))
+                    _clarity_default = True if mode == "direct_patch" else False
+                    self.direct_white_clarity_enabled.setChecked(bool(getattr(candidate, "direct_white_clarity_enhance_enabled", _clarity_default)))
                     self.direct_white_clarity_alpha_gamma.setValue(float(getattr(candidate, "direct_white_clarity_alpha_gamma", 1.0)))
                     self.direct_white_clarity_black_boost.setValue(int(getattr(candidate, "direct_white_clarity_black_boost", 0)))
                     self.direct_white_clarity_pure_white_floor.setValue(int(getattr(candidate, "direct_white_clarity_pure_white_floor", 248)))

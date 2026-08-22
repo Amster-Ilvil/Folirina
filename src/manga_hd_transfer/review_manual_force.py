@@ -161,6 +161,33 @@ def _auto_evidence_touching(evidence: np.ndarray, seed: np.ndarray, *, join_radi
     selected_group = np.isin(labels, touched)
     return np.where((ev > 0) & selected_group, 255, 0).astype(np.uint8)
 
+
+def _keep_components_touching(mask: np.ndarray, support: np.ndarray, *, halo_px: int = 3) -> np.ndarray:
+    """Keep only mask components that touch supporting text evidence.
+
+    The manual-force brush may span both text and neighbouring face/artwork.
+    ``mask`` is a candidate compact dark-ink map; ``support`` is paired/source/
+    OCR evidence that actually proves text.  Components with no nearby support
+    are discarded so eye/face/illustration strokes cannot enter the cleanup mask.
+    """
+    probe = (np.asarray(mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
+    anchor = (np.asarray(support, dtype=np.uint8) > 0).astype(np.uint8) * 255
+    if cv2.countNonZero(probe) == 0 or cv2.countNonZero(anchor) == 0:
+        return np.zeros_like(probe)
+    h = max(0, min(10, int(halo_px)))
+    if h > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (h * 2 + 1, h * 2 + 1))
+        anchor = cv2.dilate(anchor, k, iterations=1)
+    count, labels = cv2.connectedComponents((probe > 0).astype(np.uint8), 8)
+    if count <= 1:
+        return probe if np.any((probe > 0) & (anchor > 0)) else np.zeros_like(probe)
+    keep = np.zeros_like(probe)
+    for lab in range(1, count):
+        comp = labels == lab
+        if np.any(comp & (anchor > 0)):
+            keep[comp] = 255
+    return keep
+
 def _manual_force_settings(page_dir: Path) -> dict:
     path = page_dir / "manual_force_settings.json"
     data = load_json(path) if path.exists() else {}
@@ -364,6 +391,18 @@ def _apply_manual_force_transfer_mask(
             if cv2.countNonZero(brush_text):
                 brush_text = cv2.dilate(brush_text, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
                 brush_text[brush_region == 0] = 0
+                # v2.3.61: broad reviewer envelopes may cover a nearby eye/face.
+                # Keep only compact dark-ink components that are supported by
+                # actual text evidence from SOURCE/paired-diff/OCR.
+                delta = np.max(cv2.absdiff(masks.aligned_source, target), axis=2)
+                delta_support = (delta >= 10).astype(np.uint8) * 255
+                delta_support = cv2.dilate(delta_support, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), iterations=1)
+                support = np.maximum(source_mask, np.maximum(detected_clear, np.maximum(auto_target_local, delta_support)))
+                supported_brush_text = _keep_components_touching(brush_text, support, halo_px=4)
+                if cv2.countNonZero(supported_brush_text) > 0:
+                    brush_text = supported_brush_text
+                else:
+                    brush_text = np.zeros_like(brush_text)
         else:
             brush_text_diag = {"removed_components": 0, "removed_pixels": 0, "kept_components": 0, "kept_pixels": 0}
         local_clear = np.maximum(detected_clear, brush_text)

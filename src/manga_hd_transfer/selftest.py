@@ -4,6 +4,7 @@ import tempfile
 from pathlib import Path
 import json
 import os
+import sys
 import socket
 import threading
 import tomllib
@@ -608,10 +609,23 @@ def main() -> int:
     finally:
         cv2.setNumThreads(previous_threads)
     passed = bool(report.get("pass"))
+    # The receipt is written only after the complete JSON report is durable on
+    # stdout.  The release runner can therefore treat complete_pass as a trusted
+    # completion receipt and reclaim the isolated native process group without
+    # waiting for third-party OpenCV/PyTorch atexit teardown.
+    print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
     _selftest_stage("complete_pass" if passed else "complete_fail")
-    print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if passed else 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    code = main()
+    # Dedicated diagnostic process only: all Folirina checks, JSON output and the
+    # completion receipt are already committed. Avoid non-deterministic native
+    # library teardown that can otherwise keep CI/release jobs alive for minutes.
+    os._exit(int(code))

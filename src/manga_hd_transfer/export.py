@@ -25,10 +25,15 @@ def make_text_layer_rgba(shape: tuple[int, int], masks: list[np.ndarray], color=
     return layer
 
 
-def write_rgba(path: str | Path, rgba: np.ndarray) -> None:
+def write_rgba(path: str | Path, rgba: np.ndarray, params: list[int] | None = None) -> None:
     p = Path(path)
     bgra = cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA)
-    write_image(p, bgra)
+    if params is None and p.suffix.casefold() == ".png":
+        # Editable text/transfer layers are usually mostly transparent. High PNG
+        # compression cuts their disk footprint dramatically with a small one-time
+        # save cost and no pixel changes. Callers can override for dense RGBA pages.
+        params = [cv2.IMWRITE_PNG_COMPRESSION, 9]
+    write_image(p, bgra, params=params)
 
 
 def export_openraster(

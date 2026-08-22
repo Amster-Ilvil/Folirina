@@ -19,7 +19,7 @@ from .config import PipelineConfig
 
 
 ACTIVE_PIXEL_MODE_PACKAGES = ("direct_patch", "mask_replace", "hybrid")
-ACTIVE_MODE_PACKAGES = ("direct_patch", "mask_replace", "aligned_overlay_reveal", "hybrid", "reletter")
+ACTIVE_MODE_PACKAGES = ("direct_patch", "mask_replace", "aligned_overlay_reveal", "transparent_bubble_reveal", "hybrid", "reletter")
 PRIVATE_RENDERER_HELPERS = (
     "geometry_ops.py", "selection_policy.py", "raster_primitives.py", "quality_ops.py",
     "warp_ops.py", "photo_text_ops.py", "content_audit.py", "transfer_models.py", "text_transfer.py",
@@ -90,7 +90,8 @@ def _active_mode_private_file_checks(package_root: Path) -> dict[str, bool]:
         "hybrid_private_open_text_tool": (modes_root / "hybrid" / "open_text_manual.py").exists(),
         "hybrid_private_stage_stack": all((modes_root / "hybrid" / f).exists() for f in ("pixel_stage.py","execution_stage.py")),
         "reletter_private_stage_stack": all((modes_root / "reletter" / f).exists() for f in ("pixel_stage.py","execution_stage.py")),
-        "aligned_private_stack": all((modes_root / "aligned_overlay_reveal" / f).exists() for f in ("renderer.py","core.py","hole_renderer.py","bridge.py","validator.py","contract.py","runner.py")),
+        "aligned_private_stack": all((modes_root / "aligned_overlay_reveal" / f).exists() for f in ("renderer.py","core.py","hole_renderer.py","bridge.py","validator.py","contract.py","runner.py","route.py","persist.py")),
+        "transparent_private_stack": all((modes_root / "transparent_bubble_reveal" / f).exists() for f in ("route.py","persist.py")),
     }
 
 
@@ -139,7 +140,7 @@ def run_architecture_audit() -> dict:
     cfg_probe = PipelineConfig()
 
     checks = {
-        "five_active_modes": len(ACTIVE_MODE_ORDER) == 5,
+        "six_active_modes": len(ACTIVE_MODE_ORDER) == 6,
         "auto_is_legacy_only": "auto" in LEGACY_MODE_ORDER and contracts["auto"].orchestrator and sum(int(x.orchestrator) for x in contracts.values()) == 1,
         "direct_is_pixel_only": contracts["direct_patch"].direct and not contracts["direct_patch"].reletter and not contracts["direct_patch"].may_render_text,
         "mask_is_pixel_only": contracts["mask_replace"].mask_replace and not contracts["mask_replace"].reletter and not contracts["mask_replace"].may_render_text,
@@ -218,11 +219,18 @@ def run_architecture_audit() -> dict:
             and "from .modes.hybrid.executor import ReletterExecutor as HybridReletterExecutor" in pipeline_main_src
             and "from .reletter_executor import" not in pipeline_main_src
         ),
-        "aligned_route_uses_private_renderer": (
-            "from .modes.aligned_overlay_reveal.renderer import" in pipeline_route_src
-            and "from .modes.aligned_overlay_reveal.hole_renderer import" in pipeline_route_src
+        "aligned_route_uses_private_dispatcher": (
+            "from .modes.aligned_overlay_reveal.route import execute_isolated_hole_route" in pipeline_route_src
+            and "from .modes.aligned_overlay_reveal.persist import persist_aligned_hole_page" in pipeline_route_src
             and "from .aligned_overlay_reveal import" not in pipeline_route_src
             and "from .aligned_overlay_reveal_mode import" not in pipeline_route_src
+            and "from .pipeline_reveal_persistence import emit_aligned_overlay_page" not in pipeline_route_src
+        ),
+        "transparent_route_uses_private_dispatcher": (
+            "from .modes.transparent_bubble_reveal.route import execute_isolated_transparent_route" in pipeline_route_src
+            and "from .modes.transparent_bubble_reveal.persist import persist_transparent_page" in pipeline_route_src
+            and "from .transparent_bubble_reveal import" not in pipeline_route_src
+            and "from .pipeline_reveal_persistence import emit_transparent_bubble_page" not in pipeline_route_src
         ),
         "gui_ocr_editor_dispatches_private_mode_modules": (
             "from .modes.reletter import ocr_edit_blocks as _reletter_ocr_edit_blocks" in gui_src

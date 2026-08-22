@@ -19,6 +19,7 @@ from .debug import mask_overlay, matching_overlay, registration_overlay, structu
 from .export import export_openraster, export_psd_imagemagick, make_text_layer_rgba, write_rgba
 from .io_utils import save_json, write_image
 from .mask_transfer_audit import manual_reletter_required_rows, transfer_records_to_dict
+from .storage_clone import publish_independent_png
 from .transfer_policy import (
     _replace_translation_regions,
     _review_candidate_overlay,
@@ -132,19 +133,44 @@ def export_page_artifacts(
     direct_region_path = page_root / "direct_patch_regions.png"
     transfer_audit_path = page_root / "transfer_audit.json"
 
-    write_image(source_original_path, source)
+    persistent_level = int(max(0, min(9, getattr(config.export, "persistent_png_compression", 4))))
+    sparse_level = int(max(0, min(9, getattr(config.export, "sparse_png_compression", 9))))
+    persistent_png = [cv2.IMWRITE_PNG_COMPRESSION, persistent_level]
+    sparse_png = [cv2.IMWRITE_PNG_COMPRESSION, sparse_level]
+
+    source_publish = None
+    if bool(getattr(config.export, "prefer_input_reflink", True)):
+        source_publish = publish_independent_png(source_path_local, source_original_path)
+    if source_publish is None:
+        write_image(source_original_path, source, params=persistent_png)
+        source_publish = "encoded"
     # The primary/authority source equals the selected source on the common path.
     # Do not store the same lossless page twice. Secondary-source arbitration
     # still keeps the separate authority original.
     authority_artifact_path = authority_source_path_artifact
     if bool(selected_secondary_source) or str(source_path_local) != str(authority_source_path):
-        write_image(authority_source_path_artifact, authority_source)
+        authority_publish = None
+        if bool(getattr(config.export, "prefer_input_reflink", True)):
+            authority_publish = publish_independent_png(authority_source_path, authority_source_path_artifact)
+        if authority_publish is None:
+            write_image(authority_source_path_artifact, authority_source, params=persistent_png)
     else:
         if not _replace_with_hardlink(authority_source_path_artifact, source_original_path):
             authority_artifact_path = source_original_path
 
-    write_image(original_path, target)
-    write_image(final_local, rendered)
+    target_publish = None
+    if bool(getattr(config.export, "prefer_input_reflink", True)):
+        target_publish = publish_independent_png(target_path_local, original_path)
+    if target_publish is None:
+        write_image(original_path, target, params=persistent_png)
+        target_publish = "encoded"
+    write_image(final_local, rendered, params=persistent_png)
+    project.meta["workspace_storage"] = {
+        "source_original": source_publish,
+        "target_original": target_publish,
+        "persistent_png_compression": persistent_level,
+        "sparse_png_compression": sparse_level,
+    }
 
     active_review_meta = project.meta.get(active_mode, {}) if isinstance(project.meta.get(active_mode, {}), dict) else {}
     # Manual-effect candidates originate from Direct safety analysis even when
@@ -173,7 +199,7 @@ def export_page_artifacts(
             review_preview_path.unlink(missing_ok=True)
 
     exact_clear = review_effective_mask
-    write_image(target_clear_mask_path, exact_clear)
+    write_image(target_clear_mask_path, exact_clear, params=sparse_png)
     save_json(transfer_audit_path, transfer_audit)
 
     if config.export.save_inpainted:
@@ -182,15 +208,15 @@ def export_page_artifacts(
         inpainted_path.unlink(missing_ok=True)
 
     if config.export.save_masks:
-        write_image(clear_mask_path, mask_result.mask)
+        write_image(clear_mask_path, mask_result.mask, params=sparse_png)
         if bool(getattr(config.export, "save_component_masks", False)):
             for unit_id, mask in mask_result.per_unit.items():
-                write_image(page_root / "masks" / f"{unit_id}.png", mask)
+                write_image(page_root / "masks" / f"{unit_id}.png", mask, params=sparse_png)
             for bubble in target_bubbles:
                 if bubble.mask is not None:
-                    write_image(page_root / "bubbles" / f"{bubble.id}.png", bubble.mask)
+                    write_image(page_root / "bubbles" / f"{bubble.id}.png", bubble.mask, params=sparse_png)
                 if bubble.safe_mask is not None:
-                    write_image(page_root / "bubbles" / f"{bubble.id}_safe.png", bubble.safe_mask)
+                    write_image(page_root / "bubbles" / f"{bubble.id}_safe.png", bubble.safe_mask, params=sparse_png)
         else:
             for d in (page_root / "masks", page_root / "bubbles"):
                 if d.exists():
@@ -200,32 +226,32 @@ def export_page_artifacts(
 
     # Post-render layer composition only: renderer pixels are already final.
     text_rgba = make_text_layer_rgba(target.shape[:2], lettering_masks, color=config.lettering.fill)
-    write_rgba(text_layer_path, text_rgba)
+    write_rgba(text_layer_path, text_rgba, params=sparse_png)
     # Mode-owned aliases make restore/review/export decisions independent. The
     # generic text_layer remains the final-composition interchange artifact.
     if active_mode == "hybrid":
         if not _replace_with_hardlink(hybrid_text_layer_path, text_layer_path):
-            write_rgba(hybrid_text_layer_path, text_rgba)
+            write_rgba(hybrid_text_layer_path, text_rgba, params=sparse_png)
     elif active_mode == "reletter":
         if not _replace_with_hardlink(reletter_text_layer_path, text_layer_path):
-            write_rgba(reletter_text_layer_path, text_rgba)
+            write_rgba(reletter_text_layer_path, text_rgba, params=sparse_png)
     chinese_rgba = np.zeros_like(text_rgba)
     if mask_transfer is not None:
         if direct_container_fast:
             # Direct has its own artifacts. Do not also write Mask/Hybrid aliases.
-            write_rgba(direct_layer_path, transfer_rgba)
-            write_image(direct_region_path, mask_transfer.composite_mask)
+            write_rgba(direct_layer_path, transfer_rgba, params=sparse_png)
+            write_image(direct_region_path, mask_transfer.composite_mask, params=sparse_png)
         elif active_mode == "hybrid":
-            write_rgba(hybrid_transfer_layer_path, transfer_rgba)
-            write_image(hybrid_transfer_mask_path, mask_transfer.composite_mask)
+            write_rgba(hybrid_transfer_layer_path, transfer_rgba, params=sparse_png)
+            write_image(hybrid_transfer_mask_path, mask_transfer.composite_mask, params=sparse_png)
         else:
-            write_rgba(transfer_layer_path, transfer_rgba)
-            write_image(transfer_mask_path, mask_transfer.composite_mask)
+            write_rgba(transfer_layer_path, transfer_rgba, params=sparse_png)
+            write_image(transfer_mask_path, mask_transfer.composite_mask, params=sparse_png)
         chinese_rgba = transfer_rgba.copy()
     text_use = text_rgba[..., 3] > 0
     chinese_rgba[text_use, :3] = text_rgba[text_use, :3]
     chinese_rgba[..., 3] = np.maximum(chinese_rgba[..., 3], text_rgba[..., 3])
-    write_rgba(chinese_layer_path, chinese_rgba)
+    write_rgba(chinese_layer_path, chinese_rgba, params=sparse_png)
 
     if config.export.layer_bundle:
         ora_path = page_root / "editable.ora"

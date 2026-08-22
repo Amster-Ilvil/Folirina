@@ -161,9 +161,16 @@ class _JSONLineClient:
 
 
 class _TextOnlyBase:
-    """Marker API consumed by Pipeline._recognize_paired_regions_text_only."""
+    """Marker API consumed by Pipeline._recognize_paired_regions_text_only.
+
+    v2.3.63 also exposes a real ``recognize_region`` contract.  The Studio's
+    manual OCR editor works on user-selected ROI crops, while Apple Live Text
+    historically implemented only whole-image ``recognize``.  That mismatch made
+    manual OCR silently return no text on the default macOS backend.
+    """
 
     region_text_only = True
+    supports_crop_recognition = True
 
     def __init__(self, lang: str, config: "OCRConfig") -> None:
         self.lang = lang
@@ -176,6 +183,35 @@ class _TextOnlyBase:
         if name in {"japan", "ja", "ja-jp"}:
             return ["ja-JP", "zh-Hans", "zh-Hant"]
         return ["zh-Hans", "ja-JP", "en-US"]
+
+    def recognize_region(
+        self,
+        image: np.ndarray,
+        bbox: tuple[int, int, int, int] | list[int],
+        *,
+        image_path: str | Path | None = None,
+    ) -> list[TextBlock]:
+        """Recognize one ROI crop using the same Apple backend.
+
+        Returned polygons intentionally live in crop-local coordinates.  The
+        manual OCR editor offsets TARGET polygons back into page coordinates and
+        treats SOURCE output as text-only content, so no page-global geometry is
+        lost here.
+        """
+        if image is None or getattr(image, "ndim", 0) < 2:
+            return []
+        h, w = image.shape[:2]
+        try:
+            x0, y0, x1, y1 = [int(round(float(v))) for v in list(bbox)[:4]]
+        except Exception as exc:
+            raise AppleLiveTextError(f"Apple OCR ROI 无效：{bbox!r}") from exc
+        x0=max(0,min(w,x0)); x1=max(0,min(w,x1)); y0=max(0,min(h,y0)); y1=max(0,min(h,y1))
+        if x1 <= x0 or y1 <= y0:
+            return []
+        crop=image[y0:y1,x0:x1].copy()
+        # Never pass the original page path for an ROI: the backend must OCR the
+        # actual crop rather than accidentally re-reading the full page.
+        return self.recognize(crop, image_path=None)
 
     def _block(self, image: np.ndarray, text: str, backend: str) -> list[TextBlock]:
         text = str(text or "").strip()

@@ -14,7 +14,7 @@ from PySide6.QtGui import QPixmap, QPainter, QColor, QImageReader, QIcon
 from PySide6.QtWidgets import (
     QApplication, QDialog, QWidget, QFrame, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QRadioButton, QSizePolicy, QGraphicsView, QGraphicsScene, QListWidget, QListWidgetItem, QComboBox, QMenu, QLineEdit, QAbstractItemView,
-    QSpinBox, QDoubleSpinBox, QSlider,
+    QSpinBox, QDoubleSpinBox, QSlider, QAbstractScrollArea,
 )
 
 from .gui_theme import MUTED
@@ -493,6 +493,12 @@ class ImageView(QGraphicsView):
         # implicitly shared by Qt, so reuse is cheap while the cache remains bounded.
         self._pixmap_cache: OrderedDict[tuple[str, int, int, int], QPixmap] = OrderedDict()
         self._pixmap_cache_limit = 5
+        # Auto-fit previews must not let transient scrollbars change the viewport
+        # size while a new page is being installed.  Qt's AsNeeded policy can
+        # otherwise create a resize -> fitInView -> scrollbar -> resize feedback
+        # loop that is visible as a horizontal/right-edge "shake" on page switch.
+        self._fit_pending = False
+        self._fit_in_progress = False
         self.setObjectName("workbenchImage")
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
@@ -503,8 +509,13 @@ class ImageView(QGraphicsView):
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        # ImageView is an always-fit preview (unlike ZoomPreviewView).  A fitted
+        # page never needs scrollbars, and keeping them permanently off makes the
+        # central canvas width stable across portrait pages of slightly different
+        # aspect ratios.
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setSizeAdjustPolicy(QAbstractScrollArea.SizeAdjustPolicy.AdjustIgnored)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMinimumHeight(320)
 
@@ -552,7 +563,7 @@ class ImageView(QGraphicsView):
         self._scene.clear(); self._item = self._scene.addPixmap(pix)
         self._scene.setSceneRect(self._item.boundingRect())
         self._current_key = key
-        self.fit_to_window()
+        self._schedule_fit()
         return True
 
     def clear_cache(self):
@@ -566,17 +577,38 @@ class ImageView(QGraphicsView):
         self._pixmap_cache.clear()
         self._current_key = None
 
-    def fit_to_window(self):
-        if self._item is not None:
+    def _schedule_fit(self):
+        if self._item is None or self._fit_pending:
+            return
+        self._fit_pending = True
+        # Coalesce image replacement and the layout/viewport resize it triggers
+        # into one event-loop turn.  This prevents two visibly different scale
+        # transforms from being painted during one page switch.
+        QTimer.singleShot(0, self._apply_fit)
+
+    def _apply_fit(self):
+        self._fit_pending = False
+        if self._item is None or self._fit_in_progress:
+            return
+        if self.viewport().width() < 8 or self.viewport().height() < 8:
+            return
+        self._fit_in_progress = True
+        try:
             self.resetTransform()
             rect = _fit_scene_rect(self._scene)
             if not rect.isNull() and not rect.isEmpty():
                 self.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
                 self.centerOn(self._item)
+        finally:
+            self._fit_in_progress = False
+
+    def fit_to_window(self):
+        if self._item is not None:
+            self._schedule_fit()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self.fit_to_window()
+        self._schedule_fit()
 
 class Card(QFrame):
     def __init__(self, title: str = "", subtitle: str = "", *, blue=False, parent=None):

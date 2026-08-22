@@ -17,6 +17,7 @@ from .modes.aligned_overlay_reveal.core import AlignedOverlayResult
 from .transparent_bubble_reveal import TransparentBubbleResult
 from .layout_evidence import collect_koharu_layout_evidence_cached
 from .debug import mask_overlay
+from .storage_clone import publish_independent_png
 from .io_utils import save_json, stem_id, write_image
 from .export import write_rgba
 from .models import PagePair, PageProject, QAItem, RegistrationResult
@@ -192,15 +193,23 @@ def emit_aligned_overlay_page(
     review_preview = page_root / "review_preview.png"
     target_clear_mask = page_root / "target_clear_mask.png"
 
-    write_image(source_original, source)
-    write_image(target_original, target)
-    write_rgba(layer_path, result.layer_rgba)
-    write_image(mask_path, result.erase_mask)
-    write_image(source_mask_path, result.source_ink_mask)
-    write_image(hole_mask_path, result.plan.full_raster_mask)
-    write_image(erase_mask_path, result.erase_mask)
+    persistent_level = int(max(0, min(9, getattr(config.export, "persistent_png_compression", 4))))
+    sparse_level = int(max(0, min(9, getattr(config.export, "sparse_png_compression", 9))))
+    persistent_png = [cv2.IMWRITE_PNG_COMPRESSION, persistent_level]
+    sparse_png = [cv2.IMWRITE_PNG_COMPRESSION, sparse_level]
+    source_method = publish_independent_png(pair.source_path, source_original) if bool(getattr(config.export, "prefer_input_reflink", True)) else None
+    target_method = publish_independent_png(pair.target_path, target_original) if bool(getattr(config.export, "prefer_input_reflink", True)) else None
+    if source_method is None:
+        write_image(source_original, source, params=persistent_png)
+    if target_method is None:
+        write_image(target_original, target, params=persistent_png)
+    write_rgba(layer_path, result.layer_rgba, params=sparse_png)
+    write_image(mask_path, result.erase_mask, params=sparse_png)
+    write_image(source_mask_path, result.source_ink_mask, params=sparse_png)
+    write_image(hole_mask_path, result.plan.full_raster_mask, params=sparse_png)
+    write_image(erase_mask_path, result.erase_mask, params=sparse_png)
     write_image(regions_path, result.regions_overlay)
-    write_image(target_clear_mask, result.erase_mask)
+    write_image(target_clear_mask, result.erase_mask, params=sparse_png)
 
     # Aligned whole-page mode owns only its dedicated diagnostics.  Do not borrow
     # Transparent Reveal debug writers/artifacts.
@@ -368,15 +377,23 @@ def emit_transparent_bubble_page(
     meta_path = page_root / "transparent_bubble_reveal.json"
     review_preview = page_root / "review_preview.png"
 
-    write_image(source_original, source)
-    write_image(target_original, target)
-    write_rgba(final_rgba, result.image_rgba)
+    persistent_level = int(max(0, min(9, getattr(config.export, "persistent_png_compression", 4))))
+    sparse_level = int(max(0, min(9, getattr(config.export, "sparse_png_compression", 9))))
+    persistent_png = [cv2.IMWRITE_PNG_COMPRESSION, persistent_level]
+    sparse_png = [cv2.IMWRITE_PNG_COMPRESSION, sparse_level]
+    source_method = publish_independent_png(pair.source_path, source_original) if bool(getattr(config.export, "prefer_input_reflink", True)) else None
+    target_method = publish_independent_png(pair.target_path, target_original) if bool(getattr(config.export, "prefer_input_reflink", True)) else None
+    if source_method is None:
+        write_image(source_original, source, params=persistent_png)
+    if target_method is None:
+        write_image(target_original, target, params=persistent_png)
+    write_rgba(final_rgba, result.image_rgba, params=sparse_png)
     if not _replace_with_hardlink(jp_layer, final_rgba):
-        write_rgba(jp_layer, result.jp_layer_rgba)
+        write_rgba(jp_layer, result.jp_layer_rgba, params=sparse_png)
     write_image(cn_layer, result.cn_layer_rgb)
-    write_image(clear_mask, result.clear_mask)
+    write_image(clear_mask, result.clear_mask, params=sparse_png)
     if not _replace_with_hardlink(target_clear_mask, clear_mask):
-        write_image(target_clear_mask, result.clear_mask)
+        write_image(target_clear_mask, result.clear_mask, params=sparse_png)
     write_image(review_preview, mask_overlay(target, result.clear_mask) if cv2.countNonZero(result.clear_mask) else target)
     debug_artifacts = _write_transparent_reveal_debug_artifacts(page_root, target, result, config.bubbles)
     semantic_artifacts = _write_semantic_artifacts(page_root, target, result, config.semantic)
@@ -467,7 +484,6 @@ def emit_transparent_bubble_page(
             "transparent_bubble_reveal": payload,
             "transparent_reveal_debug": debug_artifacts,
             "semantic_layout": semantic_artifacts,
-            "aligned_overlay_reveal": {"used": False},
             "direct_patch": {"used": False, "manual_effect_candidates": []},
             "mask_replace": {"used": False, "review_regions": []},
             "auto_applied_count": int(result.applied_count),

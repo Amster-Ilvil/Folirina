@@ -23,14 +23,50 @@ class RuntimeConfig(BaseModel):
     mps_fallback: bool = True
     mps_memory_fraction: float = 0.82
     release_cache_every: int = 8
+    # Long-running books should not retain full-page NumPy masks for every finished page.
+    detach_completed_page_arrays: bool = True
 
 
 class BatchConfig(BaseModel):
     resume: bool = True
     stop_on_error: bool = False
     skip_completed: bool = True
+    # ``strict`` keeps the historical completed-page fingerprint contract.
+    # ``continue`` is the GUI's explicit “继续处理整本” contract: preserve an
+    # already-successful page when SOURCE/TARGET paths and transfer mode still
+    # match, even if later UI tuning changed the current job fingerprint. This
+    # prevents a crash/restart from turning continuation into an accidental
+    # from-scratch rerun. Batch config is intentionally outside mode-scoped
+    # render identity, so this policy never changes pixels of newly processed pages.
+    resume_policy: Literal["strict", "continue"] = "strict"
     prefetch_workers: int = 2
-    save_manifest_every: int = 1
+    # Small books may eagerly prefetch completed PageProjects. Larger books use a
+    # bounded sliding window so resume I/O/JSON decode overlaps current-page work
+    # without materializing the whole book.
+    resume_prefetch_page_limit: int = 48
+    resume_prefetch_window: int = 16
+    # Threaded JSON prefetch only pays off once completed page projects are large
+    # enough; tiny metadata files stay on the lower-overhead sequential path.
+    resume_prefetch_min_project_bytes: int = 16384
+    # Above this size BookProject.pages becomes a disk-backed lazy Sequence. The
+    # authoritative pages/<id>/project.json files are streamed into book/QA output.
+    stream_book_page_threshold: int = 96
+    # One-page CPU/I/O look-ahead. Accelerator/model execution remains strictly
+    # single-lane; only SOURCE/TARGET decode for the next page is overlapped.
+    # v2.3.58 stability rollback: speculative 4K decode introduced in v2.3.57
+    # can block a whole-book worker on a pathological image/codec.  Keep the
+    # implementation available for explicit experiments, but production defaults
+    # to the proven synchronous page decode path.
+    decode_prefetch_enabled: bool = False
+    decode_prefetch_pages: int = 1
+    decode_prefetch_experimental_opt_in: bool = False
+    # Per-page project transactions are already the authoritative resume boundary.
+    # Coalesce book-level control files so a 300-1000 page run does not fsync two
+    # redundant JSON files after every page. Terminal/cancel/failure states still
+    # force an immediate checkpoint.
+    checkpoint_every: int = 4
+    checkpoint_max_interval_seconds: float = 15.0
+    save_manifest_every: int = 8
 
 
 class CacheConfig(BaseModel):
@@ -38,6 +74,10 @@ class CacheConfig(BaseModel):
     registration: bool = True
     ocr: bool = True
     bubbles: bool = True
+    # Stage caches are recomputable. Keep only recent pages so batch disk usage
+    # does not grow without bound while retaining fast backtracking near the
+    # current page. 0 disables automatic pruning.
+    retain_recent_page_caches: int = 8
 
 
 class PageManagementConfig(BaseModel):
@@ -876,10 +916,11 @@ class MaskReplaceConfig(PixelTransferConfigBase):
     photo_pair_reject_edge_clipped_open_text: bool = True
     photo_pair_reject_edge_clipped_complex_text: bool = True
     photo_pair_edge_clipped_review_required: bool = True
-    # v2.3.30: shared white-bubble source clarity enhancement. Precise Mask may
-    # also rebuild the local CN source patch as clean paper + source-derived ink
-    # before compositing it into a confirmed white target container.
-    direct_white_clarity_enhance_enabled: bool = True
+    # v2.3.67: white-bubble Chinese raster enhancement is an explicit opt-in.
+    # When disabled, a verified white TARGET bubble keeps the aligned SOURCE
+    # Chinese raster and skips optional sharpening / crisp-ink / ink-rebuild
+    # ladders. TARGET Japanese clearing and structure protection still run.
+    direct_white_clarity_enhance_enabled: bool = False
     direct_white_clarity_alpha_gamma: float = 1.0
     direct_white_clarity_black_boost: int = 0
     direct_white_clarity_pure_white_floor: int = 248
@@ -896,7 +937,14 @@ class MaskReplaceConfig(PixelTransferConfigBase):
     mask_source_structure_min_aspect: float = 2.6
     mask_source_structure_min_span_ratio: float = 0.16
     mask_source_spiky_boundary_band_px: int = 14
+    # v2.3.59: SOURCE text authority is derived independently from geometry.
+    # A boundary/ray guard may never delete compact SOURCE lettering merely
+    # because the glyph became connected to the balloon outline in a scan.
+    mask_source_lettering_relief_enabled: bool = True
+    mask_source_lettering_relief_dilate_px: int = 1
     mask_target_structure_guard_enabled: bool = True
+    mask_target_structure_text_relief_enabled: bool = True
+    mask_target_structure_text_relief_dilate_px: int = 1
     mask_target_border_probe_dilate_px: int = 4
     mask_target_border_restore_fringe_px: int = 2
     mask_target_immutable_band_enabled: bool = True
@@ -906,6 +954,18 @@ class MaskReplaceConfig(PixelTransferConfigBase):
     mask_target_band_text_margin_px: int = 3
     mask_target_spiky_glyph_relief_enabled: bool = True
     mask_target_spiky_glyph_relief_dilate_px: int = 1
+    # v2.3.59: true burst/free-text geometry may describe only the paired-diff
+    # text lane and contain deep notches.  A validated inner ellipse completes
+    # the white burst paper for TARGET-language clearing only; it never expands
+    # SOURCE write authority.
+    mask_target_spiky_safe_core_ellipse_enabled: bool = True
+    mask_target_spiky_safe_core_inset_ratio: float = 0.045
+    mask_target_spiky_safe_core_min_inset_px: int = 6
+    # v2.3.59: publication guard against SOURCE lettering loss caused by either
+    # SOURCE structure filtering or TARGET-side write protection. This measures
+    # the pre-guard lettering authority instead of auditing an already-clipped mask.
+    mask_raw_source_completeness_enabled: bool = True
+    mask_raw_source_min_coverage: float = 0.965
 
 
 class DirectPatchConfig(PixelTransferConfigBase):
@@ -1136,6 +1196,11 @@ class PairingConfig(BaseModel):
     aspect_weight: float = 0.10
     edge_weight: float = 0.16
     confidence_floor: float = 0.45
+    # Full O(N*M) sequence alignment is retained for ordinary books. Large smart
+    # segments use a diagonal band; the band automatically widens for count
+    # differences and falls back to full alignment only if no valid path exists.
+    smart_alignment_full_matrix_max_cells: int = 250000
+    smart_alignment_band: int = 64
     # Destructive transfer gets a second OCR-free same-page verification after
     # registration. This catches 80->81 style page shifts even when filenames or
     # order pairing were wrong.
@@ -1522,10 +1587,10 @@ class HybridMaskConfig(PixelTransferConfigBase):
     photo_pair_reject_edge_clipped_open_text: bool = True
     photo_pair_reject_edge_clipped_complex_text: bool = True
     photo_pair_edge_clipped_review_required: bool = True
-    # v2.3.30: shared white-bubble source clarity enhancement for Hybrid
-    # mask-first transfer. OCR completion remains unchanged; only the paired
-    # Chinese pixel patch is cleaned when the target container is verified white.
-    direct_white_clarity_enhance_enabled: bool = True
+    # v2.3.67: Hybrid mirrors Precise Mask product semantics but keeps its own
+    # private config/renderer. White-bubble Chinese enhancement is opt-in and is
+    # OFF by default; OCR completion remains independent of this switch.
+    direct_white_clarity_enhance_enabled: bool = False
     direct_white_clarity_alpha_gamma: float = 1.0
     direct_white_clarity_black_boost: int = 0
     direct_white_clarity_pure_white_floor: int = 248
@@ -1541,7 +1606,12 @@ class HybridMaskConfig(PixelTransferConfigBase):
     hybrid_source_structure_min_aspect: float = 2.6
     hybrid_source_structure_min_span_ratio: float = 0.16
     hybrid_source_spiky_boundary_band_px: int = 14
+    # v2.3.59 Hybrid-private mirror of Precise Mask lettering/structure authority.
+    hybrid_source_lettering_relief_enabled: bool = True
+    hybrid_source_lettering_relief_dilate_px: int = 1
     hybrid_target_structure_guard_enabled: bool = True
+    hybrid_target_structure_text_relief_enabled: bool = True
+    hybrid_target_structure_text_relief_dilate_px: int = 1
     hybrid_target_border_probe_dilate_px: int = 4
     hybrid_target_border_restore_fringe_px: int = 2
     hybrid_target_immutable_band_enabled: bool = True
@@ -1551,6 +1621,12 @@ class HybridMaskConfig(PixelTransferConfigBase):
     hybrid_target_band_text_margin_px: int = 3
     hybrid_target_spiky_glyph_relief_enabled: bool = True
     hybrid_target_spiky_glyph_relief_dilate_px: int = 1
+    hybrid_target_spiky_safe_core_ellipse_enabled: bool = True
+    hybrid_target_spiky_safe_core_inset_ratio: float = 0.045
+    hybrid_target_spiky_safe_core_min_inset_px: int = 6
+    # v2.3.59 Hybrid-private mirror of Precise Mask SOURCE completeness.
+    hybrid_raw_source_completeness_enabled: bool = True
+    hybrid_raw_source_min_coverage: float = 0.965
     # OCR policy: automatic OCR is a fallback only for truly uncovered regions.
     # Any region that already has a Mask-stage candidate/ownership is excluded
     # from automatic OCR; the GUI manual OCR box may still explicitly override.
@@ -1646,6 +1722,13 @@ class ExportConfig(BaseModel):
     image_format: str = "png"
     tiff: bool = False
     layer_bundle: bool = False
+    # Preserve independent SOURCE/TARGET workspace copies while using CoW clones
+    # for already-PNG inputs when the filesystem supports it (APFS/reflink).
+    prefer_input_reflink: bool = True
+    # Lossless compression levels: persistent colour pages stay balanced for
+    # throughput; sparse masks/layers favour disk size.
+    persistent_png_compression: int = 4
+    sparse_png_compression: int = 9
 
 
 class SemanticLayoutConfig(BaseModel):

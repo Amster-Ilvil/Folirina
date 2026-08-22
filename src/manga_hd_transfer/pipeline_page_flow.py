@@ -113,6 +113,7 @@ def run_page_flow(
     page_mark: PageMark | dict | None = None,
     cancel_cb=None,
     progress_cb=None,
+    prefetched_images=None,
     trace=None,
     check_cancel: Callable | None = None,
     passthrough_page: Callable,
@@ -153,7 +154,7 @@ def run_page_flow(
         emit_progress(100, "skip", "页面已标记跳过")
         return passthrough_page(pair, page_root, final_path, mark)
 
-    inputs = load_page_inputs(pair, page_root, config)
+    inputs = load_page_inputs(pair, page_root, config, prefetched_images=prefetched_images)
     authority_source_path = inputs.authority_source_path
     source_path_local = inputs.source_path_local
     target_path_local = inputs.target_path_local

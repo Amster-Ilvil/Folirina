@@ -18,6 +18,7 @@ from .io_utils import load_json, read_image, save_json, write_image
 from .result_state import commit_reviewed_result, resolve_result_state
 from .schema_compat import as_dict
 from .workspace_guard import guarded_page_write
+from .review_clear_mask import safe_automatic_clear_seed
 
 def _read_layer_alpha(path: Path, shape: tuple[int, int]) -> np.ndarray | None:
     if not path.exists():
@@ -231,6 +232,70 @@ def _apply_target_layer_erase_to_rendered(
     return out, diag
 
 
+def _load_binary_mask(path: Path, shape: tuple[int, int]) -> np.ndarray | None:
+    if not path.exists():
+        return None
+    mask = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    if mask is None or mask.shape != shape:
+        return None
+    return (mask > 0).astype(np.uint8) * 255
+
+
+def _subtract_mask_file(path: Path, remove_mask: np.ndarray) -> dict:
+    current = _load_binary_mask(path, remove_mask.shape)
+    if current is None:
+        return {'path': path.name, 'changed': False, 'reason': 'missing_or_invalid'}
+    before = int(cv2.countNonZero(current))
+    current[remove_mask > 0] = 0
+    after = int(cv2.countNonZero(current))
+    write_image(path, current)
+    return {'path': path.name, 'changed': before != after, 'before_pixels': before, 'after_pixels': after, 'removed_pixels': before - after}
+
+
+def _project_restore_back_into_masks(page_dir: Path, effective: np.ndarray) -> dict:
+    """Persist TARGET-restore intent back into the driving masks.
+
+    A reviewer uses TARGET restore to say "this area should stay Japanese".
+    Merely covering the final image is not enough, because a later re-apply would
+    bring Chinese back.  Therefore the restore footprint is subtracted from the
+    relevant clear/force masks.  If there is no explicit manual clear override
+    yet, one is materialized from the current automatic clear artifact with the
+    restored area removed.
+    """
+    if cv2.countNonZero(effective) == 0:
+        return {'used': False, 'reason': 'empty_restore'}
+    shape = effective.shape
+    touched: list[dict] = []
+    # Existing explicit override masks should lose the restored pixels.
+    for name in ('manual_force_auto_target_override.png', 'manual_clear_mask.png', 'manual_japanese_clear_mask.png', 'manual_force_transfer_mask.png'):
+        touched.append(_subtract_mask_file(page_dir / name, effective))
+
+    # If no manual clear override exists yet, materialize one from the effective
+    # automatic clear artifact so future remove/apply reruns keep this restore.
+    manual_clear = page_dir / 'manual_clear_mask.png'
+    if not manual_clear.exists():
+        seeded, seed_diag = safe_automatic_clear_seed(page_dir, shape)
+        if seeded is not None:
+            before = int(cv2.countNonZero(seeded))
+            seeded[effective > 0] = 0
+            write_image(manual_clear, seeded)
+            touched.append({
+                'path': manual_clear.name,
+                'changed': True,
+                'created_from': str(seed_diag.get('source') or 'automatic_clear'),
+                'automatic_projection': seed_diag,
+                'before_pixels': before,
+                'after_pixels': int(cv2.countNonZero(seeded)),
+                'removed_pixels': before - int(cv2.countNonZero(seeded)),
+            })
+
+    return {
+        'used': True,
+        'effective_restore_pixels': int(cv2.countNonZero(effective)),
+        'touched_masks': touched,
+    }
+
+
 def _apply_target_layer_restore_to_rendered(
     page_dir: Path,
     rendered: np.ndarray,
@@ -263,6 +328,7 @@ def _apply_target_layer_restore_to_rendered(
     out = rendered.copy()
     sel = effective > 0
     out[sel] = target[sel]
+    persist_diag = _project_restore_back_into_masks(page_dir, effective)
     write_image(page_dir / 'target_layer_restore_effective_mask.png', effective)
     write_image(page_dir / 'target_layer_restore_preview.png', out)
     diag = {
@@ -273,6 +339,7 @@ def _apply_target_layer_restore_to_rendered(
         'dilate_px': int(dilate_px),
         'background_policy': 'target_original_exact_restore',
         'chinese_pixel_policy': 'allow_replace_with_target',
+        'mask_back_projection': persist_diag,
     }
     save_json(page_dir / 'target_layer_restore.json', diag)
     return out, diag

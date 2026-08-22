@@ -22,7 +22,15 @@ from .ocr import build_backend
 from .schema_compat import as_dict, as_dict_rows
 
 OCR_EDIT_MODE_SCOPE = {
+    # Reviewer OCR is a page-local overlay, not an automatic renderer feature.
+    # Direct / pure Mask keep their historical mask_ocr scope. Reveal modes use
+    # a dedicated review_ocr scope so their mode-owned automatic artifacts stay
+    # completely isolated while reviewers can still draw a local OCR/text box.
     "hybrid": "mask_ocr",
+    "mask_replace": "mask_ocr",
+    "direct_patch": "mask_ocr",
+    "aligned_overlay_reveal": "review_ocr",
+    "transparent_bubble_reveal": "review_ocr",
     "reletter": "ocr_reletter",
 }
 

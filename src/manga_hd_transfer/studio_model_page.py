@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from .gui_components import Card, OptionRow, StableComboBox, StableSpinBox, StableDoubleSpinBox
+from .gui_dialogs import confirm_action
 from .gui_workers import ComponentProbeWorker, ModelDownloadWorker, DependencyInstallWorker, ModelNetworkProbeWorker
 from .model_downloads import (
     apply_config_updates, model_home, model_local_paths, import_builtin_model,
@@ -65,6 +66,7 @@ class ModelPage(QWidget):
         self._dependency_worker = None
         self._dependency_key = ""
         self._network_probe_worker = None
+        self._global_busy = False
         outer = QVBoxLayout(self); outer.setContentsMargins(0,0,0,0); outer.setSpacing(0)
         page_scroll = QScrollArea(self); page_scroll.setWidgetResizable(True); page_scroll.setFrameShape(QFrame.Shape.NoFrame)
         page_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -285,7 +287,9 @@ class ModelPage(QWidget):
         status = Card("模型下载与接入状态", "如果你选择了本地 OCR / 配准 / 气泡模型，但本机还没有它们，处理开始前会自动补齐依赖并下载所需模型；这里仍可手动检查/修复。")
         self.status_labels = {}
         self.model_download_buttons = {}
+        self.model_import_buttons = {}
         self.dependency_buttons = {}
+        self._dependency_installable = {}
         downloadable = {"paddle", "lightglue", "loftr", "mangalens", "ysg_obb", "rtdetr_v2", "sam2", "koharu_layout", "manga_ocr", "baberu_ocr", "ocr48px", "lama_manga", "aot_inpainting", "flux2_klein", "rorem_mixed"}
         status_rows = [
             ("paddle","PaddleOCR"), ("lightglue","LightGlue"), ("loftr","LoFTR"),
@@ -304,6 +308,8 @@ class ModelPage(QWidget):
             q=QLabel("检测中"); q.setObjectName("hint"); q.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter); self.status_labels[key]=q; line.addWidget(q)
             if key in downloadable:
                 dep=QPushButton("安装依赖"); dep.setObjectName("modelDownload"); dep.setMinimumWidth(68); dep.setMaximumWidth(88)
+                installable = key not in {"lama_manga", "aot_inpainting", "flux2_klein", "rorem_mixed"}
+                self._dependency_installable[key] = installable
                 if key == "paddle":
                     dep.setToolTip("创建/修复独立 PaddleOCR Python 3.9–3.13 venv；不会把 Paddle 强装进 GUI Python。")
                 elif key in {"lightglue", "loftr"}:
@@ -316,7 +322,7 @@ class ModelPage(QWidget):
                     dep.setToolTip(f"安装 {name} 的运行依赖，并在安装后真实导入验证。")
                 dep.clicked.connect(lambda _=False,k=key:self._install_model_dependencies(k)); self.dependency_buttons[key]=dep; line.addWidget(dep)
                 imp=QPushButton("离线导入"); imp.setObjectName("modelDownload"); imp.setMinimumWidth(68); imp.setMaximumWidth(82)
-                imp.clicked.connect(lambda _=False,k=key:self._import_model(k)); line.addWidget(imp)
+                imp.clicked.connect(lambda _=False,k=key:self._import_model(k)); self.model_import_buttons[key]=imp; line.addWidget(imp)
                 b=QPushButton("下载/校验"); b.setObjectName("modelDownload"); b.setMinimumWidth(82); b.setMaximumWidth(96)
                 if key == "paddle": b.setText("下载/预热")
                 b.clicked.connect(lambda _=False,k=key:self._download_model(k)); self.model_download_buttons[key]=b; line.addWidget(b)
@@ -614,17 +620,33 @@ class ModelPage(QWidget):
     def _network_probe_finished(self):
         self._network_probe_worker=None
 
+    def has_write_task_running(self) -> bool:
+        # Presence, not only QThread.isRunning(), is the controller lifecycle
+        # authority. This closes the start/finish signal windows where a second
+        # writer could otherwise begin before the GUI clears the first worker.
+        return bool(self._model_download_worker is not None or self._dependency_worker is not None)
+
+    def _refresh_model_write_controls(self) -> None:
+        blocked = bool(self._global_busy or self.has_write_task_running())
+        for key, button in self.dependency_buttons.items():
+            button.setEnabled(bool(self._dependency_installable.get(key, True)) and not blocked)
+        for button in self.model_download_buttons.values():
+            button.setEnabled(not blocked)
+        for button in self.model_import_buttons.values():
+            button.setEnabled(not blocked)
+        if hasattr(self, "install_all_dependencies"):
+            self.install_all_dependencies.setEnabled(not blocked)
+
+    def set_processing_busy(self, busy: bool) -> None:
+        self._global_busy = bool(busy)
+        self._refresh_model_write_controls()
+
     def _set_dependency_busy(self, busy: bool, active_key: str = ""):
         for key,button in self.dependency_buttons.items():
-            button.setEnabled(not busy)
             button.setText("安装中…" if busy and key == active_key else "安装依赖")
         if hasattr(self, "install_all_dependencies"):
-            self.install_all_dependencies.setEnabled(not busy)
             self.install_all_dependencies.setText("安装中…" if busy and active_key == "all" else "安装全部缺失依赖")
-        # Avoid modifying the Python environment while a model loader/download
-        # may be importing the same packages.
-        for button in self.model_download_buttons.values():
-            button.setEnabled(not busy and self._model_download_worker is None)
+        self._refresh_model_write_controls()
 
     def _install_model_dependencies(self, key: str):
         if self._dependency_worker is not None and self._dependency_worker.isRunning():
@@ -632,6 +654,9 @@ class ModelPage(QWidget):
             return
         if self._model_download_worker is not None and self._model_download_worker.isRunning():
             QMessageBox.information(self, "模型正在下载", "请等待当前模型下载完成后再安装运行依赖。")
+            return
+        if self.window._busy_running():
+            QMessageBox.information(self, "任务进行中", "请等待当前页面处理、模型维护或程序更新任务结束后再安装依赖。")
             return
         self._apply_model_network_settings(show_message=False)
         labels={"paddle":"PaddleOCR","lightglue":"LightGlue","loftr":"LoFTR","mangalens":"MangaLens","ysg_obb":"YSG YOLO OBB","rtdetr_v2":"RT-DETR-v2","sam2":"SAM 2.1","all":"全部内置模型"}
@@ -649,17 +674,21 @@ class ModelPage(QWidget):
             elif platform.system() == "Windows":
                 extra += " Windows 会同时检查 py launcher 与 PATH 中的兼容 Python。"
         target_text="当前 GUI Python" if key not in {"paddle","all"} else "各自兼容的隔离运行环境"
-        reply=QMessageBox.question(
-            self,"安装模型运行依赖",
-            f"将为 {label} 安装运行依赖到{target_text}。{missing_text}{extra}\n\n安装完成后会用独立子进程真实验证。继续吗？"
-        )
-        if reply!=QMessageBox.StandardButton.Yes:
+        if not confirm_action(
+            self, "安装模型运行依赖",
+            f"将为 {label} 安装运行依赖到{target_text}。{missing_text}{extra}\n\n安装完成后会用独立子进程真实验证。继续吗？",
+            confirm_text="安装", destructive=False,
+        ):
+            return
+        if self.window._busy_running():
+            QMessageBox.information(self, "任务状态已变化", "确认期间已有其它写任务启动；本次依赖安装已取消。")
             return
         self._dependency_key=str(key)
         self.model_download_status.setText(f"正在安装 {label} 运行依赖…")
         self.model_progress.setVisible(True); self.model_progress.setRange(0,0)
         self._set_dependency_busy(True,str(key))
         worker=DependencyInstallWorker(str(key)); self._dependency_worker=worker
+        self.window._set_busy(None)
         worker.progress.connect(lambda msg:self.model_download_status.setText(str(msg)))
         worker.done.connect(self._dependency_install_done); worker.failed.connect(self._dependency_install_failed)
         worker.finished.connect(self._dependency_install_finished); worker.finished.connect(worker.deleteLater); worker.start()
@@ -683,9 +712,13 @@ class ModelPage(QWidget):
         self._dependency_worker=None; self._dependency_key=""
         self._set_dependency_busy(False)
         self.model_progress.setVisible(False); self.model_progress.setRange(0,100); self.model_progress.setValue(0)
+        self.window._set_busy(None)
         QTimer.singleShot(0,lambda:self.refresh(force_probe=True))
 
     def _import_model(self, key: str):
+        if self.window._busy_running():
+            QMessageBox.information(self, "任务进行中", "请等待当前处理、模型维护或程序更新任务结束后再导入模型。")
+            return
         if key == "paddle":
             profile=str(self.paddle_model_profile.currentData() or "ppocr_v6_medium") if hasattr(self,"paddle_model_profile") else "ppocr_v6_medium"
             if profile in {"paddle_vl_16","pp_structure_v3"}:
@@ -712,7 +745,6 @@ class ModelPage(QWidget):
 
     def _set_model_download_busy(self, busy: bool, active_key: str = ""):
         for key,button in self.model_download_buttons.items():
-            button.setEnabled(not busy)
             if busy and key == active_key:
                 button.setText("下载中…")
             elif key == "paddle":
@@ -722,17 +754,24 @@ class ModelPage(QWidget):
         self.model_progress.setVisible(bool(busy))
         if not busy:
             self.model_progress.setRange(0,100); self.model_progress.setValue(0)
+        self._refresh_model_write_controls()
 
     def _download_model(self, key: str):
-        self._apply_model_network_settings(show_message=False)
         if self._model_download_worker is not None and self._model_download_worker.isRunning():
             self.window.statusBar().showMessage("已有模型正在下载，请等待当前任务完成。",3500); return
+        if self._dependency_worker is not None and self._dependency_worker.isRunning():
+            self.window.statusBar().showMessage("已有依赖安装任务正在运行，请等待完成。",3500); return
+        if self.window._busy_running():
+            QMessageBox.information(self, "任务进行中", "请等待当前页面处理、模型维护或程序更新任务结束后再下载模型。")
+            return
+        self._apply_model_network_settings(show_message=False)
         sizes={"paddle":"模型大小随档位变化","lightglue":"约 45 MB","loftr":"约 45 MB","mangalens":"约 12 MB","ysg_obb":"YSG OBB 模型","rtdetr_v2":"约 172 MB + 配置","sam2":"约 156 MB","baberu_ocr":"约 121 MB ONNX","manga_ocr":"约 460 MB","ocr48px":"约 195 MB checkpoint + 字表 + 固定网络源码","lama_manga":"约 200 MB","koharu_layout":"大型实例分割模型","aot_inpainting":"模型 + 配置","flux2_klein":"超大型目录，建议离线导入","rorem_mixed":"约 1.9 GiB UNet + SDXL 运行组件"}
         label={"paddle":self.paddle_model_profile.currentText(),"lightglue":"LightGlue SIFT","loftr":"LoFTR outdoor","mangalens":"MangaLens","ysg_obb":"YSG YOLO OBB","rtdetr_v2":"RT-DETR-v2","sam2":"SAM 2.1 Hiera Tiny","koharu_layout":"Koharu Layout RF-DETR Seg 2XL","manga_ocr":"Manga OCR","baberu_ocr":"Baberu OCR","ocr48px":"48px AR OCR","lama_manga":"LaMa Manga","aot_inpainting":"AOT Inpainting","flux2_klein":"FLUX.2 Klein","rorem_mixed":"RORem Mixed"}.get(key,key)
         self.model_download_status.setText(f"正在主动下载 {label} · {sizes.get(key,'')}。下载使用临时 .part 文件，完成后原子替换。")
         self._model_download_key=str(key); self._set_model_download_busy(True,key)
         self.model_progress.setRange(0,0)
         worker=ModelDownloadWorker(key,self.window.state.config.model_copy(deep=True)); self._model_download_worker=worker
+        self.window._set_busy(None)
         worker.progress.connect(self._model_download_progress); worker.done.connect(self._model_download_done); worker.failed.connect(self._model_download_failed)
         worker.finished.connect(self._model_download_finished); worker.finished.connect(worker.deleteLater); worker.start()
 
@@ -764,6 +803,7 @@ class ModelPage(QWidget):
 
     def _model_download_finished(self):
         self._model_download_worker=None; self._model_download_key=""; self._set_model_download_busy(False)
+        self.window._set_busy(None)
 
     def _set_ocr(self,key):
         if not self._mode_requires_ocr_controls(getattr(self.window.state.config.transfer, "mode", "auto")):
@@ -950,6 +990,23 @@ class ModelPage(QWidget):
         self._apply_probe_statuses(self._probe_cache)
 
 
+    def shutdown_write_workers(self, timeout_ms: int = 250) -> bool:
+        """Refuse app teardown while a model/dependency worker writes to disk."""
+        all_stopped = True
+        for worker in (self._model_download_worker, self._dependency_worker):
+            try:
+                if worker is None or not worker.isRunning():
+                    continue
+                worker.wait(max(0, int(timeout_ms)))
+                if worker.isRunning():
+                    all_stopped = False
+            except RuntimeError:
+                continue
+            except Exception:
+                logger.debug("model write shutdown check failed", exc_info=True)
+                all_stopped = False
+        return all_stopped
+
     def shutdown_background_probes(self, timeout_ms: int = 2200) -> None:
         """Stop read-only probe QThreads before QApplication teardown.
 
@@ -973,6 +1030,8 @@ class ModelPage(QWidget):
             setattr(self, attr, None)
 
     def _start_probe(self):
+        if self._global_busy or self.has_write_task_running():
+            return
         if self._probe_worker is not None and self._probe_worker.isRunning():
             return
         worker = ComponentProbeWorker(self.window.state.config.model_copy(deep=True))

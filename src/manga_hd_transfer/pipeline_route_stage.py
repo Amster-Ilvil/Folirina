@@ -7,17 +7,16 @@ from typing import Any
 
 import numpy as np
 
+from .modes.aligned_overlay_reveal.route import execute_isolated_hole_route
 from .modes.aligned_overlay_reveal.renderer import apply_detector_policy_guard, build_aligned_overlay_plan, execute_aligned_overlay
-from .modes.aligned_overlay_reveal.hole_renderer import build_production_aligned_hole_result
+from .modes.aligned_overlay_reveal.persist import persist_aligned_hole_page
 from .config import PipelineConfig
 from .models import PagePair, PageProject, QAItem, RegistrationResult
 from .page_management import PageMark
 from .pipeline_direct_arbitration import arbitrate_direct_source
 from .pipeline_passthrough import emit_passthrough_page
-from .pipeline_reveal_persistence import emit_aligned_overlay_page, emit_transparent_bubble_page
-from .transparent_bubble_reveal import (
-    build_transparent_bubble_plan, execute_transparent_bubble, reject_transparent_bubble_plan,
-)
+from .modes.transparent_bubble_reveal.persist import persist_transparent_page
+from .modes.transparent_bubble_reveal.route import execute_isolated_transparent_route
 from .transfer_planner import TransferDecision, choose_transfer_strategy
 from .pipeline_ocr_service import build_ocr_backend_soft
 from .ocr import NullOCRBackend
@@ -99,24 +98,22 @@ def run_page_route_stage(
     # Explicit whole-page transparent reveal returns before Direct/Mask/OCR.
     if mode_contract.transparent_reveal:
         t_cfg = config.transparent_bubble_reveal
-        if not bool(pair_check.same_page):
-            transparent_plan = reject_transparent_bubble_plan(
-                source, target, registration, "rejected_page_pair_verification"
-            )
-        else:
+        transparent_target_ocr = None
+        if bool(pair_check.same_page):
             transparent_target_ocr = _build_transparent_target_ocr(config, cache_stats)
-            transparent_plan = build_transparent_bubble_plan(
-                source, target, registration, t_cfg, bubble_config=config.bubbles,
-                stage_cache=stage_cache, cache_stats=cache_stats, target_path=str(pair.target_path), source_path=str(source_path_local),
-                target_text_ocr=transparent_target_ocr, semantic_config=config.semantic,
-            )
-        transparent_result = execute_transparent_bubble(transparent_plan, source, target, t_cfg)
+        transparent_result = execute_isolated_transparent_route(
+            mode, same_page=bool(pair_check.same_page), source=source, target=target,
+            registration=registration, config=t_cfg, bubble_config=config.bubbles,
+            stage_cache=stage_cache, cache_stats=cache_stats,
+            target_path=str(pair.target_path), source_path=str(source_path_local),
+            target_text_ocr=transparent_target_ocr, semantic_config=config.semantic,
+        )
         transparent_decision = choose_transfer_strategy(
             mode, same_page=bool(pair_check.same_page),
             same_page_confidence=float(pair_check.confidence),
             direct_plan_available=False, direct_plan_safe=False,
         )
-        early = emit_transparent_bubble_page(
+        early = persist_transparent_page(
             config, pair, page_root, final_path, mark, source=source, target=target,
             registration=registration, pair_check=pair_check, result=transparent_result,
             planner_decision=transparent_decision, cache_stats=cache_stats,
@@ -127,22 +124,12 @@ def run_page_route_stage(
     # It must never alias/fall through to Transparent Reveal.  The primary TARGET
     # bubble detector is already warmed by page-flow before this point.
     if mode_contract.aligned_reveal:
-        if not bool(pair_check.same_page):
-            aligned_result = build_production_aligned_hole_result(
-                source, target, registration, config.aligned_overlay_reveal, config.bubbles,
-                stage_cache=stage_cache, cache_stats=cache_stats,
-                source_path=str(source_path_local), target_path=str(pair.target_path),
-                target_bubbles=[],
-            )
-            aligned_result.plan.accepted = False
-            aligned_result.plan.reason = "rejected_page_pair_verification"
-            aligned_result.diagnostics["reason"] = "rejected_page_pair_verification"
-        else:
-            aligned_result = build_production_aligned_hole_result(
-                source, target, registration, config.aligned_overlay_reveal, config.bubbles,
-                stage_cache=stage_cache, cache_stats=cache_stats,
-                source_path=str(source_path_local), target_path=str(pair.target_path),
-            )
+        aligned_result = execute_isolated_hole_route(
+            mode, same_page=bool(pair_check.same_page), source=source, target=target,
+            registration=registration, config=config.aligned_overlay_reveal, bubble_config=config.bubbles,
+            stage_cache=stage_cache, cache_stats=cache_stats,
+            source_path=str(source_path_local), target_path=str(pair.target_path),
+        )
         aligned_available = bool(aligned_result.accepted and aligned_result.applied_count > 0)
         aligned_safe = bool(aligned_available and str(aligned_result.page_triage).upper() == "SAFE")
         aligned_decision = choose_transfer_strategy(
@@ -151,7 +138,7 @@ def run_page_route_stage(
             direct_plan_available=False, direct_plan_safe=False,
             aligned_plan_available=aligned_available, aligned_plan_safe=aligned_safe,
         )
-        early = emit_aligned_overlay_page(
+        early = persist_aligned_hole_page(
             config, pair, page_root, final_path, mark, source=source, target=target,
             registration=registration, pair_check=pair_check, result=aligned_result,
             requested_mode=mode, planner_decision=aligned_decision, cache_stats=cache_stats,
@@ -230,7 +217,7 @@ def run_page_route_stage(
     )
 
     if decision.strategy == "aligned_overlay_reveal" and aligned_auto_result is not None:
-        early = emit_aligned_overlay_page(
+        early = persist_aligned_hole_page(
             config, pair, page_root, final_path, mark, source=source, target=target,
             registration=registration, pair_check=pair_check,
             result=aligned_auto_result, requested_mode=mode,

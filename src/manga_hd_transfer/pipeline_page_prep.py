@@ -32,6 +32,14 @@ class WorkspacePreparation:
 
 
 @dataclass
+class PrefetchedPageImages:
+    source_path: str
+    target_path: str
+    source: np.ndarray
+    target: np.ndarray
+
+
+@dataclass
 class PageInputContext:
     authority_source_path: str | Path
     source_path_local: str | Path
@@ -56,7 +64,7 @@ def prepare_workspace(
     root = Path(page_root)
     root.mkdir(parents=True, exist_ok=True)
     review_mode_archive = archive_review_state_if_mode_changed(root, mode)
-    stale_mode_cleanup = clear_stale_mode_outputs(root)
+    stale_mode_cleanup = clear_stale_mode_outputs(root, strict=True)
     invalidate_manual_review_state(root)
     mark = (
         page_mark
@@ -73,17 +81,43 @@ def prepare_workspace(
     return WorkspacePreparation(root, mark, review_mode_archive, stale_mode_cleanup)
 
 
+def prefetch_page_images(pair: PagePair) -> PrefetchedPageImages:
+    """Decode one SOURCE/TARGET pair for bounded book-level look-ahead.
+
+    No workspace or cache state is touched here; the normal page lifecycle still
+    owns all transactional side effects. The returned arrays are consumed by at
+    most one page run and are never shared across renderers.
+    """
+    source = read_image(pair.source_path)
+    target = read_image(pair.target_path)
+    return PrefetchedPageImages(
+        source_path=str(pair.source_path), target_path=str(pair.target_path),
+        source=source, target=target,
+    )
+
+
 def load_page_inputs(
     pair: PagePair,
     page_root: str | Path,
     config: Any,
+    *,
+    prefetched_images: PrefetchedPageImages | None = None,
 ) -> PageInputContext:
     authority_source_path = pair.source_path
     source_path_local = authority_source_path
     target_path_local = pair.target_path
-    authority_source = read_image(authority_source_path)
-    source = authority_source
-    target = read_image(target_path_local)
+    if (
+        prefetched_images is not None
+        and str(prefetched_images.source_path) == str(authority_source_path)
+        and str(prefetched_images.target_path) == str(target_path_local)
+    ):
+        authority_source = prefetched_images.source
+        source = authority_source
+        target = prefetched_images.target
+    else:
+        authority_source = read_image(authority_source_path)
+        source = authority_source
+        target = read_image(target_path_local)
 
     replace_source_specs = _load_additional_source_specs(
         authority_source_path, config.replace_translation
@@ -115,7 +149,9 @@ def load_page_inputs(
 
 __all__ = [
     "WorkspacePreparation",
+    "PrefetchedPageImages",
     "PageInputContext",
     "prepare_workspace",
+    "prefetch_page_images",
     "load_page_inputs",
 ]

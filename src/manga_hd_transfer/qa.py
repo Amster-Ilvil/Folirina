@@ -317,7 +317,20 @@ def run_mask_replace_qa(
             issues.append(QAItem("mask_replace_low_sharpness", "warning", "Transferred Chinese bubble remains soft after sampling enhancement; consider OCR re-lettering.", rec.source_bubble_id, rec.sharpness, sharp_floor, {"target": rec.target_bubble_id, "backend": rec.sr_backend, "scale": rec.sr_scale, "clarity_mode": getattr(rec, "clarity_mode", "pixels")}))
         clarity_mode = getattr(rec, "clarity_mode", "pixels")
         if clarity_mode == "ink-reconstruction":
-            issues.append(QAItem("mask_replace_ink_reconstruction", "info", "Soft source lettering was deterministically reconstructed as a crisp ink mask; verify rare/complex glyphs at 100% zoom.", rec.source_bubble_id, meta={"target": rec.target_bubble_id, "ink_ratio": getattr(rec, "ink_ratio", 0.0)}))
+            geometry_mode = str(getattr(rec, "geometry_mode", "standard") or "standard")
+            fidelity_mode = str(getattr(replace_config, "text_fidelity_mode", "auto") or "auto").strip().lower() if replace_config is not None else "auto"
+            # Clean Mask/Hybrid source raster must never be silently hardened.
+            # Ink reconstruction is valid for photographed pages or an explicit
+            # user request, but on ordinary raw/structural pairs it signals a
+            # source-glyph-fidelity regression and must be visible as an error.
+            if geometry_mode != "photo_pair" and fidelity_mode != "ink":
+                issues.append(QAItem(
+                    "mask_replace_source_raster_fidelity_regression", "error",
+                    "Ordinary SOURCE Chinese lettering was rebuilt as an ink mask instead of preserving the original raster/antialiasing.",
+                    rec.source_bubble_id, meta={"target": rec.target_bubble_id, "geometry_mode": geometry_mode},
+                ))
+            else:
+                issues.append(QAItem("mask_replace_ink_reconstruction", "info", "Soft source lettering was deterministically reconstructed as a crisp ink mask; verify rare/complex glyphs at 100% zoom.", rec.source_bubble_id, meta={"target": rec.target_bubble_id, "ink_ratio": getattr(rec, "ink_ratio", 0.0)}))
         elif clarity_mode == "photo-crisp-ink":
             issues.append(QAItem("mask_replace_photo_crisp_ink", "info", "Photographed lettering was rebuilt as antialiased neutral ink over clean target paper; camera blur/glare and source balloon borders were excluded.", rec.source_bubble_id, meta={"target": rec.target_bubble_id, "ink_ratio": getattr(rec, "ink_ratio", 0.0)}))
     return issues

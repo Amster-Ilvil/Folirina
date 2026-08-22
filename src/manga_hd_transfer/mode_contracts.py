@@ -51,7 +51,7 @@ COMMON_DERIVED_ARTIFACTS = (
 COMMON_DERIVED_DIRECTORIES = ("replace_translation",)
 
 
-def clear_stale_mode_outputs(page_root: str | Path) -> dict[str, int]:
+def clear_stale_mode_outputs(page_root: str | Path, *, strict: bool = False) -> dict[str, int]:
     """Remove old renderer outputs before a fresh automatic process.
 
     This is deliberately mode-agnostic: fresh processing should start from a
@@ -60,23 +60,24 @@ def clear_stale_mode_outputs(page_root: str | Path) -> dict[str, int]:
     """
     root = Path(page_root)
     removed = 0
+    failures: list[str] = []
     for name in COMMON_DERIVED_ARTIFACTS:
+        p = root / name
         try:
-            p = root / name
             if p.exists():
                 p.unlink()
                 removed += 1
-        except OSError:
-            pass
+        except OSError as exc:
+            failures.append(f"{p}: {exc}")
     for names in MODE_DERIVED_ARTIFACTS.values():
         for name in names:
+            p = root / name
             try:
-                p = root / name
                 if p.exists():
                     p.unlink()
                     removed += 1
-            except OSError:
-                pass
+            except OSError as exc:
+                failures.append(f"{p}: {exc}")
     removed_dirs = 0
     for name in COMMON_DERIVED_DIRECTORIES:
         path = root / name
@@ -90,9 +91,14 @@ def clear_stale_mode_outputs(page_root: str | Path) -> dict[str, int]:
             else:
                 path.unlink()
                 removed += 1
-        except OSError:
-            pass
-    return {"removed": removed, "removed_dirs": removed_dirs}
+        except OSError as exc:
+            failures.append(f"{path}: {exc}")
+    if failures and strict:
+        joined = "\n".join(failures[:20])
+        raise RuntimeError(
+            "无法完整清除上一模式的派生产物；为避免不同模式结果交叉污染，本次处理已在写入新结果前停止。\n" + joined
+        )
+    return {"removed": removed, "removed_dirs": removed_dirs, "failures": len(failures)}
 
 
 def artifact_ownership_snapshot(page_root: str | Path) -> dict[str, list[str]]:
@@ -267,6 +273,14 @@ def mode_scoped_config_payload(config: object) -> dict:
     get_mode_contract(mode)  # validate
 
     common = {k: cfg.get(k) for k in ("page_management", "pairing", "registration", "qa") if k in cfg}
+    # Book-level alignment resource limits affect *how* a directory pairing is
+    # solved, not the rendered result once a concrete SOURCE/TARGET pair has
+    # been selected. Keep them out of per-page resume identity so tuning long-
+    # book memory/performance does not invalidate completed pages or mode locks.
+    if isinstance(common.get("pairing"), dict):
+        common["pairing"] = dict(common["pairing"])
+        common["pairing"].pop("smart_alignment_full_matrix_max_cells", None)
+        common["pairing"].pop("smart_alignment_band", None)
     common["transfer"] = {"mode": mode}
 
     keys_by_mode = {

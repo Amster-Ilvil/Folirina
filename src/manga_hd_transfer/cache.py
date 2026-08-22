@@ -32,6 +32,7 @@ from .models import (
 )
 from .schema_compat import as_dict, as_dict_rows
 from .mode_contracts import mode_scoped_config_payload
+from .project_store import page_project_from_dict
 from .layout_evidence_models import LayoutEvidence, LayoutEvidenceItem
 
 CACHE_SCHEMA = "mhd-cache-v2"
@@ -194,11 +195,14 @@ def config_signature(value: Any) -> str:
     return _json_hash(value)
 
 
-def page_job_fingerprint(pair: PagePair, config: Any) -> str:
+def page_job_fingerprint(pair: PagePair, config: Any, *, scoped_config_payload: dict[str, Any] | None = None) -> str:
     # Completion/resume identity is mode-scoped. A Reletter font change must not
     # invalidate Direct pages, and a Transparent-Reveal tuning change must not
     # invalidate Mask pages. Low-level stage caches keep their own signatures.
-    cfg = mode_scoped_config_payload(config)
+    # A whole-book run has one immutable configuration snapshot. The orchestrator
+    # may precompute this fairly expensive model_dump/filter step once and reuse it
+    # for every resume admission without changing the fingerprint schema/value.
+    cfg = scoped_config_payload if scoped_config_payload is not None else mode_scoped_config_payload(config)
     payload = {
         # Completion identity intentionally has its own schema. Stage cache bundles
         # remain CACHE_SCHEMA=v2 and can still be reused after this safety upgrade.
@@ -660,7 +664,55 @@ def blocks_signature(blocks: list[TextBlock]) -> str:
     return _json_hash([{"p": b.polygon, "t": b.text, "c": round(float(b.confidence), 4), "k": b.kind} for b in blocks])
 
 
-def load_completed_page(page_dir: str | Path, pair: PagePair, config: Any, final_path: str | Path) -> PageProject | None:
+def _same_resume_input(saved_path: Any, current_path: str | Path, *, project_mtime_ns: int) -> bool:
+    """Conservative same-input check for GUI continuation fallback.
+
+    Older successful pages do not persist their raw file signatures separately
+    from the job fingerprint.  For continuation we therefore require the exact
+    same input file (samefile/resolved path) and reject it if that file was
+    modified after the successful project.json was committed.
+    """
+    raw = str(saved_path or "").strip()
+    if not raw:
+        return False
+    try:
+        saved = Path(raw).expanduser()
+        current = Path(current_path).expanduser()
+        if saved.exists() and current.exists():
+            try:
+                if not os.path.samefile(saved, current):
+                    return False
+            except OSError:
+                if saved.resolve(strict=False) != current.resolve(strict=False):
+                    return False
+            # If the input is newer than the durable completed-page transaction,
+            # it may have been replaced in place. Fail closed and reprocess.
+            if int(current.stat().st_mtime_ns) > int(project_mtime_ns):
+                return False
+            return True
+        return saved.resolve(strict=False) == current.resolve(strict=False)
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _continue_identity_allows_completed(obj: dict[str, Any], project_path: Path, pair: PagePair, requested_mode: str) -> bool:
+    meta0 = as_dict(obj.get("meta"))
+    saved_mode = str(meta0.get("transfer_mode") or "").strip().lower()
+    # Never continue across a renderer/mode boundary.
+    if saved_mode and requested_mode and saved_mode != requested_mode:
+        return False
+    pair0 = as_dict(obj.get("pair"))
+    try:
+        project_mtime_ns = int(project_path.stat().st_mtime_ns)
+    except OSError:
+        return False
+    return (
+        _same_resume_input(pair0.get("source_path"), pair.source_path, project_mtime_ns=project_mtime_ns)
+        and _same_resume_input(pair0.get("target_path"), pair.target_path, project_mtime_ns=project_mtime_ns)
+    )
+
+
+def load_completed_page(page_dir: str | Path, pair: PagePair, config: Any, final_path: str | Path, *, scoped_config_payload: dict[str, Any] | None = None, allow_compatible_identity: bool = False) -> PageProject | None:
     """Load a completed page only when its *mode-scoped* execution identity matches.
 
     v2.3.19 deliberately fails closed. Older code treated "same SOURCE/TARGET files"
@@ -681,7 +733,7 @@ def load_completed_page(page_dir: str | Path, pair: PagePair, config: Any, final
     if not obj:
         return None
 
-    expected = page_job_fingerprint(pair, config)
+    expected = page_job_fingerprint(pair, config, scoped_config_payload=scoped_config_payload)
     meta0 = as_dict(obj.get("meta"))
     requested_mode = str(getattr(getattr(config, "transfer", None), "mode", "") or "").strip().lower()
     saved_mode = str(meta0.get("transfer_mode") or "").strip().lower()
@@ -691,8 +743,14 @@ def load_completed_page(page_dir: str | Path, pair: PagePair, config: Any, final
     # the v3 resume contract.
     if saved_mode and requested_mode and saved_mode != requested_mode:
         return None
-    if str(meta0.get("job_fingerprint") or "") != expected:
-        return None
+    fingerprint_match = str(meta0.get("job_fingerprint") or "") == expected
+    compatible_continue = False
+    if not fingerprint_match:
+        if not allow_compatible_identity:
+            return None
+        compatible_continue = _continue_identity_allows_completed(obj, project_path, pair, requested_mode)
+        if not compatible_continue:
+            return None
 
     # Only after identity validation may the book-level final be synchronized.
     # Prefer the page-local reviewed/automatic result over persisted absolute
@@ -728,40 +786,25 @@ def load_completed_page(page_dir: str | Path, pair: PagePair, config: Any, final
         except OSError:
             return None
     # ``final`` remains the page-local artifact; the book mirror has its own key.
+    previous_book_final = str(artifacts.get("book_final", "") or "")
     artifacts["book_final"] = str(final_path)
     obj["artifacts"] = artifacts
-    try:
-        _write_json(project_path, obj)
-    except Exception:
-        pass
+    # Normal resumes used to atomically rewrite project.json on every page even
+    # when this persisted mirror path was already correct. Only legacy/repaired
+    # projects need that write; ordinary resume admission is now read-mostly.
+    if previous_book_final != str(final_path):
+        try:
+            _write_json(project_path, obj)
+        except Exception:
+            pass
 
     try:
-        regp = as_dict(obj.get("registration"))
-        reg = RegistrationResult(
-            matrix=np.asarray(regp["matrix"], np.float64), method=str(regp["method"]),
-            confidence=float(regp["confidence"]), inlier_ratio=float(regp["inlier_ratio"]),
-            reprojection_error=float(regp["reprojection_error"]), spatial_coverage=float(regp["spatial_coverage"]),
-            num_matches=int(regp["num_matches"]), source_size=tuple(regp["source_size"]), target_size=tuple(regp["target_size"]),
-            diagnostics=dict(regp.get("diagnostics") or {}),
-        )
-        source_blocks = [TextBlock(**x) for x in as_dict_rows(obj.get("source_blocks"))]
-        target_blocks = [TextBlock(**x) for x in as_dict_rows(obj.get("target_blocks"))]
-        source_bubbles = [BubbleInstance(**{**x, "polygon": [tuple(p) for p in x.get("polygon", [])]}) for x in as_dict_rows(obj.get("source_bubbles"))]
-        target_bubbles = [BubbleInstance(**{**x, "polygon": [tuple(p) for p in x.get("polygon", [])]}) for x in as_dict_rows(obj.get("target_bubbles"))]
-        source_units = [TextUnit(**x) for x in as_dict_rows(obj.get("source_units"))]
-        target_units = [TextUnit(**x) for x in as_dict_rows(obj.get("target_units"))]
-        matches = [UnitMatch(**x) for x in as_dict_rows(obj.get("matches"))]
-        lettering = [LetteringResult(**x) for x in as_dict_rows(obj.get("lettering"))]
-        qa = [QAItem(**x) for x in as_dict_rows(obj.get("qa"))]
-        meta = as_dict(obj.get("meta")); meta["batch_resume_hit"] = True
-        return PageProject(
-            page_id=str(obj["page_id"]), pair=pair, registration=reg,
-            source_blocks=source_blocks, target_blocks=target_blocks,
-            source_bubbles=source_bubbles, target_bubbles=target_bubbles,
-            source_units=source_units, target_units=target_units,
-            matches=matches, lettering=lettering, qa=qa,
-            artifacts=as_dict(obj.get("artifacts")), meta=meta,
-        )
+        page = page_project_from_dict(obj, pair_override=pair, resume_hit=True)
+        if compatible_continue:
+            page.meta["batch_resume_compatible_hit"] = True
+            page.meta["batch_resume_policy"] = "continue"
+            page.meta["batch_resume_identity_reason"] = "same_inputs_same_mode_existing_success"
+        return page
     except Exception:
         return None
 

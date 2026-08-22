@@ -94,17 +94,49 @@ def fingerprint_cost(
     return PairCost(total, hash_cost, aspect_cost, edge_cost, order_cost)
 
 
-def pair_fingerprints(
-    source: list[PageFingerprint], target: list[PageFingerprint], config: PairingConfig | None = None
+def _build_page_pairs_from_alignment(
+    source: list[PageFingerprint], target: list[PageFingerprint], cfg: PairingConfig,
+    pairs_rev: list[tuple[int, int]], unmatched_source: list[int], unmatched_target: list[int],
+    cost_lookup,
 ) -> tuple[list[PagePair], list[int], list[int]]:
-    cfg = config or PairingConfig()
-    n, m = len(source), len(target)
-    if n == 0 or m == 0:
-        return [], list(range(n)), list(range(m))
+    page_pairs: list[PagePair] = []
+    for si, tj in reversed(pairs_rev):
+        c = cost_lookup(si, tj)
+        if c.total > cfg.max_pair_cost:
+            unmatched_source.append(si)
+            unmatched_target.append(tj)
+            continue
+        confidence = float(np.clip(1.0 - c.total / max(cfg.max_pair_cost, 1e-6), 0.0, 1.0))
+        reasons = [
+            "pairing=smart",
+            f"dhash={c.hash_cost:.3f}",
+            f"edge={c.edge_cost:.3f}",
+            f"aspect={c.aspect_cost:.3f}",
+            f"order={c.order_cost:.3f}",
+        ]
+        if confidence < cfg.confidence_floor:
+            reasons.append("review_recommended")
+        page_pairs.append(
+            PagePair(
+                source_path=source[si].path,
+                target_path=target[tj].path,
+                source_index=si,
+                target_index=tj,
+                confidence=confidence,
+                score=c.total,
+                reasons=reasons,
+            )
+        )
+    return page_pairs, sorted(set(unmatched_source)), sorted(set(unmatched_target))
 
+
+def _pair_fingerprints_full(
+    source: list[PageFingerprint], target: list[PageFingerprint], cfg: PairingConfig,
+) -> tuple[list[PagePair], list[int], list[int]]:
+    """Reference full-matrix sequence alignment used by existing projects."""
+    n, m = len(source), len(target)
     costs = [[fingerprint_cost(source[i], target[j], n, m, cfg) for j in range(m)] for i in range(n)]
 
-    # Sequence alignment preserves reading order while allowing missing/extra pages.
     dp = np.full((n + 1, m + 1), np.inf, dtype=np.float64)
     prev: list[list[tuple[int, int, str] | None]] = [[None] * (m + 1) for _ in range(n + 1)]
     dp[0, 0] = 0.0
@@ -143,36 +175,121 @@ def pair_fingerprints(
             unmatched_target.append(j - 1)
         i, j = pi, pj
 
-    page_pairs: list[PagePair] = []
-    for si, tj in reversed(pairs_rev):
-        c = costs[si][tj]
-        if c.total > cfg.max_pair_cost:
-            unmatched_source.append(si)
-            unmatched_target.append(tj)
-            continue
-        confidence = float(np.clip(1.0 - c.total / max(cfg.max_pair_cost, 1e-6), 0.0, 1.0))
-        reasons = [
-            "pairing=smart",
-            f"dhash={c.hash_cost:.3f}",
-            f"edge={c.edge_cost:.3f}",
-            f"aspect={c.aspect_cost:.3f}",
-            f"order={c.order_cost:.3f}",
-        ]
-        if confidence < cfg.confidence_floor:
-            reasons.append("review_recommended")
-        page_pairs.append(
-            PagePair(
-                source_path=source[si].path,
-                target_path=target[tj].path,
-                source_index=si,
-                target_index=tj,
-                confidence=confidence,
-                score=c.total,
-                reasons=reasons,
-            )
-        )
+    return _build_page_pairs_from_alignment(
+        source, target, cfg, pairs_rev, unmatched_source, unmatched_target,
+        lambda si, tj: costs[si][tj],
+    )
 
-    return page_pairs, sorted(set(unmatched_source)), sorted(set(unmatched_target))
+
+def _pair_fingerprints_banded(
+    source: list[PageFingerprint], target: list[PageFingerprint], cfg: PairingConfig,
+) -> tuple[list[PagePair], list[int], list[int]] | None:
+    """Memory-bounded sequence alignment for very long unresolved intervals.
+
+    The path is constrained around the normalized reading-order diagonal.  The
+    effective band always covers the source/target count delta.  If the endpoint
+    cannot be reached, callers fail safe by using the full reference algorithm.
+    """
+    n, m = len(source), len(target)
+    base_band = max(8, int(getattr(cfg, "smart_alignment_band", 64) or 64))
+    band = max(base_band, abs(n - m) + 8)
+    # If the band is already effectively the whole matrix there is no benefit.
+    if band >= max(n, m):
+        return None
+
+    dp_prev: dict[int, float] = {0: 0.0}
+    prev: dict[tuple[int, int], tuple[int, int, str]] = {}
+    costs: dict[tuple[int, int], PairCost] = {}
+
+    def get_cost(si: int, tj: int) -> PairCost:
+        key = (si, tj)
+        value = costs.get(key)
+        if value is None:
+            value = fingerprint_cost(source[si], target[tj], n, m, cfg)
+            costs[key] = value
+        return value
+
+    for i in range(0, n + 1):
+        center = int(round((i * m) / max(1, n)))
+        j_lo = max(0, center - band)
+        j_hi = min(m, center + band)
+        if i == 0:
+            row: dict[int, float] = {0: 0.0}
+            for j in range(max(1, j_lo), j_hi + 1):
+                left = row.get(j - 1)
+                if left is not None:
+                    row[j] = left + cfg.gap_penalty
+                    prev[(0, j)] = (0, j - 1, "skip_target")
+            dp_prev = row
+            continue
+
+        row = {}
+        for j in range(j_lo, j_hi + 1):
+            choices: list[tuple[float, tuple[int, int, str]]] = []
+            up = dp_prev.get(j)
+            if up is not None:
+                choices.append((up + cfg.gap_penalty, (i - 1, j, "skip_source")))
+            left = row.get(j - 1)
+            if left is not None:
+                choices.append((left + cfg.gap_penalty, (i, j - 1, "skip_target")))
+            diag = dp_prev.get(j - 1)
+            if j > 0 and diag is not None:
+                choices.append((diag + get_cost(i - 1, j - 1).total, (i - 1, j - 1, "pair")))
+            if choices:
+                value, step = min(choices, key=lambda x: x[0])
+                row[j] = value
+                prev[(i, j)] = step
+        dp_prev = row
+
+    if m not in dp_prev:
+        return None
+
+    pairs_rev: list[tuple[int, int]] = []
+    unmatched_source: list[int] = []
+    unmatched_target: list[int] = []
+    i, j = n, m
+    touched_band_edge = False
+    while i > 0 or j > 0:
+        center = int(round((i * m) / max(1, n)))
+        if 0 < i < n and abs(j - center) >= max(1, band - 2):
+            touched_band_edge = True
+        step = prev.get((i, j))
+        if step is None:
+            return None
+        pi, pj, op = step
+        if op == "pair":
+            pairs_rev.append((i - 1, j - 1))
+        elif op == "skip_source":
+            unmatched_source.append(i - 1)
+        else:
+            unmatched_target.append(j - 1)
+        i, j = pi, pj
+
+    # A best path riding the imposed boundary is evidence that the configured
+    # band may be too narrow for this edition. Fail safe to the full reference
+    # solver rather than silently accepting a resource-constrained pairing.
+    if touched_band_edge:
+        return None
+
+    return _build_page_pairs_from_alignment(
+        source, target, cfg, pairs_rev, unmatched_source, unmatched_target, get_cost,
+    )
+
+
+def pair_fingerprints(
+    source: list[PageFingerprint], target: list[PageFingerprint], config: PairingConfig | None = None
+) -> tuple[list[PagePair], list[int], list[int]]:
+    cfg = config or PairingConfig()
+    n, m = len(source), len(target)
+    if n == 0 or m == 0:
+        return [], list(range(n)), list(range(m))
+
+    max_full_cells = max(1, int(getattr(cfg, "smart_alignment_full_matrix_max_cells", 250000) or 1))
+    if n * m > max_full_cells:
+        banded = _pair_fingerprints_banded(source, target, cfg)
+        if banded is not None:
+            return banded
+    return _pair_fingerprints_full(source, target, cfg)
 
 
 _COPY_SUFFIX_RE = re.compile(r"(?:\s*\(\s*\d+\s*\)|\s*\[\s*\d+\s*\])$")

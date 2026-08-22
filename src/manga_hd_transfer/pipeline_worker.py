@@ -6,6 +6,7 @@ Separated from widgets so GUI pages do not own pipeline execution semantics.
 """
 
 from pathlib import Path
+import logging
 from typing import Any
 
 from PySide6.QtCore import QThread, Signal
@@ -20,6 +21,8 @@ from .review_apply import apply_review_page
 from .schema_compat import as_dict
 from .io_utils import load_json
 from .result_state import atomic_copy_file
+
+logger = logging.getLogger(__name__)
 
 class PipelineWorker(QThread):
     done = Signal(object, str)
@@ -122,6 +125,7 @@ class PipelineWorker(QThread):
             self.cancelled.emit()
         except Exception as exc:
             import traceback
+            logger.exception("pipeline worker failed")
             self.failed.emit(f"{exc}\n\n{traceback.format_exc()}")
 
 __all__ = ["PipelineWorker"]

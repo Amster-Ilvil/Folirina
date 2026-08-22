@@ -342,7 +342,10 @@ def commit_automatic_result(
     if final_path is not None:
         book_final = Path(final_path)
         if book_final.resolve() != local_final.resolve():
-            write_image(book_final, image)
+            # The page-local PNG is already fully encoded. Publishing those exact
+            # bytes avoids a second full-resolution PNG encode on Reveal routes and
+            # keeps the book mirror byte-identical to the authoritative page result.
+            atomic_copy_file(local_final, book_final)
     return local_final, book_final
 
 def manual_baseline_path(page_dir: str | Path) -> Path:
@@ -466,7 +469,7 @@ def invalidate_manual_review_state(page_dir: str | Path) -> None:
     # only derived images/metadata so a fresh OCR run cannot inherit old shadows.
     ocr_root = page_dir / "ocr_edit"
     if ocr_root.exists():
-        for scope in ("mask_ocr", "ocr_reletter"):
+        for scope in ("mask_ocr", "review_ocr", "ocr_reletter"):
             scope_dir = ocr_root / scope
             for name in ("base.png", "base_state.json", "render_state.json", "final.png"):
                 try:

@@ -5,6 +5,7 @@ import logging
 import time
 import shutil
 import zipfile
+import copy
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,17 +57,22 @@ from .paddle_profiles import PADDLE_MODEL_PROFILES, profile_label, backend_profi
 from .runtime_preflight import plan_runtime_requirements, pending_model_requirements
 from .app_icon import apply_application_icon
 from .gui_processing_policy import (
-    compute_busy_state, classify_progress_state, worker_config_snapshot, completion_message,
+    compute_busy_state, classify_progress_state, worker_config_snapshot, completion_message, page_completion_message,
 )
 from .io_utils import load_json, save_json, write_image
 from .review_history import review_history_counts
+from .region_workspace_state import RegionWorkspaceLinkState, selection_signature
+from .selection_overlay import selection_edge_mask, selection_edge_thickness_for_scale
+from .review_action_state import review_action_availability
 from .font_catalog import discover_fonts
-from .review_apply import apply_review_page, generate_remove_text_preview, apply_target_layer_erase_review, reset_target_layer_erase_review, apply_target_layer_restore_review, reset_target_layer_restore_review, apply_manual_force_transfer_review, reset_manual_force_transfer_review, manual_force_auto_evidence_masks
+from .review_apply import apply_review_page, clear_ocr_review_blocks, generate_remove_text_preview, apply_target_layer_erase_review, reset_target_layer_erase_review, apply_target_layer_restore_review, reset_target_layer_restore_review, apply_manual_force_transfer_review, reset_manual_force_transfer_review, manual_force_auto_evidence_masks
 from .manual_effect import map_target_bbox_to_source, registration_homography, build_manual_effect_masks, build_reveal_seed_mask, estimate_source_background, composite_source_text_delta, clean_manual_target_text
 from .modes.reletter import ocr_edit_blocks as _reletter_ocr_edit_blocks
 from .modes.reletter import ocr_edit_render as _reletter_ocr_edit_render
 from .modes.hybrid import ocr_edit_blocks as _hybrid_ocr_edit_blocks
 from .modes.hybrid import ocr_edit_render as _hybrid_ocr_edit_render
+from . import ocr_edit_blocks as _shared_ocr_edit_blocks
+from . import ocr_edit_render as _shared_ocr_edit_render
 
 
 def _ocr_mode_modules(mode: str):
@@ -75,6 +81,11 @@ def _ocr_mode_modules(mode: str):
         return _hybrid_ocr_edit_blocks, _hybrid_ocr_edit_render
     if key == "reletter":
         return _reletter_ocr_edit_blocks, _reletter_ocr_edit_render
+    # All other reviewer-supported modes are owned by the shared review layer.
+    # This now includes both Reveal families under the dedicated review_ocr
+    # scope; no Reveal automatic renderer is imported or called here.
+    if _shared_ocr_edit_blocks.is_ocr_edit_mode(key):
+        return _shared_ocr_edit_blocks, _shared_ocr_edit_render
     return None, None
 
 
@@ -154,7 +165,7 @@ from .workspace import page_id_for_pair, resolve_page_workspace
 from .workspace_guard import PageRunGuard
 from .workspace_cleanup import cleanup_output_workspace
 from .mode_contracts import clear_stale_mode_outputs
-from .session_restore import scan_existing_results
+from .session_restore import scan_existing_results, expand_restored_session_pairs
 from .schema_compat import as_dict, as_dict_rows, as_list, normalize_project, normalize_overrides, normalize_review_applied
 from .result_state import commit_reviewed_result, atomic_copy_file
 from .manual_review_service import (
@@ -170,6 +181,7 @@ from .region_brush_reveal import (
     stroke_bbox as brush_stroke_bbox, paint_reveal_stroke_inplace,
     compose_reveal_patch, mask_bbox as brush_mask_bbox, mask_counts as brush_mask_counts,
 )
+from .gui_dialogs import confirm_action
 from .page_management import (
     PAGE_TYPE_INFO, MANUAL_PAGE_TYPES, PageMark,
     default_mark, manual_mark, marks_from_json, marks_to_json, page_mark_key,
@@ -184,6 +196,14 @@ QDoubleSpinBox = StableDoubleSpinBox
 QSlider = StableSlider
 
 logger = logging.getLogger(__name__)
+
+
+def _confirm_destructive_action(parent, title: str, message: str, *, confirm_text: str = "确认", cancel_text: str = "取消") -> bool:
+    return confirm_action(
+        parent, title, message, confirm_text=confirm_text, cancel_text=cancel_text, destructive=True,
+    )
+
+
 _THEME_SETTING_KEY = "ui/theme"
 _SETTINGS_ORG = "Folirina"
 _SETTINGS_APP = "Folirina"
@@ -314,6 +334,7 @@ class MaskPaintView(QGraphicsView):
     decide which review-mask file is persisted.
     """
     mask_changed = Signal()
+    stroke_finished = Signal()
 
     def __init__(self, image_path: str | Path, mask: Any, parent=None, *, reference_mask: Any | None = None, reference_original_mask: Any | None = None):
         super().__init__(parent)
@@ -357,7 +378,11 @@ class MaskPaintView(QGraphicsView):
         self._painting = False; self._erase = False; self._last = None
         self._panning = False; self._pan_last = None
         self._auto_fit = True; self._fit_pending = False
-        self._overlay_item = self._scene.addPixmap(QPixmap())
+        # v2.3.64: page-sized RGBA/QPixmap rebuilds on every mouse move were the
+        # main source of brush stutter. Keep a sparse 512px tile overlay instead;
+        # a stroke only rebuilds the few tiles it actually touches.
+        self._overlay_tile_size = 512
+        self._overlay_tiles = {}
         self._scene.setSceneRect(0, 0, w, h)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._refresh_overlay(); self.fit_to_window()
@@ -407,24 +432,57 @@ class MaskPaintView(QGraphicsView):
             self.fit_to_window(); return
         self.fit_to_rect([int(xs.min()),int(ys.min()),int(xs.max()+1),int(ys.max()+1)])
 
-    def _refresh_overlay(self):
-        h, w = self.mask.shape
-        rgba = self._np.zeros((h, w, 4), dtype=self._np.uint8)
-        manual = self.mask > 0
-        reference = self.reference_mask > 0
-        ref_only = reference & (~manual)
-        overlap = reference & manual
-        # Cyan/blue = OCR or automatic detector reference; red = reviewer paint;
-        # amber = overlap. Both layers are editable; the active layer is rendered
-        # slightly stronger so it is obvious which pixels the brush will change.
+    def _overlay_tile_keys(self, bbox=None):
+        ts=int(self._overlay_tile_size); h,w=self.mask.shape
+        if bbox and len(bbox)==4:
+            x0,y0,x1,y1=[int(v) for v in bbox]
+            x0=max(0,min(w,x0)); x1=max(0,min(w,x1)); y0=max(0,min(h,y0)); y1=max(0,min(h,y1))
+            if x1<=x0 or y1<=y0: return []
+            tx0=x0//ts; tx1=(x1-1)//ts; ty0=y0//ts; ty1=(y1-1)//ts
+            return [(tx,ty) for ty in range(ty0,ty1+1) for tx in range(tx0,tx1+1)]
+        # Full refreshes are rare (open editor / change layer / reset). Scan only
+        # tile-sized binary crops instead of allocating one page-sized RGBA image.
+        keys=set(self._overlay_tiles.keys())
+        for y0 in range(0,h,ts):
+            for x0 in range(0,w,ts):
+                y1=min(h,y0+ts); x1=min(w,x0+ts)
+                if self._cv2.countNonZero(self.mask[y0:y1,x0:x1]) or self._cv2.countNonZero(self.reference_mask[y0:y1,x0:x1]):
+                    keys.add((x0//ts,y0//ts))
+        return sorted(keys)
+
+    def _refresh_overlay(self, bbox=None):
+        ts=int(self._overlay_tile_size); h,w=self.mask.shape
         ref_alpha = 132 if self.edit_layer == "reference" else 82
         manual_alpha = 142 if self.edit_layer == "manual" else 98
-        rgba[ref_only, 0] = 70; rgba[ref_only, 1] = 165; rgba[ref_only, 2] = 235; rgba[ref_only, 3] = ref_alpha
-        rgba[manual, 0] = 230; rgba[manual, 1] = 70; rgba[manual, 2] = 85; rgba[manual, 3] = manual_alpha
-        rgba[overlap, 0] = 245; rgba[overlap, 1] = 165; rgba[overlap, 2] = 45; rgba[overlap, 3] = 150
-        q = QImage(rgba.data, w, h, int(rgba.strides[0]), QImage.Format.Format_RGBA8888).copy()
-        self._overlay_item.setPixmap(QPixmap.fromImage(q))
-        self._overlay_item.setZValue(2)
+        for tx,ty in self._overlay_tile_keys(bbox):
+            x0=tx*ts; y0=ty*ts; x1=min(w,x0+ts); y1=min(h,y0+ts)
+            manual=self.mask[y0:y1,x0:x1]>0
+            reference=self.reference_mask[y0:y1,x0:x1]>0
+            key=(tx,ty); item=self._overlay_tiles.get(key)
+            if not self._np.any(manual) and not self._np.any(reference):
+                if item is not None:
+                    self._scene.removeItem(item); self._overlay_tiles.pop(key,None)
+                continue
+            th,tw=manual.shape
+            rgba=self._np.zeros((th,tw,4),dtype=self._np.uint8)
+            ref_only=reference & (~manual); overlap=reference & manual
+            rgba[ref_only,0]=70; rgba[ref_only,1]=165; rgba[ref_only,2]=235; rgba[ref_only,3]=ref_alpha
+            rgba[manual,0]=230; rgba[manual,1]=70; rgba[manual,2]=85; rgba[manual,3]=manual_alpha
+            rgba[overlap,0]=245; rgba[overlap,1]=165; rgba[overlap,2]=45; rgba[overlap,3]=150
+            q=QImage(rgba.data,tw,th,int(rgba.strides[0]),QImage.Format.Format_RGBA8888).copy()
+            pix=QPixmap.fromImage(q)
+            if item is None:
+                item=self._scene.addPixmap(pix); item.setZValue(2); self._overlay_tiles[key]=item
+            else:
+                item.setPixmap(pix)
+            item.setPos(x0,y0)
+
+    def _stroke_dirty_bbox(self, a, b=None):
+        if b is None: b=a
+        r=max(3,int(self.brush_size)+3)
+        x0=min(int(a[0]),int(b[0]))-r; y0=min(int(a[1]),int(b[1]))-r
+        x1=max(int(a[0]),int(b[0]))+r+1; y1=max(int(a[1]),int(b[1]))+r+1
+        return [x0,y0,x1,y1]
 
     def _apply_fit(self):
         self._fit_pending = False
@@ -479,16 +537,16 @@ class MaskPaintView(QGraphicsView):
             super().mouseMoveEvent(event); return
         pos = self.mapToScene(event.position().toPoint()); now = (int(pos.x()), int(pos.y()))
         val = 0 if self._erase else 255
-        active = self.active_mask()
-        self._cv2.line(active, self._last, now, int(val), max(1, int(self.brush_size)), lineType=self._cv2.LINE_AA)
-        self._last = now; self._refresh_overlay(); self.mask_changed.emit(); event.accept()
+        active = self.active_mask(); previous=self._last
+        self._cv2.line(active, previous, now, int(val), max(1, int(self.brush_size)), lineType=self._cv2.LINE_AA)
+        self._last = now; self._refresh_overlay(self._stroke_dirty_bbox(previous,now)); self.mask_changed.emit(); event.accept()
 
     def mouseReleaseEvent(self, event):
         if self._panning and event.button() == Qt.MouseButton.MiddleButton:
             self._panning = False; self._pan_last = None
             self.viewport().unsetCursor(); event.accept(); return
         if self._painting:
-            self._painting = False; self._last = None; event.accept(); return
+            self._painting = False; self._last = None; self.stroke_finished.emit(); event.accept(); return
         super().mouseReleaseEvent(event)
 
     def _paint_to(self, pt):
@@ -496,7 +554,7 @@ class MaskPaintView(QGraphicsView):
         if 0 <= x < self.mask.shape[1] and 0 <= y < self.mask.shape[0]:
             active = self.active_mask()
             self._cv2.circle(active, (x, y), max(1, int(self.brush_size // 2)), 0 if self._erase else 255, -1, lineType=self._cv2.LINE_AA)
-            self._refresh_overlay(); self.mask_changed.emit()
+            self._refresh_overlay(self._stroke_dirty_bbox((x,y))); self.mask_changed.emit()
 
 
 class MaskEditorDialog(QDialog):
@@ -509,6 +567,8 @@ class MaskEditorDialog(QDialog):
         self.view = MaskPaintView(image_path, initial_mask, self, reference_mask=reference_mask, reference_original_mask=reference_original_mask); root.addWidget(self.view, 1)
         self._reference_label = str(reference_label or "OCR / 自动检测")
         self._preview_fn = preview_fn
+        self._preview_timer = QTimer(self); self._preview_timer.setSingleShot(True); self._preview_timer.setInterval(110)
+        self._preview_timer.timeout.connect(self._refresh_live_preview)
         has_reference = bool(self.view.reference_mask.any() or self.view.reference_original_mask.any())
         if has_reference:
             layer_row = QHBoxLayout(); layer_row.addWidget(QLabel("编辑层"))
@@ -560,7 +620,11 @@ class MaskEditorDialog(QDialog):
         self.clear_button.clicked.connect(self._clear); self.import_reference_button.clicked.connect(self._import_reference); self.save_button.clicked.connect(self.accept); self.cancel_button.clicked.connect(self.reject)
         if self.reset_reference_button is not None: self.reset_reference_button.clicked.connect(self._reset_reference)
         if self._preview_fn is not None:
-            self.view.mask_changed.connect(self._refresh_live_preview); self._refresh_live_preview()
+            # Brush overlay updates immediately, but expensive full-image preview
+            # work is debounced and forced once at stroke end.
+            self.view.mask_changed.connect(self._schedule_live_preview)
+            self.view.stroke_finished.connect(self._refresh_live_preview)
+            QTimer.singleShot(0,self._refresh_live_preview)
         QTimer.singleShot(0, self.view.fit_to_active_mask if bool(self.view.mask.any()) else self.view.fit_to_window)
 
     def _set_layer(self, layer: str):
@@ -594,8 +658,13 @@ class MaskEditorDialog(QDialog):
         self.view.mask[:] = self.view._np.maximum(self.view.mask, self.view.reference_mask)
         self.view._refresh_overlay(); self._refresh_live_preview(); self.view.fit_to_mask()
 
+    def _schedule_live_preview(self):
+        if self._preview_fn is not None:
+            self._preview_timer.start()
+
     def _refresh_live_preview(self):
         if self._preview_fn is None: return
+        if self._preview_timer.isActive(): self._preview_timer.stop()
         try: self.view.set_preview_image(self._preview_fn(self.view.mask.copy()))
         except Exception: self.view.set_preview_image(None)
 
@@ -715,7 +784,9 @@ class RevealMaskDialog(QDialog):
         self._auto_seed=(np.asarray(initial_mask)>0).astype(np.uint8)*255
         self.slider.valueChanged.connect(self._brush); self.fit_button.clicked.connect(self.view.fit_to_window); self.focus_button.clicked.connect(self._focus_selection)
         self.auto_button.clicked.connect(self._restore_auto); self.clear_button.clicked.connect(self._clear); self.save_button.clicked.connect(self.accept); self.cancel_button.clicked.connect(self.reject)
-        self.view.mask_changed.connect(self._refresh_preview)
+        self._preview_timer=QTimer(self); self._preview_timer.setSingleShot(True); self._preview_timer.setInterval(90); self._preview_timer.timeout.connect(self._refresh_preview)
+        self.view.mask_changed.connect(lambda: self._preview_timer.start())
+        self.view.stroke_finished.connect(self._refresh_preview)
         self._brush(32); self._refresh_preview(); QTimer.singleShot(0, self._focus_selection if len(self._focus_bbox)==4 else self.view.fit_to_window)
 
     def _focus_selection(self):
@@ -738,16 +809,10 @@ class RevealMaskDialog(QDialog):
         out=self._target.copy()
         if self._np.any(gate):
             out[gate]=self._full_reveal[gate]
-        rgb=self._cv2.cvtColor(out,self._cv2.COLOR_BGR2RGB)
-        h,w=rgb.shape[:2]
-        q=QImage(rgb.data,w,h,int(rgb.strides[0]),QImage.Format.Format_RGB888).copy()
-        self.view._base_item.setPixmap(QPixmap.fromImage(q))
-        # The live image is the truth; keep the red overlay extremely light so
-        # the user can still see where the editable reveal window exists.
-        rgba=self._np.zeros((h,w,4),dtype=self._np.uint8); sel=gate
-        rgba[sel,0]=70; rgba[sel,1]=150; rgba[sel,2]=235; rgba[sel,3]=26
-        qo=QImage(rgba.data,w,h,int(rgba.strides[0]),QImage.Format.Format_RGBA8888).copy()
-        self.view._overlay_item.setPixmap(QPixmap.fromImage(qo)); self.view._overlay_item.setZValue(2)
+        # Keep the expensive full-page preview out of mouse-move frequency. The
+        # tile mask overlay remains responsive while this image updates at idle /
+        # stroke end.
+        self.view.set_preview_image(out)
 
     def result_mask(self):
         return self.view.mask.copy()
@@ -911,9 +976,14 @@ class RegionSelectView(QGraphicsView):
         if crop.size==0 or cv2.countNonZero(crop)<=0:
             self._overlay_item.setPixmap(QPixmap()); self._overlay_item.setPos(0,0); return
         inside=crop>0; ch,cw=crop.shape; rgba=np.zeros((ch,cw,4),np.uint8)
-        edge=cv2.morphologyEx(crop,cv2.MORPH_GRADIENT,np.ones((3,3),np.uint8))>0
+        # v2.3.70: tight-ROI rendering must still expose the selection border.
+        # A rectangular crop can be all-255, so MORPH_GRADIENT on the cropped
+        # array returns no edge. selection_edge_mask uses an explicit zero
+        # exterior and therefore remains visible for rect/ellipse/freehand/smart.
+        edge_thickness=selection_edge_thickness_for_scale(float(self.transform().m11()))
+        edge=selection_edge_mask(crop,thickness=edge_thickness)>0
         accent=QColor(ACCENT); r,g,b=accent.red(),accent.green(),accent.blue()
-        rgba[inside,0]=r; rgba[inside,1]=g; rgba[inside,2]=b; rgba[inside,3]=54
+        rgba[inside,0]=r; rgba[inside,1]=g; rgba[inside,2]=b; rgba[inside,3]=34
         rgba[edge,0]=r; rgba[edge,1]=g; rgba[edge,2]=b; rgba[edge,3]=255
         q=QImage(rgba.data,cw,ch,int(rgba.strides[0]),QImage.Format.Format_RGBA8888).copy()
         self._overlay_item.setPixmap(QPixmap.fromImage(q)); self._overlay_item.setPos(x0,y0)
@@ -1043,21 +1113,27 @@ class RegionSelectView(QGraphicsView):
 class OCRBlockEditorDialog(QDialog):
     """Manual ROI OCR + per-block typography editor.
 
-    This dialog is hard-gated to the two OCR product flows. It stores its state
-    under ``ocr_edit/mask_ocr`` or ``ocr_edit/ocr_reletter`` and never writes
-    Direct / pure Mask / Reveal artifacts.
+    This dialog is available to the precise-transfer review families and OCR
+    reletter.  It stores state under ``ocr_edit/mask_ocr`` or
+    ``ocr_edit/ocr_reletter`` and remains a page-local review overlay.
     """
 
     def __init__(self, page_dir: str | Path, source_path: str | Path, target_path: str | Path,
                  project: dict[str, Any], config: PipelineConfig, mode: str, parent=None):
         super().__init__(parent)
         if not is_ocr_edit_mode(mode):
-            raise ValueError("人工 OCR 文本块只在 精准蒙版+OCR / OCR重排 中可用。")
+            raise ValueError("人工 OCR 文本块在当前整页模式不可用。")
         self.page_dir=Path(page_dir); self.source_path=Path(source_path); self.target_path=Path(target_path)
         self.project=dict(project or {}); self.config=config.model_copy(deep=True); self.mode=str(mode)
-        self._blocks=load_ocr_blocks(self.page_dir,self.mode); self._current_id=""
+        self._blocks=load_ocr_blocks(self.page_dir,self.mode); self._current_id=""; self._ocr_worker=None
         scope=ocr_edit_scope(self.mode)
-        self.setWindowTitle("人工 OCR 文本块 · " + ("精准蒙版+OCR" if scope=="mask_ocr" else "OCR重排"))
+        mode_label={
+            "direct_patch":"Direct · 人工 OCR",
+            "mask_replace":"精准蒙版 · 人工 OCR",
+            "hybrid":"精准蒙版+OCR",
+            "reletter":"OCR重排",
+        }.get(self.mode,"人工 OCR")
+        self.setWindowTitle("人工 OCR 文本块 · " + mode_label)
         _configure_responsive_dialog(self,(1560,980),(1040,700))
         root=QVBoxLayout(self); root.setContentsMargins(12,12,12,12); root.setSpacing(8)
         hint=QLabel("在右侧 TARGET 上拖框；“重新 OCR”只识别这个 ROI。中文内容从配准后的 SOURCE 区域读取，TARGET OCR 只用于定位需要清除的日文。字体、字号、方向、断句和排版属于当前文本块，不会修改其他模式。")
@@ -1084,9 +1160,9 @@ class OCRBlockEditorDialog(QDialog):
         self.line_spacing=QDoubleSpinBox(); self.line_spacing.setRange(-1.0,0.60); self.line_spacing.setSingleStep(0.02); self.line_spacing.setDecimals(2); self.line_spacing.setSpecialValueText("自动")
         r3.addWidget(QLabel("字号")); r3.addWidget(self.font_size); r3.addWidget(QLabel("列数")); r3.addWidget(self.columns); r3.addWidget(QLabel("行距")); r3.addWidget(self.line_spacing); r3.addStretch(1); pl.addLayout(r3)
         root.addWidget(panel)
-        actions=QHBoxLayout(); actions.addStretch(1); cancel=QPushButton("取消"); self.save_btn=QPushButton("保存并应用"); self.save_btn.setObjectName("primary")
-        actions.addWidget(cancel); actions.addWidget(self.save_btn); root.addLayout(actions)
-        cancel.clicked.connect(self.reject); self.save_btn.clicked.connect(self._save); self.ocr_btn.clicked.connect(self._rerun_ocr); self.new_btn.clicked.connect(self._new)
+        actions=QHBoxLayout(); actions.addStretch(1); self.cancel_btn=QPushButton("取消"); self.save_btn=QPushButton("保存并应用"); self.save_btn.setObjectName("primary")
+        actions.addWidget(self.cancel_btn); actions.addWidget(self.save_btn); root.addLayout(actions)
+        self.cancel_btn.clicked.connect(self.reject); self.save_btn.clicked.connect(self._save); self.ocr_btn.clicked.connect(self._rerun_ocr); self.new_btn.clicked.connect(self._new)
         self.delete_btn.clicked.connect(self._delete); self.font_pick.clicked.connect(self._pick_font); self.block_combo.currentIndexChanged.connect(self._load_selected)
         self.target_view.selection_changed.connect(self._target_selection_changed)
         self._reload_combo()
@@ -1134,30 +1210,65 @@ class OCRBlockEditorDialog(QDialog):
     def _rerun_ocr(self):
         bbox=self.target_view.box()
         if len(bbox)!=4:
-            QMessageBox.information(self,"请先框选","请在右侧 TARGET 图上拖出要重新 OCR 的区域。"); return
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            seed=self._selected_row() or self._current_style(); seed.update(self._current_style())
-            row=recognize_manual_ocr_block(self.project,self.source_path,self.target_path,bbox,self.config,existing=seed)
-            self._current_id=str(row.get("id") or ""); self.text.setPlainText(str(row.get("render_text") or row.get("ocr_text") or "")); self.source_view.set_box(list(row.get("source_bbox") or []))
-            # Keep the freshly detected TARGET polygons until save.
+            self.ocr_status.setText("请先在右侧 TARGET 图上拖出 OCR 区域。")
+            return
+        worker=getattr(self,"_ocr_worker",None)
+        if worker is not None and worker.isRunning():
+            self.ocr_status.setText("OCR 正在处理中，请稍候…")
+            return
+        seed=self._selected_row() or self._current_style(); seed.update(self._current_style())
+        bbox=list(bbox); project=dict(self.project); source_path=Path(self.source_path); target_path=Path(self.target_path); cfg=self.config.model_copy(deep=True)
+        self.ocr_btn.setEnabled(False); self.save_btn.setEnabled(False); self.cancel_btn.setEnabled(False); self.new_btn.setEnabled(False); self.delete_btn.setEnabled(False)
+        self.ocr_btn.setText("OCR 处理中…"); self.ocr_status.setText("正在识别 SOURCE 中文，并定位 TARGET 日文…")
+        worker=PageActionWorker(
+            "人工 ROI OCR",
+            lambda: recognize_manual_ocr_block(project,source_path,target_path,bbox,cfg,existing=seed),
+        )
+        self._ocr_worker=worker
+
+        def done(payload):
+            row=dict(payload or {})
+            self._current_id=str(row.get("id") or "")
+            self.text.setPlainText(str(row.get("render_text") or row.get("ocr_text") or ""))
+            self.source_view.set_box(list(row.get("source_bbox") or []))
             self._pending_ocr=row
-            serr=str(row.get("source_ocr_error") or ""); terr=str(row.get("target_ocr_error") or "")
+            serr=str(row.get("source_ocr_error") or "").strip(); terr=str(row.get("target_ocr_error") or "").strip()
+            text=str(row.get("render_text") or row.get("ocr_text") or "").strip()
             if serr:
-                self.ocr_status.setText("SOURCE OCR 失败，可手动输入文字："+serr[:80])
+                backend=str(row.get("source_backend") or "OCR")
+                self.ocr_status.setText(f"{backend} SOURCE OCR 失败：{serr[:180]} · 可改 OCR 后端后重试，或手动输入中文。")
+            elif not text:
+                self.ocr_status.setText("OCR 已执行，但 SOURCE ROI 没识别到文字。请调整选框后重试。")
             else:
                 suffix="；TARGET 定位失败，将使用保守局部清字" if terr else ""
                 self.ocr_status.setText(f"重新 OCR 完成 · 置信度 {float(row.get('confidence') or 0):.2f}{suffix}")
-        except Exception as exc:
-            QMessageBox.critical(self,"人工 OCR 失败",str(exc))
-        finally: QApplication.restoreOverrideCursor()
+
+        def failed(message):
+            detail=str(message or "人工 OCR 未返回错误信息").strip()
+            self.ocr_status.setText("人工 OCR 执行失败："+detail.splitlines()[0][:220])
+
+        def finished():
+            self._ocr_worker=None
+            self.ocr_btn.setEnabled(True); self.save_btn.setEnabled(True); self.cancel_btn.setEnabled(True); self.new_btn.setEnabled(True); self.delete_btn.setEnabled(True); self.ocr_btn.setText("重新 OCR 当前选框")
+
+        worker.done.connect(done); worker.failed.connect(failed); worker.finished.connect(finished); worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def closeEvent(self,event):  # noqa: N802 - Qt API
+        worker=getattr(self,"_ocr_worker",None)
+        if worker is not None and worker.isRunning():
+            self.ocr_status.setText("OCR 正在处理中，完成后即可关闭窗口。")
+            event.ignore(); return
+        super().closeEvent(event)
 
     def _save(self):
         bbox=self.target_view.box(); text=self.text.toPlainText().strip()
         if len(bbox)!=4:
-            QMessageBox.information(self,"缺少选框","请先在 TARGET 上框选文本区域。"); return
+            self.ocr_status.setText("缺少选框：请先在 TARGET 上框选文本区域。")
+            return
         if not text:
-            QMessageBox.information(self,"缺少文字","OCR 结果为空时可以手动输入中文，再保存文本块。"); return
+            self.ocr_status.setText("OCR 结果为空：请重新 OCR，或手动输入中文后再保存。")
+            return
         base=dict(getattr(self,"_pending_ocr",None) or self._selected_row() or {})
         base.update(self._current_style()); base["target_bbox"]=list(bbox); base["source_bbox"]=map_target_bbox_to_source(self.project,list(bbox)); base["render_text"]=text; base.setdefault("ocr_text",text); base["review_kind"]="manual_ocr"; base["box_locked"]=True; base["manual_override"]=True
         saved=upsert_ocr_block(self.page_dir,self.mode,base); self._current_id=str(saved.get("id") or ""); self.accept()
@@ -1169,7 +1280,7 @@ class OCRBlockEditorDialog(QDialog):
     def _delete(self):
         bid=str(self.block_combo.currentData() or "")
         if not bid: return
-        if QMessageBox.question(self,"删除 OCR 文本块","删除当前人工 OCR 文本块？") != QMessageBox.StandardButton.Yes: return
+        if not _confirm_destructive_action(self, "删除 OCR 文本块", "删除当前人工 OCR 文本块？", confirm_text="删除"): return
         delete_ocr_block(self.page_dir,self.mode,bid); self._reload_combo(); self.ocr_status.setText("已删除，正在返回并重新合成"); self.accept()
 
     def _pick_font(self):
@@ -1227,11 +1338,20 @@ class RegionCompositeDialog(QDialog):
 
     def __init__(self, page_dir: str|Path, source_path: str|Path, target_path: str|Path,
                  display_path: str|Path, project: dict[str,Any], config: PipelineConfig,
-                 parent=None, *, commit_handler=None):
+                 parent=None, *, commit_handler=None, commit_finalize_handler=None, trace_handler=None):
         super().__init__(parent)
         self.page_dir=Path(page_dir); self.source_path=Path(source_path); self.target_path=Path(target_path)
         self.display_path=Path(display_path); self.project=dict(project or {}); self.config=config.model_copy(deep=True)
-        self._commit_handler=commit_handler; self._applied=0; self._ocr_payload={}
+        self._commit_handler=commit_handler; self._commit_finalize_handler=commit_finalize_handler; self._trace_handler=trace_handler; self._applied=0; self._ocr_payload={}
+        # One explicit linkage state coordinates the two visual tool groups.
+        # Selection is orthogonal and persists across action-mode switches; OCR
+        # authority is tied to the exact selection that produced it.
+        self._link_state=RegionWorkspaceLinkState()
+        self._ocr_programmatic_change=False
+        self._ocr_worker=None
+        self._ocr_busy=False
+        self._ocr_request_signature=""
+        self._commit_worker=None
         self.setWindowTitle("区域复合工具 · 选区系统 / Direct / 蒙版 / 挖孔 / 透明 / OCR")
         # v2.3.43: the old bottom-toolbar layout could advertise a safe dialog
         # size but still grow beyond the real macOS content area because child
@@ -1356,7 +1476,7 @@ class RegionCompositeDialog(QDialog):
         ocrrow.addWidget(self.ocr_btn); ocrrow.addWidget(self.ocr_status,1); op.addLayout(ocrrow)
         self.ocr_text=QPlainTextEdit(); self.ocr_text.setMaximumHeight(74); self.ocr_text.setPlaceholderText("区域 OCR 中文结果；可手工修改后再应用。"); op.addWidget(self.ocr_text)
         og=QGridLayout(); og.setHorizontalSpacing(5); og.setVerticalSpacing(4)
-        self.ocr_orientation=QComboBox(); self.ocr_orientation.addItem("自动","auto"); self.ocr_orientation.addItem("竖排","vertical"); self.ocr_orientation.addItem("横排","horizontal")
+        self.ocr_orientation=QComboBox(); self.ocr_orientation.addItem("竖排","vertical"); self.ocr_orientation.addItem("横排","horizontal"); self.ocr_orientation.addItem("自动","auto"); self.ocr_orientation.setCurrentIndex(0)
         self.ocr_font_size=QSpinBox(); self.ocr_font_size.setRange(0,160); self.ocr_font_size.setSpecialValueText("自动"); self.ocr_font_size.setSuffix(" px")
         self.ocr_columns=QSpinBox(); self.ocr_columns.setRange(0,12); self.ocr_columns.setSpecialValueText("自动")
         self.ocr_break=QComboBox(); self.ocr_break.addItem("智能断句","smart"); self.ocr_break.addItem("均衡断句","balanced"); self.ocr_break.addItem("保留源换行","source")
@@ -1430,9 +1550,15 @@ class RegionCompositeDialog(QDialog):
         self.offset_x.valueChanged.connect(lambda _v:self._brush_alignment_changed())
         self.offset_y.valueChanged.connect(lambda _v:self._brush_alignment_changed())
         self.brush_undo_btn.clicked.connect(self._brush_undo); self.brush_redo_btn.clicked.connect(self._brush_redo); self.brush_clear_btn.clicked.connect(self._brush_clear)
+        self.ocr_text.textChanged.connect(self._ocr_text_changed)
         self.ocr_btn.clicked.connect(self._recognize_ocr); self.apply_btn.clicked.connect(self._apply_tool); close.clicked.connect(self.accept)
         self.target_view.set_selection_mode("rect"); self.target_view.set_interaction_mode("selection"); self.target_view.set_snap_enabled(False); self.target_view.set_snap_distance(10); self.target_view.set_brush_size(42)
-        self._update_brush_controls(); self._tool_changed(); QTimer.singleShot(0,self._finish_region_layout)
+        self._update_brush_controls(); self._tool_changed(); self._update_region_action_state(); QTimer.singleShot(0,self._finish_region_layout)
+
+    def _trace_region(self,stage:str,payload:dict[str,Any]|None=None):
+        if self._trace_handler is None: return
+        try: self._trace_handler(str(stage),dict(payload or {}))
+        except Exception: logger.debug("region workspace trace failed",exc_info=True)
 
     def _apply_region_column_widths(self):
         """Keep both side workspaces visible at every supported window width."""
@@ -1476,23 +1602,97 @@ class RegionCompositeDialog(QDialog):
     def _checked_property(self,group:QButtonGroup,name:str,default:str)->str:
         b=group.checkedButton(); return str(b.property(name) if b is not None else default)
 
+    @staticmethod
+    def _set_group_value(group:QButtonGroup, buttons, property_name:str, value:str|None):
+        """Select one button (or none) without letting two action families lie.
+
+        Region tools and brush tools live in separate Qt button groups for the
+        layout, so Qt cannot make them mutually exclusive by itself.  Temporarily
+        disabling exclusivity is the only reliable way to clear a checked button.
+        """
+        wanted=str(value or "")
+        group.setExclusive(False)
+        try:
+            for button in buttons:
+                button.setChecked(bool(wanted and str(button.property(property_name) or "") == wanted))
+        finally:
+            group.setExclusive(True)
+
+    def _selection_snapshot(self)->tuple[dict[str,Any],list[int],str]:
+        spec=copy.deepcopy(self.target_view.selection_spec())
+        box=[int(v) for v in self.target_view.box()]
+        sig=selection_signature(spec)
+        return spec,box,sig
+
+    def _pending_brush_pixels(self)->int:
+        if not hasattr(self,"_brush_transparent"):
+            return 0
+        return int(brush_mask_counts(self._brush_transparent,self._brush_hole).get("union_pixels",0) or 0)
+
+    def _invalidate_ocr_binding(self, *, keep_user_text:bool=False):
+        self._ocr_payload={}; self._link_state.clear_ocr()
+        self._ocr_programmatic_change=True
+        try:
+            if not keep_user_text: self.ocr_text.clear()
+        finally:
+            self._ocr_programmatic_change=False
+        if hasattr(self,"ocr_status"):
+            self.ocr_status.setText("选区已变化 · OCR 结果已解绑，请重新识别或输入当前区域中文")
+
+    def _ocr_text_changed(self):
+        if self._ocr_programmatic_change: return
+        # Manual text is selection-owned too.  It may replace recognition text,
+        # but detector polygons from an older selection can never follow it into
+        # a new box.  Bind typed text to the current selection and discard stale
+        # OCR geometry; a later selection change will invalidate the text again.
+        if self.ocr_text.toPlainText().strip() and len(self.target_view.box())==4:
+            self._ocr_payload={}
+            self._link_state.bind_ocr(self.target_view.selection_spec())
+        elif not self.ocr_text.toPlainText().strip():
+            self._ocr_payload={}; self._link_state.clear_ocr()
+
+    def _update_region_action_state(self):
+        if not hasattr(self,"apply_btn"): return
+        valid_selection=len(self.target_view.box())==4 and bool(selection_signature(self.target_view.selection_spec()))
+        pending=self._pending_brush_pixels()
+        enabled=self._link_state.can_apply(selection_valid=valid_selection,pending_brush_pixels=pending)
+        if getattr(self,"_ocr_busy",False) and self._tool_key()=="region_ocr":
+            enabled=False
+        self.apply_btn.setEnabled(enabled)
+        if self._link_state.active_family=="brush":
+            self.apply_btn.setText("提交当前涂抹揭示" if pending else "先在画布涂抹")
+        else:
+            self.apply_btn.setText("应用当前工具到选区" if valid_selection else "先建立选区")
+
     def _shape_changed(self,*_):
-        self._activate_selection_interaction()
+        self._activate_selection_interaction(restore_region_tool=True)
         mode=self._checked_property(self.shape_group,"selectionMode","rect")
         self.target_view.set_selection_mode(mode)
         names={"rect":"矩形框","ellipse":"椭圆框","smart":"爆炸框 / 智能闭合","freehand":"手绘闭合"}
-        self.selection_status.setText(f"已选择 {names.get(mode,mode)} · 请在中间当前结果上左键操作")
+        # Rect/ellipse are deterministic shape changes: when an existing bbox is
+        # present, update it immediately instead of merely changing the *next*
+        # drag mode while leaving a contradictory old selection active.
+        box=self.target_view.box()
+        if len(box)==4 and mode in {"rect","ellipse"}:
+            self.target_view.set_selection_spec({"schema":"folirina.region_selection.v1","kind":mode,"bbox":box,"points":[],"snapped":False},emit=True)
+        else:
+            suffix=" · 当前选区保持不变；重新拖选后使用此形状" if len(box)==4 else " · 请在中间当前结果上左键操作"
+            self.selection_status.setText(f"已选择 {names.get(mode,mode)}{suffix}")
+        self._update_region_action_state()
 
     def _tool_key(self)->str: return self._checked_property(self.tool_group,"regionTool","region_precise_mask")
 
     def _tool_changed(self,*_):
-        self._activate_selection_interaction()
-        key=self._tool_key(); hints={k:h for _l,k,h in self._TOOLS}; self.tool_hint.setText(hints.get(key,""))
+        key=self._tool_key(); self._link_state.activate_region(key)
+        self._activate_selection_interaction(restore_region_tool=False)
+        hints={k:h for _l,k,h in self._TOOLS}; self.tool_hint.setText(hints.get(key,""))
         is_ocr=key=="region_ocr"; self.ocr_box.setVisible(is_ocr); self.performance_hint.setVisible(key=="region_precise_mask")
         self.inset.setEnabled(key=="region_hole_reveal")
         self.feather.setEnabled(key in {"region_direct_patch","region_hole_reveal","region_transparent"})
         offsets=key!="region_ocr"; self.offset_x.setEnabled(offsets); self.offset_y.setEnabled(offsets)
         if key=="region_hole_reveal" and self.feather.value()==0: self.feather.setValue(1)
+        self._trace_region("region_tool_activated",{"tool":key,"selection_bbox":self.target_view.box()})
+        self._update_region_action_state()
 
     def _uncheck_brush_buttons(self):
         if not hasattr(self,"brush_group"): return
@@ -1500,24 +1700,35 @@ class RegionCompositeDialog(QDialog):
         for button in self.brush_buttons: button.setChecked(False)
         self.brush_group.setExclusive(True)
 
-    def _activate_selection_interaction(self):
+    def _activate_selection_interaction(self, *, restore_region_tool:bool=False):
         self._brush_interaction=False
+        self._link_state.active_family="region"
         if hasattr(self,"target_view"):
             self.target_view.set_interaction_mode("selection")
         self._uncheck_brush_buttons()
-        if hasattr(self,"apply_btn"): self.apply_btn.setText("应用当前工具到选区")
+        if restore_region_tool and hasattr(self,"tool_group") and self.tool_group.checkedButton() is None:
+            key=self._link_state.activate_region(self._link_state.last_region_tool)
+            self._set_group_value(self.tool_group,self.tool_buttons,"regionTool",key)
+        self._update_region_action_state()
 
     def _brush_mode_key(self)->str:
         return self._checked_property(self.brush_group,"brushRevealMode","transparent")
 
     def _brush_mode_changed(self,*_):
+        key=self._brush_mode_key(); self._link_state.activate_brush(key)
         self._brush_interaction=True
+        # A single action state must be visible.  Keep the last region tool in
+        # linkage state so selecting a shape later can restore it automatically.
+        checked=self.tool_group.checkedButton()
+        if checked is not None:
+            self._link_state.last_region_tool=str(checked.property("regionTool") or self._link_state.last_region_tool)
+        self._set_group_value(self.tool_group,self.tool_buttons,"regionTool",None)
         self.target_view.set_interaction_mode("brush")
         self.target_view.set_brush_size(int(self.brush_size.value()))
-        key=self._brush_mode_key(); names={"transparent":"透明揭示","hole":"挖孔揭示","restore":"恢复日文"}
-        self.apply_btn.setText("提交当前涂抹揭示")
+        names={"transparent":"透明揭示","hole":"挖孔揭示","restore":"恢复日文"}
         self.selection_status.setText(f"涂抹模式 · {names.get(key,key)} · 左键涂抹，右键恢复，中键平移")
-        self._update_brush_controls()
+        self._trace_region("region_brush_activated",{"brush_mode":key,"selection_bbox":self.target_view.box()})
+        self._update_brush_controls(); self._update_region_action_state()
 
     def _brush_size_changed(self,value:int):
         self.target_view.set_brush_size(int(value)); self.brush_size_label.setText(f"{int(value)} px")
@@ -1654,6 +1865,7 @@ class RegionCompositeDialog(QDialog):
         counts=brush_mask_counts(self._brush_transparent,self._brush_hole)
         self.brush_undo_btn.setEnabled(bool(self._brush_history)); self.brush_redo_btn.setEnabled(bool(self._brush_redo_stack)); self.brush_clear_btn.setEnabled(counts["union_pixels"]>0)
         self.brush_status.setText(f"透明 {counts['transparent_pixels']:,} px · 挖孔 {counts['hole_pixels']:,} px · 共 {counts['union_pixels']:,} px · 撤销 {len(self._brush_history)} / 重做 {len(self._brush_redo_stack)}")
+        self._update_region_action_state()
 
     def _clear_brush_preview_items(self):
         for item in list(self._brush_preview_items.values()):
@@ -1692,20 +1904,36 @@ class RegionCompositeDialog(QDialog):
         union=np.maximum(tr,ho).astype(np.uint8)
         return row,union,patch
 
-    def _apply_brush_session(self):
+    def _commit_brush_session(self, *, interactive:bool=True)->bool:
         if self._commit_handler is None:
-            QMessageBox.warning(self,"无法提交","当前区域编辑器没有连接复核提交器。"); return
+            if interactive: QMessageBox.warning(self,"无法提交","当前区域编辑器没有连接复核提交器。")
+            return False
         try: row,reveal,patch=self._build_brush_commit()
-        except Exception as exc: QMessageBox.information(self,"没有涂抹",str(exc)); return
-        old_text=self.apply_btn.text(); self.apply_btn.setText("正在提交涂抹…"); self.apply_btn.setEnabled(False); QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        except Exception as exc:
+            if interactive: QMessageBox.information(self,"没有涂抹",str(exc))
+            return False
+        old_text=self.apply_btn.text(); self.apply_btn.setText("正在提交涂抹…"); self.apply_btn.setEnabled(False)
+        self._trace_region("region_brush_commit_requested",{"target_bbox":list(row.get("target_bbox") or []),"pixels":int(row.get("union_pixels",0) or 0)})
+        own_cursor=not self._link_state.applying
+        if own_cursor: QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             QApplication.processEvents(); final=self._commit_handler(row,reveal,patch); self._applied+=1
             final_path=Path(str(final)) if final else self.page_dir/"final_reviewed.png"
             self._reset_brush_session(final_path)
             self.selection_status.setText(f"涂抹揭示已提交 · 已叠加 {self._applied} 步 · 可继续涂抹或切回选区工具")
-        except Exception as exc: QMessageBox.critical(self,"涂抹揭示提交失败",str(exc))
+            self._trace_region("region_brush_commit_succeeded",{"target_bbox":list(row.get("target_bbox") or []),"applied_count":self._applied})
+            return True
+        except Exception as exc:
+            self._trace_region("region_brush_commit_failed",{"reason":str(exc)})
+            if interactive: QMessageBox.critical(self,"涂抹揭示提交失败",str(exc))
+            return False
         finally:
-            QApplication.restoreOverrideCursor(); self.apply_btn.setEnabled(True); self.apply_btn.setText("提交当前涂抹揭示" if self._brush_interaction else old_text)
+            if own_cursor: QApplication.restoreOverrideCursor()
+            self.apply_btn.setText("提交当前涂抹揭示" if self._brush_interaction else old_text)
+            self._update_region_action_state()
+
+    def _apply_brush_session(self):
+        self._commit_brush_session(interactive=True)
 
     def _clear_selection(self):
         self.target_view.clear_selection(emit=True); self.jp_view.clear_selection(); self.source_view.clear_selection()
@@ -1730,8 +1958,11 @@ class RegionCompositeDialog(QDialog):
     def _selection_changed(self,bbox):
         box=list(bbox or [])
         if len(box)!=4:
-            self.jp_view.clear_selection(); self.source_view.clear_selection(); self.selection_status.setText("尚未选择区域 · 请在中间当前结果上左键拖选"); return
+            stale=self._link_state.bind_selection({})
+            if stale: self._invalidate_ocr_binding()
+            self.jp_view.clear_selection(); self.source_view.clear_selection(); self.selection_status.setText("尚未选择区域 · 请在中间当前结果上左键拖选"); self._update_region_action_state(); return
         spec=self.target_view.selection_spec(); self.jp_view.set_selection_spec(spec)
+        if self._link_state.bind_selection(spec): self._invalidate_ocr_binding()
         try:
             src_spec=project_selection_spec(
                 spec, registration_homography(self.project), self.source_view.image_shape(), target_to_source=True
@@ -1748,30 +1979,97 @@ class RegionCompositeDialog(QDialog):
         names={"rect":"矩形","ellipse":"椭圆","smart":"智能闭合","freehand":"手绘闭合"}
         kind=str(spec.get("kind") or "rect")
         self.selection_status.setText(f"{names.get(kind,kind)} · TARGET {box[0]},{box[1]}–{box[2]},{box[3]}{snap_text}{roi_text}")
+        self._update_region_action_state()
 
+    def _ocr_mode_key(self)->str:
+        return str(((self.project.get("meta") or {}).get("transfer_mode") or "")).strip().lower()
+
+    def closeEvent(self,event):
+        for worker,label in ((getattr(self,"_ocr_worker",None),"OCR"),(getattr(self,"_commit_worker",None),"区域提交")):
+            if worker is not None and worker.isRunning():
+                if hasattr(self,"ocr_status"):
+                    self.ocr_status.setText(f"{label}仍在运行，请稍候完成后再关闭。")
+                event.ignore(); return
+        super().closeEvent(event)
     def _recognize_ocr(self):
         box=self.target_view.box()
         if len(box)!=4:
             QMessageBox.information(self,"没有选区","请先选择 OCR 区域。"); return
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            QApplication.processEvents()
-            payload=_hybrid_ocr_edit_blocks.recognize_manual_ocr_block(self.project,self.source_path,self.target_path,box,self.config,existing=self._ocr_payload or None)
-            self._ocr_payload=dict(payload or {}); self.ocr_text.setPlainText(str(payload.get("render_text") or payload.get("ocr_text") or "")); backend=str(payload.get("source_backend") or "OCR")
-            err=str(payload.get("source_ocr_error") or "").strip(); self.ocr_status.setText(f"{backend} · " + (f"识别失败：{err}" if err else f"置信度 {float(payload.get('confidence') or 0.0):.2f}"))
-        except Exception as exc: QMessageBox.critical(self,"区域 OCR 失败",str(exc))
-        finally: QApplication.restoreOverrideCursor()
+        worker=getattr(self,"_ocr_worker",None)
+        if worker is not None and worker.isRunning():
+            self.ocr_status.setText("区域 OCR 正在处理中，请稍候…")
+            return
+        modules=_ocr_mode_modules(self._ocr_mode_key())
+        if modules[0] is None:
+            self.ocr_status.setText("当前模式没有可用的区域 OCR 后端。")
+            return
+        recognizer=modules[0].recognize_manual_ocr_block
+        request_sig=selection_signature(self.target_view.selection_spec())
+        self._ocr_request_signature=request_sig
+        project=copy.deepcopy(self.project); source_path=Path(self.source_path); target_path=Path(self.target_path)
+        bbox=[int(v) for v in box]; cfg=self.config.model_copy(deep=True)
+        self._ocr_busy=True; self.ocr_btn.setEnabled(False); self.ocr_btn.setText("识别中…")
+        self.ocr_status.setText("正在识别当前选区… 可继续查看，不会卡住界面")
+        self._update_region_action_state()
+        worker=PageActionWorker(
+            "区域复合 OCR",
+            lambda: recognizer(project,source_path,target_path,bbox,cfg,existing=None),
+            parent=self,
+        )
+        self._ocr_worker=worker
 
-    def _row(self)->dict[str,Any]:
+        def done(payload):
+            row=dict(payload or {})
+            current_sig=selection_signature(self.target_view.selection_spec())
+            same_selection=bool(current_sig) and current_sig==request_sig
+            self._ocr_payload=row
+            if same_selection:
+                self._link_state.bind_ocr(self.target_view.selection_spec())
+            else:
+                self._link_state.clear_ocr()
+            self._ocr_programmatic_change=True
+            try:
+                self.ocr_text.setPlainText(str(row.get("render_text") or row.get("ocr_text") or ""))
+            finally:
+                self._ocr_programmatic_change=False
+            backend=str(row.get("source_backend") or "OCR")
+            serr=str(row.get("source_ocr_error") or "").strip()
+            text_value=str(row.get("render_text") or row.get("ocr_text") or "").strip()
+            if not same_selection:
+                self.ocr_status.setText("OCR 已完成，但选区已变化 · 文本已填入，请确认后重新识别")
+            elif serr:
+                self.ocr_status.setText(f"{backend} · SOURCE OCR 失败：{serr[:180]}")
+            elif not text_value:
+                self.ocr_status.setText("OCR 已执行，但 SOURCE ROI 没识别到文字；可调整选区或手动输入。")
+            else:
+                self.ocr_status.setText(f"{backend} · 识别完成 · 置信度 {float(row.get('confidence') or 0.0):.2f}")
+
+        def failed(message):
+            detail=str(message or "区域 OCR 未返回错误信息").strip()
+            self.ocr_status.setText("区域 OCR 失败："+detail.splitlines()[0][:220])
+
+        def finished():
+            self._ocr_busy=False
+            self._ocr_worker=None
+            self.ocr_btn.setEnabled(True); self.ocr_btn.setText("识别当前选区")
+            self._update_region_action_state()
+
+        worker.done.connect(done); worker.failed.connect(failed); worker.finished.connect(finished); worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _row(self, *, selection_spec:dict[str,Any]|None=None, selection_box:list[int]|None=None, tool_key:str|None=None)->dict[str,Any]:
         import uuid
-        spec=self.target_view.selection_spec(); box=self.target_view.box(); key=self._tool_key()
+        spec=copy.deepcopy(selection_spec if selection_spec is not None else self.target_view.selection_spec())
+        box=[int(v) for v in (selection_box if selection_box is not None else self.target_view.box())]
+        key=str(tool_key or self._tool_key())
         row={
             "id":f"region-action-{uuid.uuid4().hex[:10]}","enabled":True,"mode":key,"target_bbox":box,"selection_spec":spec,
             "source_offset_x":int(self.offset_x.value()),"source_offset_y":int(self.offset_y.value()),"feather_px":int(self.feather.value()),"inset_px":int(self.inset.value()),
             "origin":"region_composite_editor","tool_kind":"region_composite","owner_transfer_mode":"","ocr_allowed":key=="region_ocr",
         }
         if key=="region_ocr":
-            payload=dict(self._ocr_payload or {}); payload.pop("id",None); row.update(payload)
+            payload=dict(self._ocr_payload or {}) if self._link_state.ocr_matches_current_selection() else {}
+            payload.pop("id",None); row.update(payload)
             row.update({
                 "render_text":self.ocr_text.toPlainText().strip(),"ocr_text":str(payload.get("ocr_text") or self.ocr_text.toPlainText().strip()),
                 "selection_spec":spec,"target_bbox":box,"orientation":str(self.ocr_orientation.currentData() or "auto"),
@@ -1783,31 +2081,63 @@ class RegionCompositeDialog(QDialog):
     def _apply_tool(self):
         if self._brush_interaction:
             self._apply_brush_session(); return
-        if brush_mask_counts(self._brush_transparent,self._brush_hole)["union_pixels"]>0:
-            QMessageBox.information(self,"存在未提交涂抹","当前还有未提交的透明/挖孔笔触。请先切回涂抹模式提交，或用“全部恢复日文”清空后再应用区域工具。"); return
-        if len(self.target_view.box())!=4:
+        if getattr(self,"_commit_worker",None) is not None and self._commit_worker.isRunning():
+            self.selection_status.setText("区域处理仍在后台执行，请稍候…")
+            return
+        spec,box,sig=self._selection_snapshot()
+        if len(box)!=4 or not sig:
+            self._trace_region("region_apply_blocked",{"reason":"no_selection"})
             QMessageBox.information(self,"没有选区","请先在中间“当前结果”画出处理区域。"); return
-        if self._tool_key()=="region_ocr" and not self.ocr_text.toPlainText().strip():
+        key=self._link_state.activate_region(self._tool_key())
+        self._trace_region("region_apply_requested",{"tool":key,"target_bbox":box,"selection_signature":sig,"pending_brush_pixels":self._pending_brush_pixels()})
+        if key=="region_ocr" and not self.ocr_text.toPlainText().strip():
             self._recognize_ocr()
-            if not self.ocr_text.toPlainText().strip(): return
-        row=self._row()
+            self.ocr_status.setText("正在 OCR；识别完成后请确认文字，再点击应用。")
+            return
         if self._commit_handler is None:
             QMessageBox.warning(self,"无法提交","当前区域编辑器没有连接复核提交器。"); return
-        old_text=self.apply_btn.text(); self.apply_btn.setText("处理中…"); self.apply_btn.setEnabled(False); QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            QApplication.processEvents(); final=self._commit_handler(row,None,None); self._applied+=1
-            final_path=Path(str(final)) if final else self.page_dir/"final_reviewed.png"
-            if final_path.exists():
-                self.target_view.replace_display_image(final_path)
-                refreshed=cv2.imread(str(final_path),cv2.IMREAD_COLOR)
-                if refreshed is not None and refreshed.shape==self._brush_base.shape: self._brush_base=refreshed
-                self._brush_source_tile_cache.clear()
-            self._selection_changed(self.target_view.box())
-            self.selection_status.setText(self.selection_status.text()+f" · 已叠加 {self._applied} 步")
-            if self._tool_key()=="region_ocr": self.ocr_status.setText("当前 OCR 动作已提交；选区保持，可继续处理")
-        except Exception as exc: QMessageBox.critical(self,"区域工具应用失败",str(exc))
-        finally:
-            QApplication.restoreOverrideCursor(); self.apply_btn.setEnabled(True); self.apply_btn.setText(old_text)
+        spec,box,sig=self._selection_snapshot(); row=self._row(selection_spec=spec,selection_box=box,tool_key=key)
+        if self._pending_brush_pixels()>0:
+            # Brush patch persistence is already sparse and quick. Commit it first
+            # so review ordering remains deterministic before launching the heavy
+            # region/OCR render in the worker thread.
+            if not self._commit_brush_session(interactive=False):
+                QMessageBox.warning(self,"提交失败","未提交涂抹无法保存；原笔触仍保留。")
+                return
+        old_text=self.apply_btn.text(); self.apply_btn.setText("后台处理中…"); self._link_state.applying=True; self.apply_btn.setEnabled(False)
+        self.selection_status.setText(self.selection_status.text()+" · 后台处理中")
+        worker=PageActionWorker("区域复合提交",lambda:self._commit_handler(row,None,None),parent=self)
+        self._commit_worker=worker
+
+        def done(result):
+            try:
+                finalized=self._commit_finalize_handler(row,result) if self._commit_finalize_handler is not None else result
+                final_path=Path(str(getattr(finalized,"final_reviewed",finalized) or self.page_dir/"final_reviewed.png"))
+                self._applied+=1
+                if final_path.exists():
+                    self.target_view.replace_display_image(final_path)
+                    refreshed=cv2.imread(str(final_path),cv2.IMREAD_COLOR)
+                    if refreshed is not None and refreshed.shape==self._brush_base.shape: self._brush_base=refreshed
+                    self._brush_source_tile_cache.clear()
+                self.target_view.set_selection_spec(spec,emit=False)
+                self._selection_changed(box)
+                self.selection_status.setText(self.selection_status.text()+f" · 已叠加 {self._applied} 步")
+                if key=="region_ocr": self.ocr_status.setText("当前 OCR 动作已提交；选区保持，可继续处理")
+                self._trace_region("region_apply_succeeded",{"tool":key,"target_bbox":box,"applied_count":self._applied})
+            except Exception as exc:
+                self._trace_region("region_apply_failed",{"tool":key,"target_bbox":box,"reason":str(exc)})
+                QMessageBox.critical(self,"区域工具应用失败",str(exc))
+
+        def failed(message):
+            detail=str(message or "区域处理失败").strip()
+            self._trace_region("region_apply_failed",{"tool":key,"target_bbox":box,"reason":detail})
+            QMessageBox.critical(self,"区域工具应用失败",detail)
+
+        def finished():
+            self._commit_worker=None; self._link_state.applying=False; self.apply_btn.setText(old_text); self._update_region_action_state()
+
+        worker.done.connect(done); worker.failed.connect(failed); worker.finished.connect(finished); worker.finished.connect(worker.deleteLater)
+        worker.start()
 
     def applied_count(self)->int: return int(self._applied)
 
@@ -2159,7 +2489,7 @@ class WorkbenchPage(QWidget):
         self.full_bubble_patch.setToolTip("只迁移 SOURCE 中文字形/透明度，TARGET 背景、肤色、衣服、网点和气泡底色都不允许被 SOURCE RGB 覆盖。")
         self.preserve_border=QCheckBox("保留高清日文气泡边线"); self.preserve_border.setChecked(True)
         self.blur_guard=QCheckBox("低清文字保护：模糊时禁止直接贴像素"); self.blur_guard.setChecked(True)
-        self.blur_guard.setToolTip("摄影模糊、反光或低分辨率旧版先做光照归一化/墨迹重建；精准蒙版模式完全不调用 OCR，不安全区域进入复核。")
+        self.blur_guard.setToolTip("普通清晰旧中文版锁定 SOURCE 原始字形与抗锯齿；只有摄影/反光来源才允许进入照片专用清晰化。精准蒙版完全不调用 OCR。")
         self.preserve_source_layout=QCheckBox("清晰旧中文版保留原字号/分列（推荐）"); self.preserve_source_layout.setChecked(True)
         self.preserve_source_layout.setToolTip("精准蒙版始终保留旧中文版真实字号/分列/符号，并且完全不调用 OCR。需要 OCR 识别或重新排字时请改用精准蒙版+OCR / OCR重排，或手动编辑。")
         mode.layout.addWidget(self.publication_safety); mode.layout.addWidget(self.paired); mode.layout.addWidget(self.skip_ocr); mode.layout.addWidget(self.pixel_exact); mode.layout.addWidget(self.full_bubble_patch); mode.layout.addWidget(self.preserve_border); mode.layout.addWidget(self.blur_guard); mode.layout.addWidget(self.preserve_source_layout)
@@ -2170,7 +2500,7 @@ class WorkbenchPage(QWidget):
         align=Card("局部对齐与清晰度")
         form=QFormLayout(); form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows); form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.local=QComboBox(); self.local.addItems(["ecc","bbox","global"]); self.sr=QComboBox(); self.sr.addItems(["auto","torch","lanczos","external","off"])
-        self.fidelity=QComboBox(); self.fidelity.addItem("自动：光照归一化 → 墨迹（精准蒙版不 OCR）","auto"); self.fidelity.addItem("只保留原像素","pixels"); self.fidelity.addItem("强制墨迹重建","ink"); self.fidelity.addItem("低清直接拒绝","reject")
+        self.fidelity=QComboBox(); self.fidelity.addItem("自动：清晰扫描保留原字；摄影来源再清晰化","auto"); self.fidelity.addItem("只保留原像素","pixels"); self.fidelity.addItem("强制墨迹重建（会改变原字，仅特殊情况）","ink"); self.fidelity.addItem("低清直接拒绝","reject")
         self.iou=QDoubleSpinBox(); self.iou.setRange(.2,1); self.iou.setSingleStep(.01); self.iou.setDecimals(3); self.iou.setValue(.80)
         self.coverage=QDoubleSpinBox(); self.coverage.setRange(.5,1); self.coverage.setSingleStep(.001); self.coverage.setDecimals(3); self.coverage.setValue(.985)
         self.sr_model=QLineEdit(); self.sr_model.setPlaceholderText("可选：本地 .pth/.safetensors 超分模型")
@@ -2214,7 +2544,7 @@ class WorkbenchPage(QWidget):
         stages.layout.addWidget(self.target_erase_mode)
         target_grid=QGridLayout(); target_grid.setContentsMargins(0,0,0,0); target_grid.setHorizontalSpacing(7); target_grid.setVerticalSpacing(7); target_grid.setColumnStretch(0,1); target_grid.setColumnStretch(1,1)
         self.target_layer_erase=QPushButton("仅擦 TARGET 日文层…"); self.target_layer_erase.setObjectName("softPrimary"); self.reset_target_layer_erase=QPushButton("清空 TARGET 擦除")
-        self.target_layer_restore=QPushButton("恢复 TARGET 日文层…"); self.target_layer_restore.setObjectName("softPrimary"); self.reset_target_layer_restore=QPushButton("清空 TARGET 恢复")
+        self.target_layer_restore=QPushButton("恢复 TARGET 日文层 / 擦蒙版…"); self.target_layer_restore.setObjectName("softPrimary"); self.reset_target_layer_restore=QPushButton("清空 TARGET 恢复")
         target_grid.addWidget(self.target_layer_erase,0,0); target_grid.addWidget(self.reset_target_layer_erase,0,1)
         target_grid.addWidget(self.target_layer_restore,1,0); target_grid.addWidget(self.reset_target_layer_restore,1,1)
         stages.layout.addLayout(target_grid)
@@ -2250,8 +2580,8 @@ class WorkbenchPage(QWidget):
         self.reprocess_current.setToolTip("处理后的编辑区域也支持人工蒙版。点击后会重新跑当前页自动流程，并自动重新应用本页已有的人工强制迁移蒙版、人工补漏、清除蒙版、TARGET 擦除/恢复等编辑结果。")
         rl.addWidget(qa)
 
-        manual=Card("OCR 文本编辑 / 排版", "仅用于“精准蒙版+OCR”和“OCR重排”：可人工框选 ROI 重新 OCR，也可编辑已有自动 Region 的文字、字体、字号、方向、断句与排版。Direct / 纯精准蒙版 / Reveal 不读取这里的文本块。")
-        self.ocr_block_status=QLabel("人工 OCR 文本块：当前模式不可用"); self.ocr_block_status.setObjectName("quiet"); self.ocr_block_status.setWordWrap(True); manual.layout.addWidget(self.ocr_block_status)
+        manual=Card("OCR 文本编辑 / 排版", "人工 OCR 是独立的页面复核叠加层：Direct、精准蒙版、两种 Reveal、精准蒙版+OCR 和 OCR重排都可框选 ROI 重新 OCR，并编辑文字、字体、字号、方向、断句与排版；不会改变当前整页自动模式。")
+        self.ocr_block_status=QLabel("人工 OCR 文本块：等待可编辑页面"); self.ocr_block_status.setObjectName("quiet"); self.ocr_block_status.setWordWrap(True); manual.layout.addWidget(self.ocr_block_status)
         ocr_actions=QHBoxLayout(); self.open_ocr_block_editor=QPushButton("人工 OCR / 编辑文本块…"); self.open_ocr_block_editor.setObjectName("softPrimary"); self.reset_ocr_blocks=QPushButton("清空人工 OCR")
         ocr_actions.addWidget(self.open_ocr_block_editor,1); ocr_actions.addWidget(self.reset_ocr_blocks); manual.layout.addLayout(ocr_actions)
         self.manual_status=QLabel("当前页没有待复核文字区域"); self.manual_status.setObjectName("hint"); self.manual_status.setWordWrap(True); manual.layout.addWidget(self.manual_status)
@@ -2346,7 +2676,20 @@ class WorkbenchPage(QWidget):
         self.current_view="target"; self.set_view("target")
 
     def set_processing_busy(self, busy: bool):
-        """Disable mutating review controls while any page writer is active."""
+        """Disable mutating review controls while any page writer is active.
+
+        Repeated ``busy=True`` notifications are intentionally idempotent.  Model
+        preparation can hand off directly to a pipeline worker; older builds took
+        a second snapshot after controls were already disabled and later restored
+        that all-False snapshot, leaving review buttons permanently unclickable.
+        """
+        busy=bool(busy)
+        previous=bool(getattr(self,"_processing_busy",False))
+        if busy == previous:
+            if hasattr(self,"activity_badge"):
+                self.activity_badge.setText("处理中…" if busy else "就绪")
+            return
+        self._processing_busy=busy
         if hasattr(self, "activity_badge"):
             self.activity_badge.setText("处理中…" if busy else "就绪")
             self.activity_badge.setProperty("busy", bool(busy))
@@ -2357,7 +2700,7 @@ class WorkbenchPage(QWidget):
             "target_layer_erase", "reset_target_layer_erase", "target_layer_restore",
             "reset_target_layer_restore", "region_composite", "open_text_box", "add_manual_effect", "add_manual_effect_candidate",
             "undo_manual_effect", "manual_apply", "manual_reset", "manual_undo", "manual_redo",
-            "candidate_accept", "candidate_restore",
+            "candidate_accept", "candidate_restore", "open_ocr_block_editor", "reset_ocr_blocks",
         )
         if busy:
             self._busy_enabled_snapshot = {}
@@ -2374,6 +2717,11 @@ class WorkbenchPage(QWidget):
                 if widget is not None:
                     widget.setEnabled(bool(enabled))
             self._busy_enabled_snapshot = {}
+            # Snapshot restore is only a transient bridge. Recompute every review
+            # control from persisted page artifacts after the worker has fully
+            # released, so a stale False state can never survive page/mode/OCR
+            # transitions. The single-shot runs after MainWindow clears its worker.
+            QTimer.singleShot(0, self.refresh)
 
     def _set_inspector_panel(self, index: int):
         index = 1 if int(index) == 1 else 0
@@ -2509,15 +2857,16 @@ class WorkbenchPage(QWidget):
             return
         import cv2
         import numpy as np
-        mask_path=page_dir/"manual_clear_mask.png"
-        if not mask_path.exists(): mask_path=page_dir/"target_clear_mask.png"
-        if not mask_path.exists(): mask_path=page_dir/"clear_mask.png"
-        mask=cv2.imread(str(mask_path),cv2.IMREAD_GRAYSCALE) if mask_path.exists() else None
         target=cv2.imread(str(page_dir/"target_original.png"),cv2.IMREAD_COLOR)
         if target is None:
             QMessageBox.warning(self,"无法读取","当前页 target_original.png 无法读取。"); return
-        if mask is None: mask=np.zeros(target.shape[:2],dtype=np.uint8)
-        dlg=MaskEditorDialog(page_dir/"target_original.png",mask,self)
+        # Use the same review-safe projection as “应用蒙版”.  Automatic renderer
+        # artifacts may be whole-container masks and can overlap a face/artwork;
+        # manual masks remain exact reviewer authority and are never projected.
+        from .review_apply import _load_effective_clear_mask
+        mask,_mask_source=_load_effective_clear_mask(page_dir,target.shape[:2])
+        if mask is None or mask.shape != target.shape[:2]: mask=np.zeros(target.shape[:2],dtype=np.uint8)
+        dlg=MaskEditorDialog(page_dir/"target_original.png",mask,self.window)
         if dlg.exec()!=QDialog.DialogCode.Accepted: return
         try:
             with PageRunGuard(page_dir, "gui:manual-clear-mask"):
@@ -2603,6 +2952,7 @@ class WorkbenchPage(QWidget):
         mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE) if mask_path.exists() else None
         if mask is None or mask.shape != target.shape[:2]:
             mask = np.zeros(target.shape[:2], dtype=np.uint8)
+        mask_before=mask.copy()
         project = normalize_project(load_json(page_dir / "project.json"))
         try:
             auto_original, _auto_source, auto_diag = manual_force_auto_evidence_masks(
@@ -2622,7 +2972,7 @@ class WorkbenchPage(QWidget):
         old_settings = load_json(settings_path) if settings_path.exists() else {}
         auto_default = bool(old_settings.get("use_auto_evidence", True))
         dlg = MaskEditorDialog(
-            display_path, mask, self,
+            display_path, mask, self.window,
             title="人工强制迁移蒙版 · 人工 + OCR/自动检测",
             hint_text=(
                 "红色 = 人工蒙版；蓝色 = OCR/自动检测蒙版；橙色 = 两层重合。"
@@ -2638,8 +2988,10 @@ class WorkbenchPage(QWidget):
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        write_image(mask_path, dlg.result_mask())
-        edited_auto = dlg.result_reference_mask()
+        edited_manual=dlg.result_mask(); edited_auto=dlg.result_reference_mask()
+        manual_changed=not np.array_equal(edited_manual,mask_before)
+        reference_changed=not np.array_equal(edited_auto,auto_original)
+        write_image(mask_path,edited_manual)
         override_path = page_dir / "manual_force_auto_target_override.png"
         if np.array_equal(edited_auto, auto_original):
             try: override_path.unlink(missing_ok=True)
@@ -2656,19 +3008,25 @@ class WorkbenchPage(QWidget):
             "auto_target_override": bool(auto_override),
             "auto_reference": auto_diag,
         })
-        # Editing the blue OCR/automatic layer can invalidate already-generated
-        # Chinese transfer layers or a flattened final result.  Rebuild the page
-        # from the original pair and then re-apply this page's saved review
-        # state; otherwise stale symbols from old automatic layers can survive
-        # even after the automatic mask itself was erased.
-        self.current_view = "result"
-        for b, k in self.view_buttons:
-            b.setChecked(k == "result")
-        self.window.statusBar().showMessage(
-            "已保存人工/OCR/自动蒙版修订，正在清理旧图层并重新处理当前页…", 7000
-        )
-        self.refresh()
-        self.window.run_current_page(reapply_review_after_process=True)
+        self.current_view="result"
+        for b,k in self.view_buttons: b.setChecked(k=="result")
+        if reference_changed:
+            # Editing the blue automatic authority can invalidate the automatic
+            # transfer itself, so keep the conservative full page rerun here.
+            self.window.statusBar().showMessage("自动/OCR蒙版已修改，正在重新处理当前页并恢复人工复核…",7000)
+            self.refresh(); self.window.run_current_page(reapply_review_after_process=True)
+            return
+        # Red manual-force paint is a review-layer operation. Replaying review
+        # artifacts is enough and is dramatically faster than rerunning detection,
+        # registration and the page renderer.
+        cfg=self.window.state.config.model_copy(deep=True)
+        def done(final):
+            final=Path(str(final)); self.window.state.last_result_path=str(final); self._sync_reviewed_book_final(final)
+            self.window.statusBar().showMessage("人工强制迁移蒙版已应用（快速复核路径）。",5000); self.refresh()
+        if manual_changed:
+            self.window.run_page_action("应用人工强制迁移蒙版",lambda: apply_review_page(page_dir,cfg),done,failure_title="应用人工强制迁移蒙版失败")
+        else:
+            self.window.statusBar().showMessage("蒙版没有变化。",2500); self.refresh()
 
     def _reset_force_transfer_mask(self):
         page_dir = self._current_page_dir()
@@ -2715,20 +3073,35 @@ class WorkbenchPage(QWidget):
             mask = np.zeros(target.shape[:2], dtype=np.uint8)
         selected_fill_mode = str(self.target_erase_mode.currentData() or "auto")
         display = cv2.imread(str(display_path), cv2.IMREAD_COLOR)
+        # Chinese protection is page-stable during one editor session; building it
+        # on every brush event repeatedly decoded several alpha/mask files.
+        from .review_apply import _protected_chinese_mask
+        protect,_protect_diag=_protected_chinese_mask(page_dir,target.shape[:2],margin_px=1)
+        preview_kernel=cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(3,3))
         def _target_erase_live_preview(mask_value):
-            from .review_apply import _protected_chinese_mask
             raw=(np.asarray(mask_value,dtype=np.uint8)>0).astype(np.uint8)*255
             if cv2.countNonZero(raw)==0: return display.copy()
-            expanded=cv2.dilate(raw,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(3,3)),iterations=1)
-            protect,_=_protected_chinese_mask(page_dir, target.shape[:2], margin_px=1)
+            expanded=cv2.dilate(raw,preview_kernel,iterations=1)
             effective=expanded.copy(); effective[protect>0]=0
+            out=display.copy()
+            if cv2.countNonZero(effective)==0: return out
             if selected_fill_mode == "pure_white":
-                cleaned=target.copy(); cleaned[effective>0]=255
-            else:
-                cleaned=cv2.inpaint(target,effective,3.0,cv2.INPAINT_TELEA)
-            out=display.copy(); out[effective>0]=cleaned[effective>0]; return out
+                out[effective>0]=255; return out
+            # Live preview only needs the local brush neighbourhood. Inpaint a
+            # padded ROI instead of the whole manga page; final save still uses
+            # the authoritative full review service in a worker thread.
+            pts=cv2.findNonZero(effective)
+            if pts is None: return out
+            x,y,w,h=cv2.boundingRect(pts); pad=12
+            x0=max(0,x-pad); y0=max(0,y-pad); x1=min(target.shape[1],x+w+pad); y1=min(target.shape[0],y+h+pad)
+            crop_target=target[y0:y1,x0:x1]
+            crop_mask=effective[y0:y1,x0:x1]
+            cleaned=cv2.inpaint(crop_target,crop_mask,3.0,cv2.INPAINT_TELEA)
+            local=crop_mask>0
+            out_crop=out[y0:y1,x0:x1]; out_crop[local]=cleaned[local]
+            return out
         dlg = MaskEditorDialog(
-            display_path, mask, self,
+            display_path, mask, self.window,
             title="只擦 TARGET 日文层 · 中文硬保护",
             hint_text=("红色 = 笔刷范围。当前模式：" + ("纯白涂抹；" if selected_fill_mode == "pure_white" else "智能恢复 TARGET；") +
                        "可刷残留日文、黑点、短线、标点和符号。画布会实时预览背景修复；正式保存时仍按中文保护层计算有效区域。"),
@@ -2743,24 +3116,20 @@ class WorkbenchPage(QWidget):
             "protect_chinese_margin_px": 1,
             "fill_mode": selected_fill_mode,
         })
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            final = apply_target_layer_erase_review(page_dir, self.window.state.config.model_copy(deep=True))
-            self.window.state.last_result_path = str(final)
-            pair = self.window.current_pair(); page_id = page_id_for_pair(pair) if pair is not None else ""
-            proj = self.window.state.projects_by_page.get(page_id)
-            if proj is not None:
-                proj.artifacts["final"] = str(final)
-            self._sync_reviewed_book_final(final)
-            self.current_view = "target_erase"
-            for b, k in self.view_buttons:
-                b.setChecked(k == self.current_view)
-            self.window.statusBar().showMessage("TARGET 层擦除已应用：只改日文母版层，中文图层已硬保护。", 6000)
+        cfg=self.window.state.config.model_copy(deep=True)
+        def done(final):
+            final=Path(str(final)); self.window.state.last_result_path=str(final)
+            pair=self.window.current_pair(); page_id=page_id_for_pair(pair) if pair is not None else ""
+            proj=self.window.state.projects_by_page.get(page_id)
+            if proj is not None: proj.artifacts["final"]=str(final)
+            self._sync_reviewed_book_final(final); self.current_view="target_erase"
+            for b,k in self.view_buttons: b.setChecked(k==self.current_view)
+            self.window.statusBar().showMessage("TARGET 层擦除已应用：只改日文母版层，中文图层已硬保护。",6000)
             self.refresh()
-        except Exception as exc:
-            QMessageBox.critical(self, "TARGET 层擦除失败", str(exc))
-        finally:
-            QApplication.restoreOverrideCursor()
+        self.window.run_page_action(
+            "TARGET 层擦除", lambda: apply_target_layer_erase_review(page_dir,cfg), done,
+            failure_title="TARGET 层擦除失败",
+        )
 
     def _edit_target_layer_restore(self):
         page_dir = self._current_page_dir()
@@ -2789,9 +3158,9 @@ class WorkbenchPage(QWidget):
             if cv2.countNonZero(raw)==0: return display.copy()
             out=display.copy(); out[raw>0]=target[raw>0]; return out
         dlg = MaskEditorDialog(
-            display_path, mask, self,
+            display_path, mask, self.window,
             title="恢复 TARGET 日文层",
-            hint_text="红色 = 恢复范围。该工具会把笔刷区域直接恢复成 TARGET 原始日文图层与背景，可用于去掉误显示的中文。",
+            hint_text="红色 = 恢复范围。该工具会把笔刷区域直接恢复成 TARGET 原始日文图层与背景；同时会把恢复区域反向写回相关清除/强制蒙版，用于真正擦去蒙版、恢复日文层。左键涂抹，右键或“消除蒙版”可反擦。",
             save_label="保存并应用 TARGET 恢复", preview_fn=_target_restore_live_preview,
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
@@ -2801,66 +3170,51 @@ class WorkbenchPage(QWidget):
             "schema": "manga_hd_translation_transfer.target_layer_restore_settings.v1",
             "dilate_px": 0,
         })
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            final = apply_target_layer_restore_review(page_dir)
-            self.window.state.last_result_path = str(final)
-            pair = self.window.current_pair(); page_id = page_id_for_pair(pair) if pair is not None else ""
-            proj = self.window.state.projects_by_page.get(page_id)
-            if proj is not None:
-                proj.artifacts["final"] = str(final)
-            self._sync_reviewed_book_final(final)
-            self.current_view = "target_restore"
-            for b, k in self.view_buttons:
-                b.setChecked(k == self.current_view)
-            self.window.statusBar().showMessage("TARGET 层恢复已应用：笔刷区域已恢复原始日文图层。", 6000)
+        def done(final):
+            final=Path(str(final)); self.window.state.last_result_path=str(final)
+            pair=self.window.current_pair(); page_id=page_id_for_pair(pair) if pair is not None else ""
+            proj=self.window.state.projects_by_page.get(page_id)
+            if proj is not None: proj.artifacts["final"]=str(final)
+            self._sync_reviewed_book_final(final); self.current_view="target_restore"
+            for b,k in self.view_buttons: b.setChecked(k==self.current_view)
+            self.window.statusBar().showMessage("TARGET 层恢复已应用：笔刷区域已恢复原始日文图层，并同步从相关蒙版中扣除。",6000)
             self.refresh()
-        except Exception as exc:
-            QMessageBox.critical(self, "TARGET 层恢复失败", str(exc))
-        finally:
-            QApplication.restoreOverrideCursor()
+        self.window.run_page_action(
+            "TARGET 层恢复", lambda: apply_target_layer_restore_review(page_dir), done,
+            failure_title="TARGET 层恢复失败",
+        )
 
 
     def _reset_target_layer_erase(self):
         page_dir = self._current_page_dir()
         if page_dir is None:
             return
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            final = reset_target_layer_erase_review(page_dir)
+        def done(final):
             if final is not None:
-                self.window.state.last_result_path = str(final)
-                self._sync_reviewed_book_final(final)
-            self.current_view = "result"
-            for b, k in self.view_buttons:
-                b.setChecked(k == "result")
-            self.window.statusBar().showMessage("已清空 TARGET 层擦除，并恢复擦除前结果。", 5000)
-            self.refresh()
-        except Exception as exc:
-            QMessageBox.critical(self, "恢复 TARGET 层失败", str(exc))
-        finally:
-            QApplication.restoreOverrideCursor()
+                final=Path(str(final)); self.window.state.last_result_path=str(final); self._sync_reviewed_book_final(final)
+            self.current_view="result"
+            for b,k in self.view_buttons: b.setChecked(k=="result")
+            self.window.statusBar().showMessage("已清空 TARGET 层擦除，并恢复擦除前结果。",5000); self.refresh()
+        self.window.run_page_action(
+            "清空 TARGET 层擦除", lambda: reset_target_layer_erase_review(page_dir), done,
+            failure_title="恢复 TARGET 层失败",
+        )
 
 
     def _reset_target_layer_restore(self):
         page_dir = self._current_page_dir()
         if page_dir is None:
             return
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            final = reset_target_layer_restore_review(page_dir)
+        def done(final):
             if final is not None:
-                self.window.state.last_result_path = str(final)
-                self._sync_reviewed_book_final(final)
-            self.current_view = "result"
-            for b, k in self.view_buttons:
-                b.setChecked(k == "result")
-            self.window.statusBar().showMessage("已清空 TARGET 层恢复，并恢复恢复前结果。", 5000)
-            self.refresh()
-        except Exception as exc:
-            QMessageBox.critical(self, "恢复 TARGET 层失败", str(exc))
-        finally:
-            QApplication.restoreOverrideCursor()
+                final=Path(str(final)); self.window.state.last_result_path=str(final); self._sync_reviewed_book_final(final)
+            self.current_view="result"
+            for b,k in self.view_buttons: b.setChecked(k=="result")
+            self.window.statusBar().showMessage("已清空 TARGET 层恢复，并恢复恢复前结果。",5000); self.refresh()
+        self.window.run_page_action(
+            "清空 TARGET 层恢复", lambda: reset_target_layer_restore_review(page_dir), done,
+            failure_title="恢复 TARGET 层失败",
+        )
 
 
     def _manual_effect_rows(self) -> list[dict[str, Any]]:
@@ -2964,26 +3318,21 @@ class WorkbenchPage(QWidget):
         steps.append({"stage":str(stage), "time":time.time(), **as_dict(payload)})
         data["steps"]=steps; data["last_stage"]=str(stage); save_json(path,data)
 
-    def _commit_manual_effect_dialog_result(self, page_dir: Path, row: dict[str, Any], reveal, reveal_patch, preset_candidate: dict[str, Any] | None = None) -> Path:
-        """Qt adapter for the core manual-review transaction service."""
+    def _commit_manual_effect_core(self, page_dir: Path, row: dict[str, Any], reveal, reveal_patch, preset_candidate: dict[str, Any] | None = None):
+        """Qt-free portion of a manual/region commit; safe for PageActionWorker."""
         def trace(stage: str, payload: dict[str, Any]):
             self._trace_manual_gui_flow(page_dir, stage, payload)
+        return commit_manual_effect(
+            page_dir, row, reveal, reveal_patch,
+            self.window.state.config.model_copy(deep=True),
+            preset_candidate=preset_candidate,
+            trace=trace,
+        )
 
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            result = commit_manual_effect(
-                page_dir, row, reveal, reveal_patch,
-                self.window.state.config.model_copy(deep=True),
-                preset_candidate=preset_candidate,
-                trace=trace,
-            )
-        finally:
-            QApplication.restoreOverrideCursor()
-
+    def _finalize_manual_effect_commit(self, page_dir: Path, row: dict[str, Any], result, *, refresh_ui: bool = True) -> Path:
+        """GUI-thread bookkeeping after the core transaction has completed."""
         self.window.state.last_result_path = str(result.final_reviewed)
         remembered_mode = str(row.get("mode", "") or "")
-        # Region-composite actions reuse the manual-effect transaction/history,
-        # but must not replace the legacy dialog's remembered effect mode.
         if remembered_mode and not remembered_mode.startswith("region_"):
             self.window.state.last_manual_effect_mode = remembered_mode
             _app_settings().setValue("review/last_manual_effect_mode", remembered_mode)
@@ -2992,19 +3341,33 @@ class WorkbenchPage(QWidget):
             proj.artifacts["final"] = str(result.final)
             proj.artifacts["final_reviewed"] = str(result.final_reviewed)
         self._sync_reviewed_book_final(result.final_reviewed)
-
         try:
             self.image.clear_cache()
         except Exception:
             logger.debug("manual effect preview cache invalidation failed", exc_info=True)
-        self.current_view = "result"
-        for b,k in self.view_buttons:
-            b.setChecked(k == "result")
+        if refresh_ui:
+            self.current_view = "result"
+            for b,k in self.view_buttons:
+                b.setChecked(k == "result")
         self.window.statusBar().showMessage(
             f"人工补漏已直接提交 · 本页共 {result.region_count} 个区域 · final 已同步", 6000
         )
-        self.refresh()
+        # RegionCompositeDialog updates its own image immediately. Rebuilding the
+        # whole ProjectPage after every local region would decode thumbnails,
+        # recalculate controls and visibly hitch the modal editor. Defer that
+        # outer-page refresh until the region dialog closes.
+        if refresh_ui:
+            self.refresh()
         return result.final_reviewed
+
+    def _commit_manual_effect_dialog_result(self, page_dir: Path, row: dict[str, Any], reveal, reveal_patch, preset_candidate: dict[str, Any] | None = None) -> Path:
+        """Synchronous adapter retained for legacy/manual dialogs."""
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            result=self._commit_manual_effect_core(page_dir,row,reveal,reveal_patch,preset_candidate)
+        finally:
+            QApplication.restoreOverrideCursor()
+        return self._finalize_manual_effect_commit(page_dir,row,result)
 
     def _open_region_composite_editor(self):
         page_dir=self._current_page_dir(); ws=self._workspace()
@@ -3026,9 +3389,13 @@ class WorkbenchPage(QWidget):
         self._trace_manual_gui_flow(page_dir,"region_composite_opened")
         def _commit(row,reveal,reveal_patch):
             self._trace_manual_gui_flow(page_dir,"region_action_commit",{"mode":str(row.get("mode") or ""),"target_bbox":list(row.get("target_bbox") or [])})
-            return self._commit_manual_effect_dialog_result(page_dir,row,reveal,reveal_patch,{})
+            return self._commit_manual_effect_core(page_dir,row,reveal,reveal_patch,{})
+        def _finalize(row,result):
+            return self._finalize_manual_effect_commit(page_dir,row,result,refresh_ui=False)
+        def _trace(stage,payload):
+            self._trace_manual_gui_flow(page_dir,stage,payload)
         try:
-            dlg=RegionCompositeDialog(page_dir,source_path,target_path,display_path,project,self.window.state.config,self,commit_handler=_commit)
+            dlg=RegionCompositeDialog(page_dir,source_path,target_path,display_path,project,self.window.state.config,self.window,commit_handler=_commit,commit_finalize_handler=_finalize,trace_handler=_trace)
         except Exception as exc:
             self._trace_manual_gui_flow(page_dir,"region_composite_failed",{"reason":str(exc)})
             QMessageBox.critical(self,"无法打开区域复合工具",str(exc)); return
@@ -3084,7 +3451,7 @@ class WorkbenchPage(QWidget):
             self._trace_manual_gui_flow(page_dir,stage,payload)
         try:
             dlg=ManualEffectDialog(
-                source_path,target_path,project,self,
+                source_path,target_path,project,self.window,
                 initial_bbox=initial_bbox,initial_mode=initial_mode,commit_handler=_commit,trace_handler=_trace,
                 config=self.window.state.config, tool_kind=str(forced_tool_kind or "manual_effect"),
                 owner_transfer_mode=str(owner_transfer_mode or project_mode), ops_module=manual_ops,
@@ -3210,24 +3577,24 @@ class WorkbenchPage(QWidget):
     def _open_ocr_block_editor(self):
         ctx=self._ocr_editor_context()
         if ctx is None:
-            QMessageBox.information(self,"当前模式不可用","人工 OCR 文本块只属于“精准蒙版+OCR”和“OCR重排”。请先处理当前页并切换到其中一个 OCR 模式。")
+            QMessageBox.information(self.window,"当前页面不可编辑","人工 OCR 需要当前页已有 project.json、SOURCE 和 TARGET。处理完成后的 Direct、精准蒙版、两种 Reveal、精准蒙版+OCR 与 OCR重排页面均可使用。")
             return
         ws,project,mode,source_path,target_path=ctx
-        dialog=OCRBlockEditorDialog(ws.page_root,source_path,target_path,project,self.window.state.config,mode,parent=self)
+        dialog=OCRBlockEditorDialog(ws.page_root,source_path,target_path,project,self.window.state.config,mode,parent=self.window)
         if dialog.exec()!=QDialog.DialogCode.Accepted:
             return
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            final=apply_ocr_edit_blocks(ws.page_root,project,self.window.state.config.model_copy(deep=True))
-            self.window.state.last_result_path=str(final); self._sync_reviewed_book_final(final)
+        cfg=self.window.state.config.model_copy(deep=True)
+        def done(final):
+            final=Path(str(final)); self.window.state.last_result_path=str(final); self._sync_reviewed_book_final(final)
             self.current_view="result"
             for b,k in self.view_buttons: b.setChecked(k=="result")
-            self.window.statusBar().showMessage("人工 OCR 文本块已保存并局部重绘。",4500)
-            self.refresh()
-        except Exception as exc:
-            QMessageBox.critical(self,"应用人工 OCR 失败",str(exc))
-        finally:
-            QApplication.restoreOverrideCursor()
+            self.window.statusBar().showMessage("人工 OCR 文本块已保存并局部重绘。",4500); self.refresh()
+        # Rebuild/replay may read several page artifacts and render text. Keep it
+        # off the GUI thread so closing the OCR editor never freezes the workbench.
+        self.window.run_page_action(
+            "应用人工 OCR", lambda: apply_review_page(ws.page_root,cfg), done,
+            failure_title="应用人工 OCR 失败",
+        )
 
     def _reset_ocr_blocks(self):
         ctx=self._ocr_editor_context()
@@ -3237,20 +3604,25 @@ class WorkbenchPage(QWidget):
         rows=load_ocr_blocks(ws.page_root,mode)
         if not rows:
             self.window.statusBar().showMessage("当前页没有人工 OCR 文本块。",2500); return
-        if QMessageBox.question(self,"清空人工 OCR","清空当前页所有人工 OCR 文本块并恢复进入 OCR 编辑前的结果？") != QMessageBox.StandardButton.Yes:
+        if not _confirm_destructive_action(
+            self.window,
+            "清空人工 OCR",
+            f"将清空当前页 {len(rows)} 个人工 OCR 文本块，并恢复不含人工 OCR 的复核结果。\n\n这不会修改当前整页自动模式，也不会删除 Direct / 精准蒙版 / Reveal 等自动产物。",
+            confirm_text="清空",
+        ):
             return
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            save_ocr_blocks(ws.page_root,mode,[])
-            final=reset_ocr_edit_blocks(ws.page_root,project,self.window.state.config.model_copy(deep=True))
-            self.window.state.last_result_path=str(final); self._sync_reviewed_book_final(final)
+        cfg=self.window.state.config.model_copy(deep=True)
+        logger.info("manual OCR clear requested mode=%s page=%s blocks=%d", mode, ws.page_root, len(rows))
+        def action():
+            return clear_ocr_review_blocks(ws.page_root,cfg)
+        def done(final):
+            final=Path(str(final)); self.window.state.last_result_path=str(final); self._sync_reviewed_book_final(final)
             self.current_view="result"
             for b,k in self.view_buttons: b.setChecked(k=="result")
-            self.window.statusBar().showMessage("已清空人工 OCR 文本块。",3500); self.refresh()
-        except Exception as exc:
-            QMessageBox.critical(self,"清空人工 OCR 失败",str(exc))
-        finally:
-            QApplication.restoreOverrideCursor()
+            logger.info("manual OCR clear completed mode=%s page=%s", mode, ws.page_root); self.window.statusBar().showMessage("已清空人工 OCR 文本块，并恢复无 OCR 复核结果。",4500); self.refresh()
+        self.window.run_page_action(
+            "清空人工 OCR", action, done, failure_title="清空人工 OCR 失败",
+        )
 
     def _manual_selection_changed(self, *_args):
         queue=self._manual_queue(); idx=self.manual_target.currentIndex()
@@ -3484,6 +3856,9 @@ class WorkbenchPage(QWidget):
             self.region_composite.setEnabled(False)
             self.open_text_box.setEnabled(False); self.open_text_box.setVisible(False); self.open_text_box_hint.setVisible(False)
             self.add_manual_effect.setEnabled(False); self.add_manual_effect_candidate.setEnabled(False); self.undo_manual_effect.setEnabled(False)
+            if hasattr(self, "open_ocr_block_editor"):
+                self.open_ocr_block_editor.setEnabled(False); self.reset_ocr_blocks.setEnabled(False)
+                self.ocr_block_status.setText("人工 OCR 文本块：等待可编辑页面")
             return
         idx=max(0,min(s.selected_index,total-1)); pair=s.pairs[idx]
         self.page_rail.set_pages(s.pairs, idx)
@@ -3498,21 +3873,54 @@ class WorkbenchPage(QWidget):
         if open_text_box_available:
             mode_label = "精准蒙版" if current_mode == "mask_replace" else "精准蒙版+OCR"
             self.open_text_box_hint.setText(f"{mode_label}：自动检测漏掉开放式文字时，直接框住文字。只迁移 SOURCE 中文原字形，不 OCR、不整块贴背景。")
-        ocr_editor_enabled=bool(page_root and is_ocr_edit_mode(current_mode))
+        action_state=review_action_availability(page_root)
+        globally_busy=bool(getattr(self.window,"_busy_running",lambda:False)())
+        if not globally_busy:
+            # Recompute from persistent page artifacts instead of trusting a
+            # possibly stale enabled-state snapshot from a previous worker.
+            for name in (
+                "edit_clear_mask","remove_text_only","apply_mask_review","force_transfer_mask",
+                "target_layer_erase","target_layer_restore","reset_clear_mask","reset_force_transfer_mask",
+                "reset_target_layer_erase","reset_target_layer_restore",
+            ):
+                widget=getattr(self,name,None)
+                if widget is not None:
+                    widget.setEnabled(bool(action_state.get(name,False)))
+
+        # v2.3.74: the button and click handler must derive capability from the
+        # exact same persisted project context.  Earlier refresh() used ws.meta
+        # while _open_ocr_block_editor() re-read project.json; after mode changes
+        # those two answers could diverge and the editor repeatedly became stale
+        # disabled/enabled.  The context is now the single authority.
+        ocr_ctx=self._ocr_editor_context()
+        ocr_editor_enabled=bool(ocr_ctx is not None and not globally_busy)
+        ocr_runtime_mode=str(ocr_ctx[2]) if ocr_ctx is not None else current_mode
         if hasattr(self,"open_ocr_block_editor"):
             self.open_ocr_block_editor.setEnabled(ocr_editor_enabled)
-            rows=load_ocr_blocks(page_root,current_mode) if ocr_editor_enabled else []
-            self.reset_ocr_blocks.setEnabled(bool(rows))
-            if ocr_editor_enabled:
-                scope_label="精准蒙版+OCR" if ocr_edit_scope(current_mode)=="mask_ocr" else "OCR重排"
-                if ocr_edit_scope(current_mode)=="mask_ocr":
-                    self.ocr_block_status.setText(
-                        f"{scope_label} · 人工 OCR 文本块 {len(rows)} 个 · 人工框选=强制 OCR；自动 OCR 仅处理完全无精准蒙版覆盖的区域"
-                    )
+            rows=load_ocr_blocks(page_root,ocr_runtime_mode) if ocr_ctx is not None else []
+            self.reset_ocr_blocks.setEnabled(bool(rows) and not globally_busy)
+            if ocr_ctx is not None:
+                scope = ocr_edit_scope(ocr_runtime_mode)
+                scope_label = {
+                    "direct_patch": "Direct · 人工 OCR",
+                    "mask_replace": "精准蒙版 · 人工 OCR",
+                    "aligned_overlay_reveal": "整页对齐挖孔 · 人工 OCR",
+                    "transparent_bubble_reveal": "整页对齐透明 · 人工 OCR",
+                    "hybrid": "精准蒙版+OCR",
+                    "reletter": "OCR重排",
+                }.get(ocr_runtime_mode, "人工 OCR")
+                if scope=="mask_ocr":
+                    if ocr_runtime_mode == "hybrid":
+                        suffix = "人工框选=强制 OCR；自动 OCR 仅处理完全无精准蒙版覆盖的区域"
+                    else:
+                        suffix = "人工框选=局部强制 OCR；不会把整页模式改成 OCR 模式"
+                elif scope=="review_ocr":
+                    suffix = "仅作为人工复核叠加层；Reveal 自动 renderer 与原有图层完全不改"
                 else:
-                    self.ocr_block_status.setText(f"{scope_label} · 人工 OCR 文本块 {len(rows)} 个 · 仅影响当前 OCR 流程")
+                    suffix = "仅影响当前 OCR 重排复核层"
+                self.ocr_block_status.setText(f"{scope_label} · 人工 OCR 文本块 {len(rows)} 个 · {suffix}")
             else:
-                self.ocr_block_status.setText("人工 OCR 文本块仅在“精准蒙版+OCR / OCR重排”可用；其他模式完全隔离。")
+                self.ocr_block_status.setText("当前页尚无可用的人工 OCR 编辑上下文；请先完成该页自动处理。")
         if page_root is not None and hasattr(self, "target_erase_mode"):
             settings_path = page_root / "target_layer_erase_settings.json"
             if settings_path.exists():
@@ -3617,7 +4025,10 @@ class WorkbenchPage(QWidget):
         if queue:
             self.manual_status.setText((f"当前页 {len(queue)} 个 OCR重排 Region 均可人工修改；修改只重绘当前 Region。" if has_auto_reletter else f"发现 {len(queue)} 个待复核区域；默认先给中文候选。可接受、重新编辑或还原日文。"))
         else:
-            self.manual_status.setText("当前页没有可编辑/待复核文字区域")
+            if ocr_editor_enabled:
+                self.manual_status.setText("当前页没有自动待复核文字区域；仍可使用上方“人工 OCR / 编辑文本块…”自行框选并编辑。")
+            else:
+                self.manual_status.setText("当前页没有可编辑/待复核文字区域")
         enabled=bool(queue)
         for widget in [self.manual_target,self.manual_text,self.manual_orientation,self.manual_break_mode,self.manual_font_preset,self.manual_font,self.manual_font_pick,self.manual_font_size,self.manual_columns,self.manual_line_spacing,self.manual_apply,self.candidate_accept,self.candidate_restore,self.manual_reset]: widget.setEnabled(enabled)
         if enabled:
@@ -3656,7 +4067,7 @@ class WorkbenchPage(QWidget):
                 else:
                     suffix = f" · 模式 {mode_name}" + (f" / {strategy_name}" if strategy_name else "")
                     self.view_status.setText((f"已恢复已有结果 · {origin} · 可继续人工补漏{suffix}" if origin else f"已同步到当前页{suffix}"))
-        elif self.current_view in {"result","review","mask","clear_mask","chinese_layer","removed","target_erase"}:
+        elif self.current_view in {"result","review","mask","clear_mask","chinese_layer","removed","target_erase","target_restore"}:
             self.view_status.setText("本页尚无该输出")
         else:
             self.view_status.setText("")
@@ -3765,6 +4176,7 @@ class StudioWindow(QMainWindow):
         self.stop_button.clicked.connect(self.cancel_worker)
         rail_tools.addWidget(self.theme_button,0,0); rail_tools.addWidget(self.log_button,0,1)
         rail_tools.addWidget(self.runtime_log_button,1,0,1,2)
+        rail_tools.addWidget(self.stop_button,2,0,1,2)
         rail.addLayout(rail_tools)
         platform_badge = QLabel(desktop_platform_badge()); platform_badge.setObjectName("railPlatform"); platform_badge.setAlignment(Qt.AlignmentFlag.AlignCenter); rail.addWidget(platform_badge)
         version = QLabel(f"v{VERSION}"); version.setObjectName("railVersion")
@@ -3901,6 +4313,12 @@ class StudioWindow(QMainWindow):
 
         still_running = False
         try:
+            if hasattr(self, "models") and not self.models.shutdown_write_workers():
+                still_running = True
+        except Exception:
+            logger.debug("model write worker shutdown check failed", exc_info=True)
+            still_running = True
+        try:
             if hasattr(self, "settings") and not self.settings.shutdown_background_workers():
                 still_running = True
         except Exception:
@@ -3929,22 +4347,38 @@ class StudioWindow(QMainWindow):
 
     def _processing_busy_state(self):
         return compute_busy_state(
-            pipeline_running=self.worker is not None and self.worker.isRunning(),
-            prepare_running=self._prepare_worker is not None and self._prepare_worker.isRunning(),
-            page_action_running=self._page_action_worker is not None and self._page_action_worker.isRunning(),
+            # Controller-owned worker references are the lifecycle authority.
+            # Treat the tiny created-before-start / finished-before-slot windows
+            # as busy too; otherwise conflicting actions can slip in between
+            # QThread.start() and isRunning() becoming observable.
+            pipeline_running=self.worker is not None,
+            prepare_running=self._prepare_worker is not None,
+            page_action_running=self._page_action_worker is not None,
             settings_updating=hasattr(self, "settings") and self.settings.is_updating,
+            model_write_running=hasattr(self, "models") and self.models.has_write_task_running(),
         )
 
     def _busy_running(self) -> bool:
         return self._processing_busy_state().busy
 
+    def _refresh_global_stop_visibility(self, state=None) -> None:
+        if not hasattr(self, "stop_button") or not hasattr(self, "stack"):
+            return
+        state = state or self._processing_busy_state()
+        # ProjectPage already owns the visible stop button beside its processing
+        # actions. If the user changes workflow pages during a cancellable task,
+        # surface the rail stop control so cancellation never becomes unreachable.
+        visible = bool(state.cancellable and self.stack.currentIndex() != 0)
+        self.stop_button.setVisible(visible)
+        self.stop_button.setEnabled(bool(state.cancellable))
+
     def _set_busy(self, active: bool | None = None):
         state = self._processing_busy_state()
         busy = state.busy if active is None else bool(active)
         cancellable = state.cancellable
-        self.stop_button.setEnabled(cancellable)
+        self._refresh_global_stop_visibility(state)
         if hasattr(self, "project"):
-            self.project.cancel.setEnabled(busy)
+            self.project.cancel.setEnabled(cancellable)
             self.project.run_page.setEnabled(not busy)
             self.project.run_book.setEnabled(not busy)
             if hasattr(self.project, "continue_book"): self.project.continue_book.setEnabled(not busy)
@@ -3954,16 +4388,21 @@ class StudioWindow(QMainWindow):
             self.project.page_type.setEnabled(not busy)
             if hasattr(self.project, "set_processing_busy"):
                 self.project.set_processing_busy(busy)
+        if hasattr(self, "models") and hasattr(self.models, "set_processing_busy"):
+            self.models.set_processing_busy(busy)
         if hasattr(self, "workbench"):
             self.workbench.set_processing_busy(busy)
         if hasattr(self, "export"):
-            self.export.run.setEnabled(not busy)
+            self.export.set_processing_busy(busy)
+        if hasattr(self, "settings") and hasattr(self.settings, "set_processing_busy"):
+            self.settings.set_processing_busy(busy)
 
     def show_page(self, index: int):
         if not 0 <= int(index) < self.stack.count():
             return
         index = int(index)
         self.stack.setCurrentIndex(index)
+        self._refresh_global_stop_visibility()
         for i,b in enumerate(self.pages):
             b.setChecked(i == index)
         self._pending_page_refresh = index
@@ -4086,16 +4525,22 @@ class StudioWindow(QMainWindow):
             self.state.output_dir = str(session.output_root)
             self.state.source_dir = session.source_dir
             self.state.target_dir = session.target_dir
-            self.state.pairs = [row.pair for row in session.pages]
+            full_pairs, unmatched_source, unmatched_target, expanded = expand_restored_session_pairs(session, self.state.config.pairing)
+            self.state.pairs = full_pairs
             self.state.selected_index = 0
             self.state.projects_by_page.clear(); self.state.batch_status.clear()
             self.state.restored_page_roots = {row.page_id: str(row.page_root) for row in session.pages}
             self.state.restored_page_origin = {row.page_id: "命令行/Codex 已有结果" for row in session.pages}
-            self.state.unmatched_source.clear(); self.state.unmatched_target.clear()
+            self.state.unmatched_source = list(unmatched_source); self.state.unmatched_target = list(unmatched_target)
             self.project._table_signature = None; self.project._thumb_signature = None
             self.load_page_marks()
             warning = f" · 跳过/警告 {len(session.warnings)}" if session.warnings else ""
-            self.statusBar().showMessage(f"已恢复 {len(session.pages)} 页已有结果{warning}。可直接继续页面检查或进入替换工作台人工补漏。", 8000)
+            if expanded:
+                pending = max(0, len(self.state.pairs) - len(session.pages))
+                msg = f"已恢复 {len(session.pages)} 页已有结果，并重建整本 {len(self.state.pairs)} 页配对 · 待继续 {pending} 页{warning}"
+            else:
+                msg = f"已恢复 {len(session.pages)} 页已有结果{warning}。可直接继续页面检查或进入替换工作台人工补漏。"
+            self.statusBar().showMessage(msg, 8000)
             # Restoring existing results is not the same as a fresh pairing pass.
             # Keep 项目文件 visible here; the normal auto_pair() completion path
             # owns collapsing it. This avoids hiding inputs while restored pairs /
@@ -4228,9 +4673,9 @@ class StudioWindow(QMainWindow):
         self._pending_pipeline_worker = worker
         self.progress.setRange(0,0); self.progress.setValue(0)
         self.statusBar().showMessage("正在验证/自动准备：" + labels)
-        self._set_busy(True)
         prep = AutoPrepareModelsWorker(worker.config.model_copy(deep=True))
         self._prepare_worker = prep
+        self._set_busy(None)
         prep.progress.connect(self._prepare_worker_progress)
         prep.done.connect(self._prepare_worker_done)
         prep.failed.connect(self._prepare_worker_failed)
@@ -4267,7 +4712,6 @@ class StudioWindow(QMainWindow):
         self._pending_pipeline_worker = None
         short = str(message).split("\n", 1)[0]
         self.progress.setRange(0,100); self.progress.setValue(0)
-        self._set_busy(False)
         if hasattr(self, "models"):
             self.models.model_download_status.setText("自动准备失败：" + short)
             self.models.refresh(force_probe=True)
@@ -4288,6 +4732,11 @@ class StudioWindow(QMainWindow):
         self._worker_is_single_page = worker.pair is not None
         self._worker_page_id = page_id_for_pair(worker.pair) if worker.pair is not None else ""
         self._worker_reapply_review = bool(getattr(worker, "reapply_review_after_process", False))
+        # Whole-book progress emits once or more per page. Build this once instead
+        # of linearly scanning every pair for every progress signal (O(n^2)).
+        self._worker_pair_row_by_name = {}
+        for row, pair in enumerate(self.state.pairs):
+            self._worker_pair_row_by_name.setdefault(Path(pair.target_path).name, row)
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         self.statusBar().showMessage("正在处理…")
@@ -4323,10 +4772,14 @@ class StudioWindow(QMainWindow):
             try:
                 on_done(payload)
             except Exception as exc:
-                QMessageBox.critical(self, failure_title, str(exc))
+                logger.exception("page action completion callback failed label=%s", label)
+                detail = str(exc).strip() or f"{type(exc).__name__}：完成回调失败，但异常没有文本信息。请查看运行日志。"
+                QMessageBox.critical(self, failure_title, detail)
 
         def failed(message: str):
-            QMessageBox.critical(self, failure_title, str(message))
+            detail = str(message).strip() or "后台页面操作失败，但没有返回错误详情。请查看运行日志。"
+            logger.error("page action failed label=%s detail=%s", label, detail)
+            QMessageBox.critical(self, failure_title, detail)
             self.statusBar().showMessage(f"{label}失败", 5000)
 
         def finished():
@@ -4352,6 +4805,9 @@ class StudioWindow(QMainWindow):
             self.statusBar().showMessage("正在安全停止…")
 
     def _find_pair_row_by_target_name(self, name: str) -> int:
+        lookup = getattr(self, "_worker_pair_row_by_name", None)
+        if isinstance(lookup, dict) and name in lookup:
+            return int(lookup[name])
         for idx, pair in enumerate(self.state.pairs):
             if Path(pair.target_path).name == name:
                 return idx
@@ -4387,7 +4843,12 @@ class StudioWindow(QMainWindow):
 
     def _worker_finished(self):
         self.progress.setRange(0,100)
+        self._worker_pair_row_by_name = {}
+        worker = self.worker
+        self.worker = None
         self._set_busy(None)
+        if worker is not None:
+            worker.deleteLater()
 
     def _worker_done(self, project, path):
         self.progress.setRange(0,100); self.progress.setValue(100)
@@ -4397,24 +4858,57 @@ class StudioWindow(QMainWindow):
             self._merge_project_page_mark(project)
         elif hasattr(project, "pages"):
             self.state.last_project = None
-            for page in list(getattr(project, "pages", []) or []):
-                if getattr(page, "page_id", None): self.state.projects_by_page[str(page.page_id)] = page
-                self._merge_project_page_mark(page)
+            # Page project.json files are the authoritative persistent store and
+            # resolve_page_workspace already reloads them. Do not duplicate an
+            # entire processed book in GUI RAM after a long batch finishes.
+            self.state.projects_by_page.clear()
+            compact_updates = list((getattr(project, "meta", {}) or {}).get("page_management_updates") or [])
+            if compact_updates:
+                # Long-book streaming results expose compact mark updates so the
+                # GUI does not defeat disk-backed pages by deserializing every
+                # project.json again immediately after completion.
+                for row in compact_updates:
+                    key = str((row or {}).get("page_id") or "")
+                    pm = (row or {}).get("page_management")
+                    if not key or not pm:
+                        continue
+                    existing = PageMark.from_dict(self.state.page_marks.get(key)) if key in self.state.page_marks else None
+                    incoming = PageMark.from_dict(pm)
+                    if existing is None or existing.origin != "manual" or incoming.origin == "manual":
+                        self.state.page_marks[key] = incoming.to_dict()
+            else:
+                for page in getattr(project, "pages", []) or []:
+                    self._merge_project_page_mark(page)
         else:
             self.state.last_project = None
         self.save_page_marks(); self.project._table_signature = None; self.project._thumb_signature = None
         self.state.last_result_path = path if str(path).lower().endswith(".png") else ""
         meta = dict(getattr(project, "meta", {}) or {}) if hasattr(project, "meta") else {}
         cancelled = bool(meta.get("cancelled"))
-        self.statusBar().showMessage(completion_message(project), 5000)
+        if getattr(self, "_worker_is_single_page", False):
+            self.statusBar().showMessage(
+                page_completion_message(project, reprocessed=bool(getattr(self, "_worker_reapply_review", False))),
+                7000,
+            )
+        else:
+            self.statusBar().showMessage(completion_message(project), 5000)
         if getattr(self, "_worker_is_single_page", False) and not cancelled:
+            # The automatic renderer rewrites the same result pathname in-place
+            # across mode switches. Force the workbench to decode the newly
+            # published pixels even on filesystems where timestamp/size cache
+            # keys can collide for two rapid writes.
+            try:
+                self.workbench.image.clear_cache()
+            except Exception:
+                logger.debug("failed to invalidate workbench image cache after page run", exc_info=True)
             wanted = getattr(self, "_worker_page_id", "")
             if wanted:
                 for i,pair in enumerate(self.state.pairs):
                     if page_id_for_pair(pair) == wanted:
                         self.set_selected_page(i); break
-            if bool(getattr(self, "_worker_reapply_review", False)):
-                self.statusBar().showMessage("重新处理完成 · 已自动重新应用本页人工蒙版/复核结果", 6000)
+            # page_completion_message already includes whether this was a
+            # reprocess; keep its mode/pixel-effect diagnostics visible instead
+            # of overwriting them with a generic review-reapply sentence.
             self.workbench.current_view = "result"
             for b,k in self.workbench.view_buttons: b.setChecked(k == "result")
             self.show_page(2)

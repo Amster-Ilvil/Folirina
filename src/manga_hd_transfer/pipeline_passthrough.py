@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import os
+import cv2
 from pathlib import Path
 
 import numpy as np
 
 from .cache import page_job_fingerprint
 from .config import PipelineConfig
+from .storage_clone import publish_independent_png
 from .io_utils import read_image, save_json, stem_id, write_image
 from .mode_contracts import get_mode_contract, mode_artifact_violations
 from .models import PagePair, PageProject, QAItem, RegistrationResult
@@ -72,8 +74,14 @@ def emit_passthrough_page(
         source_original = page_root / "source_original.png"
         source_authority_original = page_root / "source_authority_original.png"
         target_original = page_root / "target_original.png"
-        write_image(source_original, source)
-        write_image(target_original, target)
+        persistent_level = int(max(0, min(9, getattr(config.export, "persistent_png_compression", 4))))
+        persistent_png = [cv2.IMWRITE_PNG_COMPRESSION, persistent_level]
+        source_method = publish_independent_png(pair.source_path, source_original) if bool(getattr(config.export, "prefer_input_reflink", True)) else None
+        target_method = publish_independent_png(pair.target_path, target_original) if bool(getattr(config.export, "prefer_input_reflink", True)) else None
+        if source_method is None:
+            write_image(source_original, source, params=persistent_png)
+        if target_method is None:
+            write_image(target_original, target, params=persistent_png)
         if not _replace_with_hardlink(source_authority_original, source_original):
             source_authority_original = source_original
         passthrough_artifacts.update({

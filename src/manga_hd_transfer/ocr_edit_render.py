@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-"""Local renderer for manually edited OCR blocks.
+"""Page-local renderer for manually edited OCR blocks.
 
-Only hybrid (product name: 精准蒙版+OCR) and reletter (OCR重排) may call this
-module. It never imports or dispatches Direct / pure Mask / Reveal renderers.
+This shared reviewer renderer may sit on top of Direct, pure Mask, or either
+Reveal result without importing or dispatching any of those automatic renderers.
+Hybrid/Reletter keep their private mode capsules and are dispatched separately.
 """
 
 from pathlib import Path
@@ -119,7 +120,7 @@ def apply_ocr_edit_blocks(page_dir: str | Path, project: dict[str, Any], cfg) ->
     page_dir = Path(page_dir)
     mode = str(as_dict(project.get("meta")).get("transfer_mode") or cfg.transfer.mode or "").strip().lower()
     if not is_ocr_edit_mode(mode):
-        raise ValueError("人工 OCR 文本块只属于 精准蒙版+OCR / OCR重排。")
+        raise ValueError("当前页面不支持人工 OCR 文本块局部编辑。")
     blocks = [row for row in load_ocr_blocks(page_dir, mode) if str(row.get("render_text") or row.get("ocr_text") or "").strip()]
     if not blocks:
         base = page_dir / "final_reviewed.png"

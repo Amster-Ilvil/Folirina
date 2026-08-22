@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "folirina"
-version = "2.3.53"
+version = "2.3.78"
 description = "Folirina is a cross-platform manga replacement and translation-transfer studio with registration, safe inpainting, lettering, and QA."
 readme = "README.md"
 requires-python = ">=3.11"
