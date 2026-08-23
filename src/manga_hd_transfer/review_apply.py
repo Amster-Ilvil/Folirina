@@ -373,12 +373,42 @@ def _apply_mask_replace_review(page_dir: Path, project: dict, cfg: PipelineConfi
     manual_force_present = (page_dir / "manual_force_transfer_mask.png").exists()
     if manual_force_present:
         ensure_manual_baseline(page_dir)
-    automatic_path = _manual_effect_overlay_base_path(page_dir) if (_dict_rows(overrides_probe.get("manual_effect_regions")) or manual_force_present) else page_dir / "final.png"
+    meta = _dict_or_empty(project.get("meta"))
+    project_mode = str(meta.get("transfer_mode", "") or "").strip().lower()
+    # ``final.png`` is a compatibility mirror of the latest reviewed output.
+    # Once manual OCR has been applied, feeding that mirror back into the core
+    # review pass would compound the OCR on every Apply.  The first OCR render
+    # freezes ``final_auto.png`` through ensure_manual_baseline(); subsequent core
+    # rebuilds must therefore start from that immutable pre-OCR automatic base.
+    ocr_active = False
+    ocr_replay_base: Path | None = None
+    try:
+        blocks_mod, _renderer_mod = _ocr_replay_modules(project_mode)
+        if blocks_mod is not None:
+            ocr_active = any(
+                str(row.get("render_text") or row.get("ocr_text") or "").strip()
+                for row in blocks_mod.load_ocr_blocks(page_dir, project_mode)
+            )
+            if ocr_active:
+                probe = Path(blocks_mod.ocr_edit_dir(page_dir, project_mode)) / "base.png"
+                if probe.exists():
+                    ocr_replay_base = probe
+    except Exception:
+        ocr_active = False
+        ocr_replay_base = None
+    if ocr_replay_base is not None:
+        # The OCR scope base is the exact pre-OCR core result from the previous
+        # replay.  Use it instead of final.png (which mirrors the OCR-reviewed
+        # output) so repeated Apply is pixel-idempotent without broad bbox resets.
+        automatic_path = ocr_replay_base
+    elif _dict_rows(overrides_probe.get("manual_effect_regions")) or manual_force_present:
+        automatic_path = _manual_effect_overlay_base_path(page_dir)
+    else:
+        automatic_path = page_dir / "final.png"
     automatic = read_image(automatic_path) if automatic_path.exists() else None
     if automatic is not None and automatic.shape != target.shape:
         automatic = None
     review_change_mask = np.zeros(target.shape[:2], np.uint8)
-    meta = _dict_or_empty(project.get("meta"))
     direct_meta = _route_meta(meta, "direct_patch")
     direct_used = bool(direct_meta.get("used"))
     route = "direct_patch" if direct_used else "mask_replace"
@@ -875,7 +905,10 @@ def _apply_review_page_core(page_dir: str | Path, config: PipelineConfig | None 
         or str(row.get("owner_transfer_mode", "") or "").strip().lower() == project_mode
     ]
     manual_force_present = (page_dir / "manual_force_transfer_mask.png").exists()
-    if manual_effect_rows or manual_force_present:
+    ocr_active_for_page = _has_active_manual_ocr(page_dir, project_mode)
+    # Never freeze final.png as a non-OCR manual baseline after manual OCR is
+    # already visible.  OCR owns its own exact pre-OCR base.
+    if (manual_effect_rows or manual_force_present) and not ocr_active_for_page:
         _ensure_manual_effect_stable_base(page_dir)
     # Reletter has its own stable Region editor. It must never be hijacked by a
     # leftover standalone manual-force mask before the reletter dispatcher runs.
@@ -891,7 +924,7 @@ def _apply_review_page_core(page_dir: str | Path, config: PipelineConfig | None 
     # Manual omission repair is an additive overlay.  When it is the only
     # visual review operation, never rebuild the whole page from a single
     # Direct/Mask layer; use the already-good automatic final as the base.
-    if manual_effect_rows and (
+    if manual_effect_rows and not ocr_active_for_page and (
         _manual_effect_can_overlay_final(page_dir, overrides)
         or bool(meta.get("passthrough"))
         or not ((page_dir / "direct_patch_layer.png").exists() or (page_dir / "mask_transfer_layer.png").exists() or (page_dir / "hybrid_transfer_layer.png").exists())
@@ -905,6 +938,11 @@ def _apply_review_page_core(page_dir: str | Path, config: PipelineConfig | None 
     unit_level_override = bool(dict(overrides.get("text_overrides", {}) or {})) or bool(dict(overrides.get("match_overrides", {}) or {})) or bool(list(overrides.get("accepted_source_units", []) or [])) or any(
         action in {"force_match", "skip_unit"} for action in unit_actions_probe.values()
     )
+    if project_mode in {"hybrid", "aligned_overlay_reveal", "transparent_bubble_reveal"} and ocr_active_for_page and not unit_level_override:
+        # These modes do not use the generic unit-reletter compositor as their
+        # automatic pixel authority.  With OCR active, preserve the exact pre-OCR
+        # mode result and apply only additive review tools before replaying OCR.
+        return _commit_reviewed_result(page_dir, _apply_ocr_base_preserving_review(page_dir, project, overrides, cfg))
     if meta.get("transfer_mode") in {"mask_replace", "direct_patch", "auto"} and not unit_level_override:
         return _commit_reviewed_result(page_dir, _apply_mask_replace_review(page_dir, project, cfg))
 
@@ -1179,6 +1217,319 @@ def clear_ocr_review_blocks(page_dir: str | Path, config: PipelineConfig | None 
 
 
 @guarded_page_write("review_apply")
+
+
+def _has_active_manual_ocr(page_dir: Path, mode: str) -> bool:
+    try:
+        blocks_mod, renderer_mod = _ocr_replay_modules(mode)
+        if blocks_mod is None or renderer_mod is None:
+            return False
+        return any(str(row.get("render_text") or row.get("ocr_text") or "").strip() for row in blocks_mod.load_ocr_blocks(page_dir, mode))
+    except Exception:
+        return False
+
+
+def _apply_ocr_base_preserving_review(page_dir: Path, project: dict, overrides: dict, cfg: PipelineConfig) -> Path:
+    """Apply non-OCR review tools over the exact pre-OCR mode result.
+
+    Hybrid and Reveal automatic outputs cannot be reconstructed by the generic
+    unit-level review compositor.  When manual OCR already exists, use the OCR
+    scope's frozen no-OCR base as the page authority, apply additive review tools,
+    then let :func:`apply_review_page` replay OCR afterwards.
+    """
+    mode = str(_dict_or_empty(project.get("meta")).get("transfer_mode", "") or cfg.transfer.mode or "").strip().lower()
+    blocks_mod, _renderer_mod = _ocr_replay_modules(mode)
+    if blocks_mod is None:
+        raise ValueError(f"No OCR scope for mode: {mode}")
+    base_path, _base_state = _ensure_manual_ocr_local_base(page_dir, mode, blocks_mod)
+    target = read_image(page_dir / "target_original.png")
+    rendered = read_image(base_path)
+    if rendered.shape != target.shape:
+        raise ValueError("pre-OCR review base size mismatch")
+
+    rendered, manual_masks, manual_reletters = _apply_manual_reletters(rendered, target, page_dir, project, overrides, cfg)
+    rendered, effect_layer, effect_clear_mask, effect_applied = _apply_manual_effect_regions(rendered, target, page_dir, project, overrides, cfg)
+    rendered, force_layer, force_clear_mask, force_diag = _apply_manual_force_transfer_mask(page_dir, rendered, target, project, cfg)
+    protect = list(manual_masks)
+    if effect_layer is not None and effect_layer.ndim == 3 and effect_layer.shape[2] >= 4:
+        protect.append(effect_layer[:, :, 3])
+    if force_layer is not None and force_layer.ndim == 3 and force_layer.shape[2] >= 4:
+        protect.append(force_layer[:, :, 3])
+    rendered, erase_diag = _apply_target_layer_erase_to_rendered(
+        page_dir, rendered, target, cfg, refresh_base=True, extra_protect_masks=protect
+    )
+    rendered, restore_diag = _apply_target_layer_restore_to_rendered(
+        page_dir, rendered, target, refresh_base=True
+    )
+    final_path = page_dir / "final_reviewed.png"
+    write_image(final_path, rendered)
+    write_image(page_dir / "review_base.png", read_image(base_path))
+    save_json(page_dir / "review_applied.json", {
+        "mode": "ocr_base_preserving_review",
+        "status": overrides.get("status", "reviewed"),
+        "manual_reletter": manual_reletters,
+        "manual_effect_applied": effect_applied,
+        "manual_effect_clear_pixels": int(cv2.countNonZero(effect_clear_mask)),
+        "manual_force_transfer": force_diag,
+        "manual_force_clear_pixels": int(cv2.countNonZero(force_clear_mask)),
+        "target_layer_erase": erase_diag,
+        "target_layer_restore": restore_diag,
+        "pre_ocr_base": str(base_path),
+        "final": str(final_path),
+    })
+    return final_path
+
+def _hybrid_pre_ocr_base_from_mode_artifacts(page_dir: Path) -> tuple[np.ndarray | None, dict[str, object]]:
+    """Recover the automatic Hybrid composite without consuming a reviewed mirror.
+
+    v2.3.82 could inject a generic review result into ``ocr_edit/mask_ocr/base.png``.
+    On Hybrid pages that generic review result may contain only TARGET pixels, so an
+    existing broken base must not be reused.  Hybrid's own transfer/text capsules are
+    sufficient to reconstruct the pre-OCR automatic raster without calling another
+    mode renderer.
+    """
+    target_path = page_dir / "target_original.png"
+    transfer_path = page_dir / "hybrid_transfer_layer.png"
+    if not target_path.exists() or not transfer_path.exists():
+        return None, {"recovered": False, "reason": "hybrid_artifacts_missing"}
+    target = read_image(target_path)
+    bgra = cv2.imread(str(transfer_path), cv2.IMREAD_UNCHANGED)
+    if bgra is None or bgra.ndim != 3 or bgra.shape[2] != 4 or bgra.shape[:2] != target.shape[:2]:
+        return None, {"recovered": False, "reason": "hybrid_transfer_layer_invalid"}
+    out = target.copy()
+    a = (bgra[:, :, 3].astype(np.float32) / 255.0)[..., None]
+    out = np.clip(bgra[:, :, :3].astype(np.float32) * a + out.astype(np.float32) * (1.0 - a), 0, 255).astype(np.uint8)
+    text_path = page_dir / "hybrid_text_layer.png"
+    text_used = False
+    if text_path.exists():
+        text = cv2.imread(str(text_path), cv2.IMREAD_UNCHANGED)
+        if text is not None and text.ndim == 3 and text.shape[2] == 4 and text.shape[:2] == target.shape[:2]:
+            ta = (text[:, :, 3].astype(np.float32) / 255.0)[..., None]
+            out = np.clip(text[:, :, :3].astype(np.float32) * ta + out.astype(np.float32) * (1.0 - ta), 0, 255).astype(np.uint8)
+            text_used = bool(np.any(text[:, :, 3] > 0))
+    return out, {
+        "recovered": True,
+        "reason": "hybrid_mode_artifacts_recovery",
+        "transfer_layer": str(transfer_path),
+        "text_layer": str(text_path) if text_path.exists() else "",
+        "text_layer_used": text_used,
+    }
+
+
+def _reveal_pre_ocr_base_from_mode_artifacts(page_dir: Path) -> tuple[np.ndarray | None, dict[str, object]]:
+    """Recover the flattened automatic Reveal result from its durable layers.
+
+    Both Reveal modes persist the Japanese upper RGBA layer and the aligned
+    Chinese lower RGB layer.  Compositing those artifacts reconstructs the
+    automatic visible result without dispatching either Reveal renderer.
+    """
+    jp_path = page_dir / "jp_layer_rgba.png"
+    cn_path = page_dir / "cn_layer_rgb.png"
+    if not jp_path.exists() or not cn_path.exists():
+        return None, {"recovered": False, "reason": "reveal_artifacts_missing"}
+    top = cv2.imread(str(jp_path), cv2.IMREAD_UNCHANGED)
+    bottom = read_image(cn_path)
+    if top is None or top.ndim != 3 or top.shape[2] != 4 or top.shape[:2] != bottom.shape[:2]:
+        return None, {"recovered": False, "reason": "reveal_layer_invalid"}
+    alpha = (top[:, :, 3].astype(np.float32) / 255.0)[..., None]
+    out = np.clip(top[:, :, :3].astype(np.float32) * alpha + bottom.astype(np.float32) * (1.0 - alpha), 0, 255).astype(np.uint8)
+    return out, {
+        "recovered": True,
+        "reason": "reveal_mode_artifacts_recovery",
+        "jp_layer": str(jp_path),
+        "cn_layer": str(cn_path),
+    }
+
+
+def _ensure_manual_ocr_local_base(page_dir: Path, mode: str, blocks_mod) -> tuple[Path, dict[str, object]]:
+    """Return the immutable pre-OCR visible raster for a manual OCR editing session.
+
+    The OCR editor is a local overlay.  Its base must therefore be captured *before*
+    any generic review compositor runs.  Existing trusted bases are reused so editing
+    or deleting one OCR block replays all remaining blocks from the same no-OCR page.
+    """
+    scope_dir = Path(blocks_mod.ocr_edit_dir(page_dir, mode))
+    scope_dir.mkdir(parents=True, exist_ok=True)
+    base_path = scope_dir / "base.png"
+    state_path = scope_dir / "base_state.json"
+    state: dict[str, object] = {}
+    if state_path.exists():
+        try:
+            raw = load_json(state_path)
+            state = raw if isinstance(raw, dict) else {}
+        except Exception:
+            state = {}
+    trusted = (
+        base_path.exists()
+        and str(state.get("schema") or "") == "folirina.ocr_edit.base.v2"
+        and str(state.get("mode") or mode).strip().lower() == mode
+        and str(state.get("authority") or "") == "pre_ocr_visible_result"
+    )
+    if trusted:
+        return base_path, state
+
+    # Migration guard for the v2.3.82 whole-page replay failure.  Hybrid and
+    # both Reveal modes could receive a generic compositor raster that did not
+    # contain their mode-owned automatic result.  Recover only from each mode's
+    # own durable artifacts; never call another renderer during migration.
+    legacy_injected = base_path.exists() and str(state.get("reason") or "") == "review_replay_base_injection"
+    if legacy_injected and mode in {"hybrid", "aligned_overlay_reveal", "transparent_bubble_reveal"}:
+        if mode == "hybrid":
+            recovered, diag = _hybrid_pre_ocr_base_from_mode_artifacts(page_dir)
+            migration_reason = "v2382_hybrid_base_migration"
+        else:
+            recovered, diag = _reveal_pre_ocr_base_from_mode_artifacts(page_dir)
+            migration_reason = "v2382_reveal_base_migration"
+        if recovered is not None:
+            write_image(base_path, recovered)
+            state = {
+                "schema": "folirina.ocr_edit.base.v2", "scope": scope_dir.name, "mode": mode,
+                **diag, "authority": "pre_ocr_visible_result", "reason": migration_reason,
+            }
+            save_json(state_path, state)
+            return base_path, state
+        raise RuntimeError(
+            f"Cannot safely recover the v2.3.82 manual OCR base for {mode}; "
+            "mode-owned recovery artifacts are missing or invalid."
+        )
+
+    # Older Direct/Mask/Reletter bases were produced by mode-aware review paths.
+    # Promote those exact no-OCR rasters rather than sampling a visible image that
+    # may already contain manual OCR.
+    if base_path.exists() and str(state.get("schema") or "") == "folirina.ocr_edit.base.v2":
+        state = {**state, "authority": "pre_ocr_visible_result", "promoted_by": "v2.3.83"}
+        save_json(state_path, state)
+        return base_path, state
+
+    # First manual OCR on a fresh page: final.png is the current published visible
+    # result and already includes all automatic and non-OCR review effects.
+    source = page_dir / "final.png"
+    if not source.exists():
+        source = page_dir / "final_reviewed.png"
+    if not source.exists():
+        raise FileNotFoundError(f"No visible pre-OCR result in {page_dir}")
+    base = read_image(source)
+    write_image(base_path, base)
+    state = {
+        "schema": "folirina.ocr_edit.base.v2", "scope": scope_dir.name, "mode": mode,
+        "authority": "pre_ocr_visible_result", "reason": "manual_ocr_local_base", "source": str(source),
+    }
+    save_json(state_path, state)
+    return base_path, state
+
+
+def _manual_ocr_allowed_change_mask(shape: tuple[int, int], rows: list[dict], render_state: dict) -> np.ndarray:
+    """Build a conservative page-local fence for manual OCR pixel publication."""
+    allowed = np.zeros(shape, np.uint8)
+    for row in rows:
+        box = list(row.get("target_bbox") or [])
+        if len(box) == 4:
+            x0, y0, x1, y1 = map(int, box)
+            x0=max(0,x0); y0=max(0,y0); x1=min(shape[1],x1); y1=min(shape[0],y1)
+            if x1>x0 and y1>y0: allowed[y0:y1, x0:x1] = 255
+        # A manual layout frame is presentation authority only (never TARGET
+        # erase authority) but the locality fence must allow its text pixels.
+        layout_box = list(row.get("layout_bbox") or []) if str(row.get("layout_box_mode") or "auto").lower()=="manual" else []
+        if len(layout_box)==4:
+            lx0,ly0,lx1,ly1=map(int,layout_box)
+            lx0=max(0,lx0); ly0=max(0,ly0); lx1=min(shape[1],lx1); ly1=min(shape[0],ly1)
+            if lx1>lx0 and ly1>ly0: allowed[ly0:ly1,lx0:lx1]=255
+    for item in list(render_state.get("applied") or []):
+        if not isinstance(item, dict):
+            continue
+        layout = item.get("layout") if isinstance(item.get("layout"), dict) else {}
+        box = list(layout.get("container_bbox") or [])
+        if len(box) == 4:
+            x0, y0, x1, y1 = map(int, box)
+            x0=max(0,x0); y0=max(0,y0); x1=min(shape[1],x1); y1=min(shape[0],y1)
+            if x1>x0 and y1>y0: allowed[y0:y1, x0:x1] = 255
+    return allowed
+
+
+@guarded_page_write("manual_ocr_local_apply")
+def apply_manual_ocr_review(page_dir: str | Path, config: PipelineConfig | None = None) -> Path:
+    """Apply manual OCR as a strictly local overlay on the current reviewed page.
+
+    Unlike :func:`apply_review_page`, this entry point never invokes the generic
+    whole-page review compositor.  The page outside the OCR selection/container is
+    restored bit-for-bit from the frozen pre-OCR visible result before publication.
+    """
+    page_dir = Path(page_dir)
+    cfg = config or PipelineConfig()
+    project = normalize_project(load_json(page_dir / "project.json"))
+    mode = str(_dict_or_empty(project.get("meta")).get("transfer_mode", "") or cfg.transfer.mode or "").strip().lower()
+    blocks_mod, renderer_mod = _ocr_replay_modules(mode)
+    if blocks_mod is None or renderer_mod is None:
+        raise ValueError(f"Current mode does not support manual OCR: {mode}")
+    rows = blocks_mod.load_ocr_blocks(page_dir, mode)
+    active_rows = [row for row in rows if str(row.get("render_text") or row.get("ocr_text") or "").strip()]
+    # Persist canonical active rows before rendering. This self-heals legacy
+    # projects that accumulated overlapping OCR blocks, so deleting/clearing a
+    # current block can never resurrect an older hidden duplicate.
+    if active_rows:
+        blocks_mod.save_ocr_blocks(page_dir, mode, rows)
+    if not active_rows:
+        current = page_dir / "final_reviewed.png"
+        return current if current.exists() else page_dir / "final.png"
+
+    base_path, base_state = _ensure_manual_ocr_local_base(page_dir, mode, blocks_mod)
+    base = read_image(base_path)
+    result_path = Path(renderer_mod.apply_ocr_edit_blocks(page_dir, project, cfg))
+    rendered = read_image(result_path)
+    if rendered.shape != base.shape:
+        raise ValueError("Manual OCR result shape differs from pre-OCR base")
+    scope_dir = Path(blocks_mod.ocr_edit_dir(page_dir, mode))
+    state_path = scope_dir / "render_state.json"
+    render_state: dict = {}
+    if state_path.exists():
+        try:
+            raw = load_json(state_path); render_state = raw if isinstance(raw, dict) else {}
+        except Exception:
+            render_state = {}
+    suppressed_ids = {
+        str(item.get("id") or "")
+        for item in list(render_state.get("suppressed_render_conflicts") or [])
+        if isinstance(item, dict) and str(item.get("id") or "")
+    }
+    if suppressed_ids:
+        rows = [row for row in rows if str(row.get("id") or "") not in suppressed_ids]
+        active_rows = [row for row in rows if str(row.get("render_text") or row.get("ocr_text") or "").strip()]
+        blocks_mod.save_ocr_blocks(page_dir, mode, rows)
+    allowed = _manual_ocr_allowed_change_mask(base.shape[:2], active_rows, render_state)
+    if cv2.countNonZero(allowed) == 0:
+        raise RuntimeError("Manual OCR produced no valid local influence region")
+    fenced = base.copy()
+    fenced[allowed > 0] = rendered[allowed > 0]
+    outside_changed = int(np.count_nonzero(np.any(fenced[allowed == 0] != base[allowed == 0], axis=1))) if np.any(allowed == 0) else 0
+    if outside_changed:
+        raise RuntimeError(f"Manual OCR locality violation: {outside_changed} pixels outside OCR region")
+    final_reviewed = page_dir / "final_reviewed.png"
+    write_image(final_reviewed, fenced)
+    write_image(scope_dir / "final.png", fenced)
+    render_state.update({
+        "locality_contract": "ocr_region_only_v1",
+        "allowed_pixels": int(cv2.countNonZero(allowed)),
+        "outside_changed_pixels": 0,
+        "base_authority": str(base_state.get("authority") or ""),
+        "base_reason": str(base_state.get("reason") or ""),
+    })
+    save_json(state_path, render_state)
+
+    # This entry point is deliberately OCR-only.  Non-OCR finishing brushes are
+    # applied by their own review actions and are already part of the current
+    # no-OCR base.  Re-running them here would allow an OCR button press to modify
+    # pixels outside the OCR influence region.
+    replay_diag: dict[str, object] = {
+        "schema": "folirina.review_replay.v1", "mode": mode,
+        "core": str(base_path), "ocr_applied": True, "ocr_block_count": len(active_rows),
+        "ocr_apply_policy": "strict_local_pre_ocr_base", "outside_changed_pixels": 0,
+        "target_erase_replayed": False, "target_restore_replayed": False,
+    }
+    write_image(final_reviewed, fenced)
+    write_image(scope_dir / "final.png", fenced)
+    save_json(page_dir / "review_replay.json", replay_diag)
+    return commit_reviewed_result(page_dir, final_reviewed)
+
 def apply_review_page(page_dir: str | Path, config: PipelineConfig | None = None) -> Path:
     """Apply page review and deterministically replay durable downstream layers.
 
@@ -1209,25 +1560,67 @@ def apply_review_page(page_dir: str | Path, config: PipelineConfig | None = None
     blocks_mod, renderer_mod = _ocr_replay_modules(mode)
     rows = blocks_mod.load_ocr_blocks(page_dir, mode) if blocks_mod is not None else []
     active_rows = [row for row in rows if str(row.get("render_text") or row.get("ocr_text") or "").strip()]
+    if blocks_mod is not None and active_rows:
+        blocks_mod.save_ocr_blocks(page_dir, mode, rows)
     if renderer_mod is not None and active_rows:
-        # Inject the freshly rebuilt review result through the existing OCR base
-        # artifact contract instead of changing any mode-owned renderer API.
-        # Hybrid/Reletter private capsules therefore remain byte-identical.
+        # The core result is the newest complete page *without OCR*.  Persist it
+        # as the authoritative OCR base so later OCR edits/deletes/clears retain
+        # every non-OCR review action performed after OCR was first created.
         scope_dir = Path(blocks_mod.ocr_edit_dir(page_dir, mode))
         scope_dir.mkdir(parents=True, exist_ok=True)
         replay_base = read_image(current)
-        write_image(scope_dir / "base.png", replay_base)
-        save_json(scope_dir / "base_state.json", {
+        base_path = scope_dir / "base.png"
+        write_image(base_path, replay_base)
+        base_state = {
             "schema": "folirina.ocr_edit.base.v2",
             "scope": scope_dir.name,
             "mode": mode,
+            "authority": "pre_ocr_visible_result",
             "rebuilt": True,
-            "reason": "review_replay_base_injection",
+            "reason": "full_review_no_ocr_base_refresh",
             "source": str(current),
+        }
+        save_json(scope_dir / "base_state.json", base_state)
+        raw_ocr_path = Path(renderer_mod.apply_ocr_edit_blocks(page_dir, project, cfg))
+        raw_ocr = read_image(raw_ocr_path)
+        state_path = scope_dir / "render_state.json"
+        try:
+            raw_state = load_json(state_path) if state_path.exists() else {}
+            render_state = raw_state if isinstance(raw_state, dict) else {}
+        except Exception:
+            render_state = {}
+        suppressed_ids = {
+            str(item.get("id") or "")
+            for item in list(render_state.get("suppressed_render_conflicts") or [])
+            if isinstance(item, dict) and str(item.get("id") or "")
+        }
+        if suppressed_ids:
+            rows = [row for row in rows if str(row.get("id") or "") not in suppressed_ids]
+            active_rows = [row for row in rows if str(row.get("render_text") or row.get("ocr_text") or "").strip()]
+            blocks_mod.save_ocr_blocks(page_dir, mode, rows)
+        allowed = _manual_ocr_allowed_change_mask(replay_base.shape[:2], active_rows, render_state)
+        if cv2.countNonZero(allowed) == 0:
+            raise RuntimeError("Manual OCR replay produced no valid local influence region")
+        fenced = replay_base.copy()
+        fenced[allowed > 0] = raw_ocr[allowed > 0]
+        outside_changed = int(np.count_nonzero(np.any(fenced[allowed == 0] != replay_base[allowed == 0], axis=1))) if np.any(allowed == 0) else 0
+        if outside_changed:
+            raise RuntimeError(f"Manual OCR replay locality violation: {outside_changed} pixels outside OCR region")
+        current = page_dir / "final_reviewed.png"
+        write_image(current, fenced)
+        write_image(scope_dir / "final.png", fenced)
+        render_state.update({
+            "locality_contract": "ocr_region_only_v1",
+            "allowed_pixels": int(cv2.countNonZero(allowed)),
+            "outside_changed_pixels": 0,
+            "base_authority": "pre_ocr_visible_result",
+            "base_reason": "full_review_no_ocr_base_refresh",
         })
-        current = Path(renderer_mod.apply_ocr_edit_blocks(page_dir, project, cfg))
+        save_json(state_path, render_state)
         replay_diag["ocr_applied"] = True
         replay_diag["ocr_block_count"] = len(active_rows)
+        replay_diag["ocr_apply_policy"] = "full_review_then_strict_local_ocr"
+        replay_diag["outside_changed_pixels"] = 0
 
         # OCR is intentionally before TARGET finishing brushes. Reapply these
         # masks over the fresh OCR result so residual-JP cleanup and exact TARGET

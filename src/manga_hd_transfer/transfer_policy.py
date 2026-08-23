@@ -39,6 +39,10 @@ def _replace_translation_regions(source_units, target_units, matches, overlap_th
         match = match_by_source.get(source.id)
         target = target_by_id.get(match.target_unit_id) if match is not None else None
         overlap = _reason_metric(match, "overlap", 0.0) if match is not None else 0.0
+        paired_identity = bool(
+            match is not None
+            and any(str(reason or "").startswith("route=paired_id_binding") for reason in (getattr(match, "reasons", None) or []))
+        )
         rows.append({
             "source_unit_id": source.id,
             "target_unit_id": target.id if target is not None else None,
@@ -46,7 +50,11 @@ def _replace_translation_regions(source_units, target_units, matches, overlap_th
             "source_bbox": [float(x) for x in source.bbox],
             "target_bbox": [float(x) for x in target.bbox] if target is not None else None,
             "overlap": float(overlap),
-            "matched": bool(match is not None and target is not None and overlap >= float(overlap_threshold)),
+            # Deterministic paired-ID binding is already an identity proof; it
+            # must not be mislabeled unmatched merely because the synthetic
+            # target-driven OCR region reports geometric overlap=0.
+            "matched": bool(match is not None and target is not None and (paired_identity or overlap >= float(overlap_threshold))),
+            "match_route": "paired_id_binding" if paired_identity else "geometric",
             "relation": str(match.relation) if match is not None else "unmatched",
             "confidence": float(match.confidence) if match is not None else 0.0,
             "cost": float(match.cost) if match is not None else 1.0,

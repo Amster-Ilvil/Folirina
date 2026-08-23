@@ -42,8 +42,6 @@ COMMON_DERIVED_ARTIFACTS = (
     "editable.ora", "editable.psd", "inpainted.png",
     "text_layer.png", "text_layer_reviewed.png", "chinese_transfer_layer.png",
     "review_overrides.template.json", "removed_text_preview.png", "remove_text_stage.json",
-    "aligned_overlay_reveal_diff_mask.png", "aligned_overlay_reveal_judgment.png",
-    "aligned_overlay_reveal_validation.json",
 )
 
 # Generated evidence bundles that belong to the last automatic pass.  Manual

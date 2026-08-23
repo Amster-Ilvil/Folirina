@@ -11,6 +11,7 @@ from typing import Iterable, Any
 from .io_utils import load_json, save_json, write_image
 from .schema_compat import as_dict, normalize_project
 from .review_artifacts import STATIC_REVIEW_INPUTS, dynamic_review_artifact_names
+from .mode_contracts import MODE_DERIVED_ARTIFACTS
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,7 +46,9 @@ _RUN_SNAPSHOT_FILES = (
     "transparent_bubble_reveal.json", "final_rgba.png", "jp_layer_rgba.png", "cn_layer_rgb.png",
     "target_layer_erase_base.png", "target_layer_erase_effective_mask.png", "target_layer_erase_preview.png", "target_layer_erase.json",
     "target_layer_restore_base.png", "target_layer_restore_effective_mask.png", "target_layer_restore_preview.png", "target_layer_restore.json",
-) + STATIC_REVIEW_INPUTS
+) + STATIC_REVIEW_INPUTS + tuple(
+    name for names in MODE_DERIVED_ARTIFACTS.values() for name in names
+)
 
 # These paths are written in-place by the frozen Aligned Reveal compatibility
 # renderer. They must be real copies in a rollback snapshot; a hard link would

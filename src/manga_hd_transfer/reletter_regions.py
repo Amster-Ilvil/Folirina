@@ -52,33 +52,104 @@ def _component_rows(image: np.ndarray, bubble: BubbleInstance) -> tuple[list[dic
     safe_area = float(max(1, cv2.countNonZero(protected)))
     bx0, by0, bx1, by1 = bubble.bbox
     bw, bh = max(1.0, bx1 - bx0), max(1.0, by1 - by0)
-    rows: list[dict] = []
-    kept = np.zeros_like(raw)
+    # Distance to the trusted bubble edge is a much stronger discriminator than
+    # raw component size. Manga balloon contours are dark connected components
+    # too; on small balloons they can outnumber the actual glyph components and
+    # poison median-size heuristics. Keep edge distance per component so the
+    # target text detector can reason about *interior glyphs* instead of borders.
+    distance = cv2.distanceTransform((protected > 0).astype(np.uint8), cv2.DIST_L2, 5)
+    raw_rows: list[dict] = []
     for idx in range(1, count):
         x, y, cw, ch, area = [int(v) for v in stats[idx]]
         if area < 2:
             continue
         if area > safe_area * 0.05 or cw > bw * 0.45 or ch > bh * 0.45:
             continue
-        rows.append({
+        component_pixels = labels == idx
+        distances = distance[component_pixels]
+        boundary_distance = float(np.median(distances)) if distances.size else 0.0
+        raw_rows.append({
             "label": idx, "x": x, "y": y, "w": cw, "h": ch, "area": area,
             "cx": float(centroids[idx][0]), "cy": float(centroids[idx][1]),
+            "fill_ratio": float(area / max(1, cw * ch)),
+            "boundary_distance_px": boundary_distance,
+            "_mask": (labels[y:y + ch, x:x + cw] == idx).astype(np.uint8) * 255,
         })
-        kept[labels == idx] = 255
+
+    boundary_margin = float(np.clip(min(bw, bh) * 0.035, 2.0, 6.0))
+
+    def glyph_like(row: dict, *, satellite: bool = False) -> bool:
+        cw = int(row["w"]); ch = int(row["h"]); area = int(row["area"])
+        min_dim = min(cw, ch); max_dim = max(cw, ch)
+        aspect = max_dim / max(1.0, float(min_dim))
+        min_boundary = boundary_margin * (0.58 if satellite else 1.0)
+        return bool(
+            min_dim >= (2 if satellite else 3)
+            and area >= (3 if satellite else 5)
+            and float(row.get("fill_ratio", 0.0)) >= (0.055 if satellite else 0.08)
+            and aspect <= (6.5 if satellite else 5.5)
+            and float(row.get("boundary_distance_px", 0.0)) >= max(1.35, min_boundary)
+        )
+
+    core = [row for row in raw_rows if glyph_like(row)]
+    # Punctuation and detached kana strokes can be smaller than the core glyphs.
+    # Admit them only when they are spatially close to a proven interior glyph;
+    # this retains dakuten / punctuation without re-admitting long balloon edges.
+    selected = list(core)
+    if core:
+        med_extent = float(np.median([max(int(r["w"]), int(r["h"])) for r in core]))
+        satellite_radius = float(np.clip(med_extent * 1.85, 12.0, 34.0))
+        core_xy = np.asarray([[float(r["cx"]), float(r["cy"])] for r in core], dtype=np.float32)
+        selected_labels = {int(r["label"]) for r in selected}
+        for row in raw_rows:
+            if int(row["label"]) in selected_labels or not glyph_like(row, satellite=True):
+                continue
+            pt = np.asarray([float(row["cx"]), float(row["cy"])], dtype=np.float32)
+            if float(np.min(np.linalg.norm(core_xy - pt, axis=1))) <= satellite_radius:
+                selected.append(row)
+                selected_labels.add(int(row["label"]))
+
+    # Degenerate tiny balloons (e.g. 「チッ」) can contain only two or three
+    # meaningful connected glyph pieces. If strict core selection yielded too
+    # little, retain the strongest interior compact pieces rather than declaring
+    # the whole bubble text-free.
+    if len(selected) < 2:
+        fallback = [
+            row for row in raw_rows
+            if min(int(row["w"]), int(row["h"])) >= 2
+            and int(row["area"]) >= 4
+            and float(row.get("boundary_distance_px", 0.0)) >= max(1.5, boundary_margin * 0.55)
+            and max(int(row["w"]), int(row["h"])) / max(1.0, float(min(int(row["w"]), int(row["h"])))) <= 6.0
+        ]
+        fallback.sort(key=lambda r: (float(r.get("boundary_distance_px", 0.0)), int(r["area"])), reverse=True)
+        selected = fallback[: max(2, min(8, len(fallback)))]
+
+    selected.sort(key=lambda r: (float(r["cy"]), float(r["cx"])))
+    kept = np.zeros_like(raw)
+    for row in selected:
+        x, y, cw, ch = int(row["x"]), int(row["y"]), int(row["w"]), int(row["h"])
+        kept[y:y + ch, x:x + cw] = cv2.bitwise_or(
+            kept[y:y + ch, x:x + cw], row["_mask"]
+        )
     diag = {
         "threshold": threshold,
-        "component_count": len(rows),
+        "component_count": len(selected),
+        "raw_component_count": len(raw_rows),
+        "selected_component_count": len(selected),
+        "core_component_count": len(core),
+        "boundary_margin_px": round(boundary_margin, 3),
         "safe_pixels": int(safe_area),
         "white_ratio": float(np.mean(vals > 220)),
         "gray_std": float(np.std(vals)),
     }
-    if rows:
+    if selected:
         diag.update({
-            "median_component_w": float(np.median([r["w"] for r in rows])),
-            "median_component_h": float(np.median([r["h"] for r in rows])),
-            "median_component_area": float(np.median([r["area"] for r in rows])),
+            "median_component_w": float(np.median([r["w"] for r in selected])),
+            "median_component_h": float(np.median([r["h"] for r in selected])),
+            "median_component_area": float(np.median([r["area"] for r in selected])),
+            "median_boundary_distance_px": float(np.median([r["boundary_distance_px"] for r in selected])),
         })
-    return rows, kept, diag
+    return selected, kept, diag
 
 
 def _kmeans_diagonal_split(rows: list[dict]) -> tuple[list[list[int]], dict]:
@@ -109,15 +180,31 @@ def _kmeans_diagonal_split(rows: list[dict]) -> tuple[list[list[int]], dict]:
     improvement = float(1.0 - float(compactness) / sse1)
     dx = float(abs(centers[0, 0] - centers[1, 0]))
     dy = float(abs(centers[0, 1] - centers[1, 1]))
+    group_boxes = []
+    for group in groups:
+        gx0 = min(rows[i]["x"] for i in group); gy0 = min(rows[i]["y"] for i in group)
+        gx1 = max(rows[i]["x"] + rows[i]["w"] for i in group); gy1 = max(rows[i]["y"] + rows[i]["h"] for i in group)
+        group_boxes.append((gx0, gy0, gx1, gy1))
+    a, b = group_boxes
+    gap_x = float(max(0, max(a[0], b[0]) - min(a[2], b[2])))
+    gap_y = float(max(0, max(a[1], b[1]) - min(a[3], b[3])))
+    gap_x_glyphs = gap_x / med_w
+    gap_y_glyphs = gap_y / med_h
     accepted = (
         improvement >= 0.58
         and dx >= 3.2
         and dy >= 3.2
         and min(len(groups[0]), len(groups[1])) >= 4
+        # A real two-flow compound balloon has a visible whitespace corridor.
+        # Curved/diagonal normal columns can separate their centres in both axes
+        # without being independent text islands; do not split those.
+        and max(gap_x_glyphs, gap_y_glyphs) >= 1.8
     )
     diag = {
         "split": bool(accepted), "kmeans_improvement": improvement,
         "center_dx_glyphs": dx, "center_dy_glyphs": dy,
+        "whitespace_gap_x_glyphs": round(gap_x_glyphs, 3),
+        "whitespace_gap_y_glyphs": round(gap_y_glyphs, 3),
         "cluster_sizes": [len(groups[0]), len(groups[1])],
     }
     return groups if accepted else [list(range(len(rows)))], diag
@@ -276,7 +363,10 @@ def detect_target_text_regions(
     # artifact as a pseudo balloon. Real printed glyphs at this page scale have a
     # meaningful two-dimensional component size; the false arm region in the
     # regression page is only 4x2px median.
-    if len(rows) < 3 or med_w < 4.5 or med_h < 4.5 or med_area < 8.0:
+    # These statistics are now computed from interior glyph candidates rather
+    # than balloon-edge noise. Keep the gate permissive enough for short sound
+    # effects / two-glyph balloons while still rejecting single stray strokes.
+    if len(rows) < 2 or med_w < 2.5 or med_h < 2.5 or med_area < 4.0:
         return []
 
     groups, split_diag = _kmeans_diagonal_split(rows)
@@ -314,14 +404,15 @@ def detect_target_text_regions(
             if cell.shape[:2] == region_rect.shape[:2] and cv2.countNonZero(cell) > 0:
                 region_rect = cv2.bitwise_and(region_rect, cell)
                 flow_route = flow_partition.route
-        labels = {rows[i]["label"] for i in group}
-        # Reconstruct only original glyph components for this subregion.
-        # A small dilation captures anti-aliased ink without erasing the whole box.
+        # Reconstruct only the exact connected glyph components belonging to this
+        # subregion. Do not pull every dark pixel inside the expanded region bbox:
+        # that is how balloon borders leaked into v2.3.87/88 Reletter masks.
         region_ink = np.zeros((h, w), np.uint8)
-        # kept has no per-label identity now; intersect with the group's bbox, which
-        # is sufficient after a diagonal split because the two expanded bboxes are
-        # well separated in the regression case.
-        region_ink[y0:y1, x0:x1] = kept[y0:y1, x0:x1]
+        for ri in group:
+            row = rows[ri]
+            rx, ry, rwc, rhc = int(row["x"]), int(row["y"]), int(row["w"]), int(row["h"])
+            roi = region_ink[ry:ry + rhc, rx:rx + rwc]
+            region_ink[ry:ry + rhc, rx:rx + rwc] = cv2.bitwise_or(roi, row["_mask"])
         region_ink = cv2.bitwise_and(region_ink, region_rect)
         if cv2.countNonZero(region_ink) == 0:
             continue
@@ -356,6 +447,7 @@ def detect_target_text_regions(
             diagnostics={
                 **diag, **split_diag, **grid_diag, "group_index": gi, "bbox": list(bbox),
                 "component_bboxes": component_bboxes,
+                "glyph_component_bboxes": component_bboxes,
                 "component_area_sum": int(sum(int(rows[i]["area"]) for i in group)),
                 "text_mask_pixels": int(cv2.countNonZero(region_ink)),
                 "flow_cell_route": flow_route,

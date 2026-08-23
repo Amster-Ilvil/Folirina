@@ -293,7 +293,7 @@ def run_transfer_execution_stage(
             if source_profile_mask is not None and cv2.countNonZero(source_profile_mask) > 0:
                 if clear_for_layout is None or cv2.countNonZero(clear_for_layout) == 0:
                     clear_for_layout = source_profile_mask
-                elif base_safe is not None:
+                elif base_safe is not None and not target_driven_unit:
                     safe_area = max(1, cv2.countNonZero(base_safe))
                     clear_area = cv2.countNonZero(clear_for_layout)
                     # Synthetic target-mask recovery can be missing or overly broad
@@ -366,19 +366,67 @@ def run_transfer_execution_stage(
                         # Use target columns first, but allow fit_text to explore
                         # neighbouring column counts instead of hard-locking.
                         lcfg.preferred_columns = int(np.clip(tcols, 1, lcfg.max_lines))
-                    candidates = []
-                    if tpitch > 0:
-                        candidates.append(int(round(tpitch * 1.10)))
+                    med_component = max(
+                        float(td.get("median_component_w") or 0.0),
+                        float(td.get("median_component_h") or 0.0),
+                    )
+                    # ``glyph_pitch`` is line/column spacing, not font size. The
+                    # old max(source,target_pitch) rule systematically oversized
+                    # Reletter text on clean manga pages. Prefer the source OCR
+                    # spacing after geometric projection, then bracket it with the
+                    # actual TARGET connected-component size. This keeps the clean
+                    # Japanese master authoritative without treating inter-glyph
+                    # whitespace as printable glyph height.
+                    target_component_font = med_component * 1.35 if med_component > 0 else 0.0
+                    # Connected components on clean manga text are often *strokes*,
+                    # not complete glyphs (especially kana, ellipsis and outlined
+                    # scans).  Recover a second, geometry/text-density estimate from
+                    # the TARGET Region envelope and the actual translated string.
+                    # This is a lower bound only: fit_text still owns the hard safe-
+                    # area check and may shrink when the translation is longer.
+                    clean_chars = [ch for ch in str(src.text or "") if not ch.isspace() and ch not in "\r\n"]
+                    target_density_font = 0.0
+                    dx0, dy0, dx1, dy1 = [float(v) for v in dst.bbox]
+                    dw, dh = max(1.0, dx1-dx0), max(1.0, dy1-dy0)
+                    if clean_chars:
+                        if lcfg.orientation == "vertical" and tcols > 0:
+                            expected_rows = max(1, int(np.ceil(len(clean_chars) / max(1, tcols))))
+                            cell = min(dw / max(1, tcols), dh / expected_rows)
+                            target_density_font = cell * 0.82
+                        elif lcfg.orientation == "horizontal":
+                            trows = int(td.get("estimated_rows") or 0)
+                            if trows > 0:
+                                expected_cols = max(1, int(np.ceil(len(clean_chars) / max(1, trows))))
+                                cell = min(dw / expected_cols, dh / max(1, trows))
+                                target_density_font = cell * 0.82
                     if source_predicted_font > 0:
-                        candidates.append(int(round(source_predicted_font * 0.92)))
-                    if candidates:
-                        predicted = max(candidates)
+                        predicted = float(source_predicted_font) * 0.82
+                        if target_component_font > 0:
+                            # TARGET connected components may be individual kana/
+                            # Han strokes rather than whole glyphs, so use them as
+                            # a conservative *lower* plausibility bound only. The
+                            # projected SOURCE pitch is the better whole-glyph size
+                            # estimate on these fragmented small balloons.
+                            predicted = max(predicted, target_component_font * 0.82)
+                        if target_density_font > 0:
+                            predicted = max(predicted, target_density_font)
+                    elif target_density_font > 0:
+                        predicted = max(target_component_font, target_density_font)
+                    elif target_component_font > 0:
+                        predicted = target_component_font
+                    elif tpitch > 0:
+                        predicted = tpitch * 0.78
+                    else:
+                        predicted = 0.0
+                    if predicted > 0:
+                        if tpitch > 0 and source_predicted_font <= 0:
+                            predicted = min(predicted, tpitch * 0.88)
                         # Never let a noisy source-photo estimate exceed most of
                         # the target text-region short side.
                         dx0, dy0, dx1, dy1 = dst.bbox
-                        regional_cap = max(lcfg.min_font_size, int(round(min(max(1.0, dx1-dx0), max(1.0, dy1-dy0)) * 0.72)))
+                        regional_cap = max(lcfg.min_font_size, int(round(min(max(1.0, dx1-dx0), max(1.0, dy1-dy0)) * 0.58)))
                         predicted = min(predicted, regional_cap)
-                        lcfg.preferred_font_size = int(np.clip(predicted, lcfg.min_font_size, lcfg.max_font_size))
+                        lcfg.preferred_font_size = int(np.clip(round(predicted), lcfg.min_font_size, lcfg.max_font_size))
                     target_layout_hint_units += 1
             if target_driven_unit:
                 _apply_target_layout_hints(lcfg, dst, safe)
@@ -390,11 +438,18 @@ def run_transfer_execution_stage(
                     result = retry
             lettering.append(result)
             if trace is not None:
+                safe_bbox = None
+                if safe is not None and cv2.countNonZero(safe) > 0:
+                    sx, sy, sw, sh = cv2.boundingRect((safe > 0).astype(np.uint8))
+                    safe_bbox = [int(sx), int(sy), int(sx + sw), int(sy + sh)]
                 trace.event(
                     "reletter_region", region_id=str((dst.meta or {}).get("reletter_region_id") or dst.id),
                     target_unit_id=str(dst.id), source_unit_id=str(src.id),
                     success=bool(result.success), reason=str(getattr(result, "reason", "") or ""),
                     text=str(src.text), orientation=str(lcfg.orientation),
+                    preferred_font_size=int(getattr(lcfg, "preferred_font_size", 0) or 0),
+                    preferred_columns=int(getattr(lcfg, "preferred_columns", 0) or 0),
+                    layout_mode=str(layout_mode), safe_bbox=safe_bbox,
                     font_size=int(getattr(result, "font_size", 0) or 0),
                     bbox=list(getattr(result, "bbox", ())) if getattr(result, "bbox", None) else [],
                 )
@@ -416,6 +471,61 @@ def run_transfer_execution_stage(
                 pair, registration, source_units, target_units, matches, lettering,
                 mask_result, inpaint_result.image, config.qa,
             )
+            # In target-driven Reletter, deterministic paired-ID binding plus a
+            # valid registration supersedes only the *initial* page-pair
+            # heuristic. Keep the diagnostic visible, but do not report a false
+            # blocking error after all paired regions were actually typeset.
+            paired_authority = bool(
+                target_driven_reletter_regions
+                and matches
+                and float(registration.confidence) >= float(config.qa.registration_min_confidence)
+                and all(
+                    any(str(r or "").startswith("route=paired_id_binding") for r in (getattr(m, "reasons", None) or []))
+                    for m in matches
+                )
+            )
+            if paired_authority:
+                for item in qa:
+                    if item.code == "page_pair_low_confidence":
+                        item.severity = "warning"
+                        item.message = (
+                            "Initial page-pair heuristic is weak, but target-driven Reletter "
+                            "has deterministic paired text-region IDs and verified registration."
+                        )
+                        item.meta.update({
+                            "paired_reletter_authority": True,
+                            "registration_confidence": float(registration.confidence),
+                            "paired_matches": len(matches),
+                        })
+            # Never silently publish a Reletter run that recognized/matched text
+            # but produced zero (or only partial) lettering. Per-unit QA already
+            # records the individual failure; this aggregate guard makes the run
+            # state and GUI diagnostics unambiguous.
+            requested_regions = len(fallback_matches)
+            successful_regions = int(sum(1 for row in lettering if bool(getattr(row, "success", False))))
+            existing_codes = {item.code for item in qa}
+            if requested_regions > 0 and successful_regions == 0 and "reletter_no_output" not in existing_codes:
+                qa.append(QAItem(
+                    "reletter_no_output", "error",
+                    "Reletter recognized and accepted text regions but produced no publishable lettering output.",
+                    value=successful_regions, threshold=1,
+                    meta={"requested_regions": requested_regions},
+                ))
+            elif 0 < successful_regions < requested_regions and "reletter_partial_output" not in existing_codes:
+                qa.append(QAItem(
+                    "reletter_partial_output", "warning",
+                    "Reletter produced only part of the accepted text regions; inspect the missing regions before publication.",
+                    value=successful_regions, threshold=requested_regions,
+                    meta={"requested_regions": requested_regions, "failed_regions": requested_regions-successful_regions},
+                ))
+            if trace is not None:
+                trace.event(
+                    "reletter_summary", requested_regions=int(requested_regions),
+                    successful_regions=int(successful_regions),
+                    failed_regions=int(max(0, requested_regions-successful_regions)),
+                    clear_pixels=int(cv2.countNonZero(mask_result.mask)),
+                    lettering_masks=int(len(lettering_masks)),
+                )
         else:
             assert mask_transfer is not None
             mask_qa = run_mask_replace_qa(

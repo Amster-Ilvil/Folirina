@@ -153,7 +153,16 @@ def _complete_reletter_region_mask(
         return baseline
     white_ratio = float(np.count_nonzero(vals >= 220) / max(1, vals.size))
     spread = float(np.percentile(vals, 90) - np.percentile(vals, 20))
-    if (bool(getattr(cfg, "reletter_region_full_clear_enabled", True))
+    # Target-driven Reletter regions are generated from detected Japanese glyph
+    # islands. Treating their rectangular extent as disposable paper caused large
+    # white holes and could eat balloon outlines. Keep legacy full-region clearing
+    # available only behind an explicit compatibility opt-out; the normal Reletter
+    # path is glyph/component based.
+    allow_full_region = (
+        bool(getattr(cfg, "reletter_region_full_clear_enabled", True))
+        and not bool(getattr(cfg, "reletter_target_region_glyph_only", True))
+    )
+    if (allow_full_region
             and white_ratio >= float(getattr(cfg, "reletter_region_full_clear_min_white_ratio", 0.68))
             and spread <= float(getattr(cfg, "reletter_region_full_clear_max_spread", 48.0))):
         # Keep one-pixel safety around the Region edge; the parent bubble border
@@ -186,6 +195,33 @@ def _complete_reletter_region_mask(
         added = cv2.dilate(added, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=2)
         added = cv2.bitwise_and(added, clip)
     return cv2.bitwise_or(baseline, added)
+
+
+def _glyph_component_clip(block: TextBlock, shape: tuple[int, int]) -> np.ndarray | None:
+    """Return a compact clip around detector-proven glyph components.
+
+    The block polygon is intentionally a layout envelope, not a destructive mask.
+    Destructive clearing must stay close to the component evidence stored by the
+    target text-region detector. A tiny pad keeps antialiasing/dakuten while the
+    protected bubble mask still owns the final boundary.
+    """
+    h, w = shape
+    diag = (block.meta or {}).get("region_diagnostics") or {}
+    boxes = list(diag.get("glyph_component_bboxes") or diag.get("component_bboxes") or [])
+    if not boxes:
+        return None
+    clip = np.zeros((h, w), dtype=np.uint8)
+    for box in boxes:
+        if not isinstance(box, (list, tuple)) or len(box) != 4:
+            continue
+        x0, y0, x1, y1 = [int(round(float(v))) for v in box]
+        short = max(1, min(x1 - x0, y1 - y0))
+        pad = int(np.clip(round(short * 0.20), 1, 3))
+        x0 = max(0, x0 - pad); y0 = max(0, y0 - pad)
+        x1 = min(w, x1 + pad); y1 = min(h, y1 + pad)
+        if x1 > x0 and y1 > y0:
+            clip[y0:y1, x0:x1] = 255
+    return clip if cv2.countNonZero(clip) > 0 else None
 
 
 def build_clear_mask(
@@ -231,6 +267,7 @@ def build_clear_mask(
                     if pixel_mask.shape != (h, w):
                         pixel_mask = cv2.resize(pixel_mask, (w, h), interpolation=cv2.INTER_NEAREST)
                     block_mask = (pixel_mask > 0).astype(np.uint8) * 255
+            synthetic_region_pixel_mask = False
             if block_mask is None and bool(block.meta.get("synthetic_geometry_only")) and target_image is not None:
                 block_mask = _synthetic_target_text_mask(
                     target_image, bubble_by_id.get(unit.bubble_id) if unit.bubble_id else None, cfg,
@@ -243,20 +280,22 @@ def build_clear_mask(
                     # glyphs from the authoritative Japanese image.
                     region_clip = rasterize_polygon(block.polygon, (h, w))
                     if cv2.countNonZero(region_clip) > 0:
-                        short_side = min(max(1.0, block.bbox[2]-block.bbox[0]), max(1.0, block.bbox[3]-block.bbox[1]))
-                        pad = max(2, int(round(short_side * float(getattr(cfg, "reletter_region_completion_pad_ratio", 0.10)))))
-                        pad = min(pad, int(getattr(cfg, "reletter_region_completion_max_pad_px", 14)))
-                        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*pad+1, 2*pad+1))
-                        region_clip = cv2.dilate(region_clip, k, iterations=1)
                         bubble = bubble_by_id.get(unit.bubble_id) if unit.bubble_id else None
                         protected = _protected_bubble_mask(bubble, cfg) if bubble is not None else None
                         if protected is not None and cv2.countNonZero(protected) > 0:
                             region_clip = cv2.bitwise_and(region_clip, protected)
-                        block_mask = cv2.bitwise_and(block_mask, region_clip)
-                        block_mask = _complete_reletter_region_mask(target_image, bubble, region_clip, block_mask, cfg)
+                        component_clip = _glyph_component_clip(block, (h, w))
+                        if component_clip is not None:
+                            component_clip = cv2.bitwise_and(component_clip, region_clip)
+                            if protected is not None and cv2.countNonZero(protected) > 0:
+                                component_clip = cv2.bitwise_and(component_clip, protected)
+                        destructive_clip = component_clip if component_clip is not None and cv2.countNonZero(component_clip) > 0 else region_clip
+                        block_mask = cv2.bitwise_and(block_mask, destructive_clip)
+                        block_mask = _complete_reletter_region_mask(target_image, bubble, destructive_clip, block_mask, cfg)
+                        synthetic_region_pixel_mask = block_mask is not None and cv2.countNonZero(block_mask) > 0
             if block_mask is None:
                 block_mask = rasterize_polygon(block.polygon, (h, w))
-            has_pixel_mask = bool(mask_path and Path(mask_path).exists())
+            has_pixel_mask = bool(mask_path and Path(mask_path).exists()) or synthetic_region_pixel_mask
             d = _dilation_pixels(block, cfg, has_pixel_mask=has_pixel_mask)
             if d > 0:
                 k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * d + 1, 2 * d + 1))

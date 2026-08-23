@@ -21,6 +21,7 @@ from .run_trace import PageRunTrace
 from .run_receipt import write_run_receipt
 from .workspace_guard import PageRunGuard, cleanup_orphan_temp_files
 from .workspace_integrity import validate_page_workspace
+from .run_status import status_from_project
 
 
 def _selected_strategy(project: PageProject) -> str:
@@ -222,11 +223,12 @@ def run_page_lifecycle(
                 if restored.get("success"):
                     discard_run_snapshot(snapshot)
                     snapshot = None
-                trace.exception("run_failed", exc, previous_result_restore=restored)
+                cancelled = type(exc).__name__ == "PipelineCancelled"
+                trace.exception("run_cancelled" if cancelled else "run_failed", exc, previous_result_restore=restored)
                 try:
                     save_json(root / "last_run_state.json", {
-                        "schema": "manga_hd_translation_transfer.run_state.v2",
-                        "status": "failed",
+                        "schema": "manga_hd_translation_transfer.run_state.v3",
+                        "status": "cancelled" if cancelled else "failed",
                         "mode": mode,
                         "run_id": trace.run_id,
                         "error_type": type(exc).__name__,
@@ -278,10 +280,12 @@ def run_page_lifecycle(
                             meta={"issues": list(integrity.get("issues") or []), "mode": mode},
                         ))
                 project.meta["qa_summary"] = qa_summary(project.qa)
+                terminal_status = status_from_project(project, integrity, publish_effect)
+                project.meta["run_status"] = str(terminal_status)
                 save_json(root / "qa.json", {"summary": qa_summary(project.qa), "issues": [x.to_dict() for x in project.qa]})
                 save_json(root / "project.json", project.to_dict())
                 trace.event(
-                    "run_success", selected_strategy=selected_strategy,
+                    "run_complete", status=str(terminal_status), selected_strategy=selected_strategy,
                     applied_regions=int(publish_effect.get("applied_regions") or 0),
                     failed_regions=int(publish_effect.get("failed_regions") or 0),
                     previous_mode=str(publish_effect.get("previous_mode") or ""),
@@ -292,8 +296,8 @@ def run_page_lifecycle(
                     workspace_integrity=bool(integrity.get("pass")),
                 )
                 save_json(root / "last_run_state.json", {
-                    "schema": "manga_hd_translation_transfer.run_state.v2",
-                    "status": "success" if integrity.get("pass") else "integrity_failed",
+                    "schema": "manga_hd_translation_transfer.run_state.v3",
+                    "status": str(terminal_status),
                     "mode": mode,
                     "run_id": trace.run_id,
                     "selected_strategy": selected_strategy,
@@ -316,7 +320,7 @@ def run_page_lifecycle(
                 trace.exception("run_commit_failed", exc, previous_result_restore=restored)
                 try:
                     save_json(root / "last_run_state.json", {
-                        "schema": "manga_hd_translation_transfer.run_state.v2",
+                        "schema": "manga_hd_translation_transfer.run_state.v3",
                         "status": "failed", "stage": "commit", "mode": mode,
                         "run_id": trace.run_id, "error_type": type(exc).__name__, "error": str(exc),
                         "previous_result_restored": restored,

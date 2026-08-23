@@ -20,6 +20,7 @@ from ...io_utils import load_json, save_json
 from .manual_effect_ops import map_target_bbox_to_source
 from ...ocr import build_backend
 from ...schema_compat import as_dict, as_dict_rows
+from ...ocr_block_conflicts import canonicalize_ocr_blocks, conflicting_block_ids
 
 OCR_EDIT_MODE_SCOPE = {
     "hybrid": "mask_ocr",
@@ -50,7 +51,7 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def load_ocr_blocks(page_dir: str | Path, mode: str | None) -> list[dict[str, Any]]:
+def _load_raw_ocr_blocks(page_dir: str | Path, mode: str | None) -> list[dict[str, Any]]:
     path = ocr_blocks_path(page_dir, mode)
     if not path.exists():
         return []
@@ -60,6 +61,15 @@ def load_ocr_blocks(page_dir: str | Path, mode: str | None) -> list[dict[str, An
         return []
     rows = payload.get("blocks", []) if isinstance(payload, dict) else []
     return [dict(x) for x in as_dict_rows(rows)]
+
+
+def load_ocr_blocks(page_dir: str | Path, mode: str | None) -> list[dict[str, Any]]:
+    # Legacy v2.3.83 and earlier projects could accumulate several manual OCR
+    # blocks over the same ROI.  Only one text authority may own one locator.
+    # Canonicalize on every read so old projects stop double/triple-rendering
+    # immediately, even before their JSON is rewritten by the next save/apply.
+    rows, _ = canonicalize_ocr_blocks(_load_raw_ocr_blocks(page_dir, mode))
+    return rows
 
 
 
@@ -82,12 +92,15 @@ def save_ocr_blocks(page_dir: str | Path, mode: str | None, blocks: list[dict[st
     scope = ocr_edit_scope(mode)
     path = ocr_blocks_path(page_dir, mode)
     path.parent.mkdir(parents=True, exist_ok=True)
+    canonical, suppressed = canonicalize_ocr_blocks(blocks)
     save_json(path, {
         "schema": "folirina.ocr_edit.blocks.v1",
         "scope": scope,
         "runtime_mode": str(mode or "").strip().lower(),
         "updated_at": _now(),
-        "blocks": [_json_safe(dict(x)) for x in blocks],
+        "conflict_policy": "single_overlapping_authority_v1",
+        "suppressed_legacy_conflicts": [_json_safe(x) for x in suppressed],
+        "blocks": [_json_safe(dict(x)) for x in canonical],
     })
     return path
 
@@ -102,7 +115,18 @@ def upsert_ocr_block(page_dir: str | Path, mode: str | None, block: dict[str, An
     item.setdefault("box_locked", True)
     item.setdefault("created_at", _now())
     item["updated_at"] = _now()
-    rows = [row for row in rows if str(row.get("id") or "") != block_id]
+
+    # Saving a newly drawn ROI is an explicit user decision.  If it targets the
+    # same area as an existing manual OCR block it *replaces* that authority; it
+    # must never append a second full text layer over the first one.
+    replaced = conflicting_block_ids(rows, item)
+    if replaced:
+        item["replaces_overlapping_ids"] = list(replaced)
+    rows = [
+        row for row in rows
+        if str(row.get("id") or "") != block_id
+        and str(row.get("id") or "") not in set(replaced)
+    ]
     rows.append(item)
     save_ocr_blocks(page_dir, mode, rows)
     return item
@@ -221,6 +245,12 @@ def recognize_manual_ocr_block(
         "columns": int(old.get("columns") or 0),
         "line_spacing_ratio": old.get("line_spacing_ratio", None),
         "letter_spacing_ratio": old.get("letter_spacing_ratio", None),
+        "column_spacing_ratio": old.get("column_spacing_ratio", None),
+        "text_alignment": str(old.get("text_alignment") or "center"),
+        "layout_bbox": list(old.get("layout_bbox") or []),
+        "layout_box_mode": str(old.get("layout_box_mode") or "auto"),
+        "rotation_degrees": float(old.get("rotation_degrees") or 0.0),
+        "fill_color": old.get("fill_color", None),
         "box_locked": True,
         "manual_override": True,
         "created_at": str(old.get("created_at") or _now()),

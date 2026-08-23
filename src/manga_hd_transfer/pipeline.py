@@ -56,8 +56,14 @@ class TransferPipeline:
             self.config.registration.device = self.config.runtime.device
         if self.config.bubbles.device == "auto":
             self.config.bubbles.device = self.config.runtime.device
-        if self.config.mask_replace.sr_device == "auto":
+        mode = str(self.config.transfer.mode or "direct_patch").strip().lower()
+        # Resolve accelerator aliases only for the selected route.  v2.x always
+        # mutated Mask configuration even while Direct/Reveal was active, which
+        # was harmless at render time but violated strict mode-state isolation.
+        if mode in {"mask_replace", "hybrid", "auto"} and self.config.mask_replace.sr_device == "auto":
             self.config.mask_replace.sr_device = self.config.runtime.device
+        if mode in {"direct_patch", "auto"} and self.config.direct_patch.sr_device == "auto":
+            self.config.direct_patch.sr_device = self.config.runtime.device
 
     def _build_ocr_backend_soft(self, lang: str, backend_name: str, *, role: str) -> OCRBackend:
         return build_ocr_backend_soft(

@@ -40,6 +40,11 @@ class StudioState:
     last_manual_effect_mode: str = ""
     restored_page_roots: dict[str, str] = field(default_factory=dict)
     restored_page_origin: dict[str, str] = field(default_factory=dict)
+    # True only after the user explicitly presses 智能配对. Restoring existing
+    # results deliberately loads the processed subset only and must never imply
+    # that a full-book pairing has been performed.
+    book_pairing_ready: bool = False
+    restored_processed_only: bool = False
 
 
 __all__ = ["StudioState", "studio_default_config"]

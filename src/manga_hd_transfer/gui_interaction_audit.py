@@ -69,12 +69,25 @@ def run_gui_interaction_audit(package_root: str | Path | None = None) -> dict[st
     models = sources["studio_model_page.py"]
     export = sources["studio_export_page.py"]
     page_prep = _read(root, "pipeline_page_prep.py")
+    restore_block = gui.split("def restore_existing_results(self):", 1)[1].split("def _pair_now", 1)[0]
+    batch_block = gui.split("def _run_book_explicit(self, *, resume: bool):", 1)[1].split("def run_book", 1)[0]
 
     checks = {
         "self_owned_buttons_connected": not dead_buttons,
         "no_native_question_sheets": "QMessageBox.question" not in all_source,
-        "reletter_font_refresh_connected": "self.reletter_font_refresh.clicked.connect(self._refresh_reletter_font_catalog)" in project,
+        "reletter_font_refresh_connected": "self.reletter_font_refresh.clicked.connect(lambda: self._refresh_reletter_font_catalog(force=True))" in project,
         "reletter_font_catalog_connected": "self.reletter_font_catalog.currentIndexChanged.connect(self._apply_reletter_catalog_font)" in project,
+        "external_fonts_import_into_managed_library": all(token in all_source for token in [
+            'import_font_to_library(path)',
+            '导入当前 OCR 文本块字体',
+            '导入当前 Region 字体到 Folirina 字体库',
+            '导入 OCR 字体到 Folirina 字体库',
+        ]),
+        "font_paths_persist_before_review_write": all(token in all_source for token in [
+            'persist_font_expression(self.font.text().strip(), strict=True)',
+            'persist_font_expression(self.manual_font.text().strip(), strict=True)',
+            'persist_font_expression(raw, strict=True)',
+        ]),
         "global_stop_becomes_visible_off_project_page": "self.stop_button.setVisible(visible)" in gui and "self.stack.currentIndex() != 0" in gui,
         "global_stop_is_attached_to_rail_layout": "rail_tools.addWidget(self.stop_button,2,0,1,2)" in gui,
         "pipeline_worker_released_after_finish": "worker = self.worker" in gui and "self.worker = None" in gui and "worker.deleteLater()" in gui,
@@ -88,6 +101,9 @@ def run_gui_interaction_audit(package_root: str | Path | None = None) -> dict[st
         "export_cleanup_matches_component_mask_copy": "cleanup_output_workspace(out, aggressive_component_masks=True)" in export,
         "fresh_page_run_uses_strict_mode_cleanup": "clear_stale_mode_outputs(root, strict=True)" in page_prep,
         "shared_application_confirmation_dialog": "from .gui_dialogs import confirm_action" in all_source,
+        "restore_reads_processed_results_only": "scan_existing_results(path, processed_only=True)" in restore_block,
+        "restore_never_pairs_implicitly": "pair_directories" not in restore_block and "expand_restored_session_pairs" not in restore_block,
+        "whole_book_never_pairs_implicitly": "self._pair_now()" not in batch_block and "book_pairing_ready" in batch_block,
     }
     return {
         "schema": "folirina.gui_interaction_audit.v1",

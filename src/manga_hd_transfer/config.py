@@ -1465,6 +1465,10 @@ class MaskingConfig(BaseModel):
     # This prevents Japanese strokes/punctuation surviving under newly rendered
     # Chinese while remaining clipped to the paired bubble safe interior.
     reletter_region_full_clear_enabled: bool = True
+    # Reletter target-region polygons are layout envelopes. By default clear only
+    # detector-proven glyph components inside them; set False only for legacy
+    # compatibility with whole-region paper blanking.
+    reletter_target_region_glyph_only: bool = True
     reletter_region_full_clear_min_white_ratio: float = 0.68
     reletter_region_full_clear_max_spread: float = 48.0
     reletter_region_completion_pad_ratio: float = 0.10
@@ -1524,6 +1528,12 @@ class LetteringConfig(BaseModel):
     max_font_size: int = 72
     min_safe_coverage: float = 0.997
     line_spacing_ratio: float = 0.16
+    # Manual/live OCR typography tracking. Positive values add inter-glyph space;
+    # negative values tighten it. It is consumed only by lettering renderers.
+    letter_spacing_ratio: float = 0.0
+    # Text alignment inside the current safe/layout frame. For vertical CJK,
+    # left/center/right map to top/center/bottom within each column.
+    text_alignment: str = "center"  # auto|left|center|right
     side_padding_ratio: float = 0.04
     # Reletter-only vertical column gap. 0 keeps glyph cells adjacent; a small
     # positive ratio improves manga readability without widening raster-transfer modes.

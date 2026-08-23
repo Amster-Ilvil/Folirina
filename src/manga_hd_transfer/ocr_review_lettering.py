@@ -19,9 +19,9 @@ except Exception:  # optional; PIL rendering still works without fontTools
     TTFont = None
     TTCollection = None
 
-from ...config import LetteringConfig
-from ...geometry import rasterize_polygon
-from ...models import LetteringResult, TextUnit
+from .config import LetteringConfig
+from .geometry import rasterize_polygon
+from .models import LetteringResult, TextUnit
 
 _CJK = re.compile(r"[\u3400-\u9fff\u3040-\u30ff\uf900-\ufaff]")
 _FORBID_LINE_START = set("，。！？：；、）》】」』〉〕］｝…—～!?;:,.%）)")

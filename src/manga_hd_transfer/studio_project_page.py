@@ -28,7 +28,7 @@ QComboBox = StableComboBox
 QSpinBox = StableSpinBox
 QDoubleSpinBox = StableDoubleSpinBox
 from .gui_theme import semantic_palette
-from .font_catalog import discover_fonts
+from .font_catalog import discover_fonts, import_font_to_library, persist_font_expression, font_library_dir
 from .io_utils import load_json
 from .direct_patch_status import summarize_direct_patch_payload  # compatibility/public import; runtime uses safe wrapper
 from . import direct_patch_status as _direct_patch_status
@@ -495,10 +495,11 @@ class ProjectPage(QWidget):
         rbl.addLayout(rhead)
 
         font_row = QHBoxLayout(); font_row.setSpacing(6)
-        self.reletter_font = QLineEdit(); self.reletter_font.setPlaceholderText("字体文件、sans / serif / rounded / comic，或 A;B;C 字体链")
+        self.reletter_font = QLineEdit(); self.reletter_font.setPlaceholderText("Folirina 字体库、sans / serif / rounded / comic，或 A;B;C 字体链")
         self.reletter_font.setText(str(self.window.state.config.lettering.font_path or ""))
-        self.reletter_font_pick = QPushButton("浏览"); self.reletter_font_pick.setObjectName("compactAction"); self.reletter_font_pick.setMaximumWidth(64)
+        self.reletter_font_pick = QPushButton("导入"); self.reletter_font_pick.setObjectName("compactAction"); self.reletter_font_pick.setMaximumWidth(64)
         self.reletter_font_default = QPushButton("默认"); self.reletter_font_default.setObjectName("compactAction"); self.reletter_font_default.setMaximumWidth(64)
+        self.reletter_font.setToolTip(f"导入字体会复制到：{font_library_dir()}")
         font_row.addWidget(self.reletter_font,1); font_row.addWidget(self.reletter_font_pick); font_row.addWidget(self.reletter_font_default); rbl.addLayout(font_row)
 
         catalog_row=QHBoxLayout(); catalog_row.setSpacing(6)
@@ -829,10 +830,10 @@ class ProjectPage(QWidget):
         self.mode.currentIndexChanged.connect(self._on_mode_changed); self.show_experimental.toggled.connect(self._set_experimental_visible); self.diff_check.toggled.connect(self._sync_config); self.exact_check.toggled.connect(self._sync_config)
         self.direct_white_clarity_enabled.toggled.connect(self._sync_config); self.direct_white_clarity_enabled.toggled.connect(self._update_direct_clarity_controls)
         self.direct_white_clarity_alpha_gamma.valueChanged.connect(self._sync_config); self.direct_white_clarity_black_boost.valueChanged.connect(self._sync_config); self.direct_white_clarity_pure_white_floor.valueChanged.connect(self._sync_config); self.direct_white_clarity_min_text_pixels.valueChanged.connect(self._sync_config)
-        self.reletter_font.textChanged.connect(self._sync_config); self.reletter_min_font.valueChanged.connect(self._sync_config); self.reletter_max_font.valueChanged.connect(self._sync_config); self.reletter_line_spacing.valueChanged.connect(self._sync_config); self.reletter_break_mode.currentIndexChanged.connect(self._sync_config); self.reletter_layout_mode.currentIndexChanged.connect(self._sync_config); self.reletter_koharu_flow_cells.toggled.connect(self._sync_config)
+        self.reletter_font.textChanged.connect(self._sync_config); self.reletter_font.editingFinished.connect(self._persist_reletter_font_expression); self.reletter_min_font.valueChanged.connect(self._sync_config); self.reletter_max_font.valueChanged.connect(self._sync_config); self.reletter_line_spacing.valueChanged.connect(self._sync_config); self.reletter_break_mode.currentIndexChanged.connect(self._sync_config); self.reletter_layout_mode.currentIndexChanged.connect(self._sync_config); self.reletter_koharu_flow_cells.toggled.connect(self._sync_config)
         self.reletter_font_pick.clicked.connect(self._pick_reletter_font); self.reletter_font_default.clicked.connect(self._clear_reletter_font)
         self.reletter_font_preset.currentIndexChanged.connect(self._apply_reletter_font_preset)
-        self.reletter_font_refresh.clicked.connect(self._refresh_reletter_font_catalog)
+        self.reletter_font_refresh.clicked.connect(lambda: self._refresh_reletter_font_catalog(force=True))
         self.reletter_font_catalog.currentIndexChanged.connect(self._apply_reletter_catalog_font)
         self.transparent_backend.currentIndexChanged.connect(self._sync_config); self.transparent_clear_mode.currentIndexChanged.connect(self._sync_config); self.transparent_protect_border.toggled.connect(self._sync_config); self.transparent_suppress_page_furniture.toggled.connect(self._sync_config); self.transparent_verify_text_presence.toggled.connect(self._sync_config); self.transparent_ocr_text_presence.toggled.connect(self._sync_config); self.transparent_restore_source_evidence.toggled.connect(self._sync_config); self.transparent_expand.valueChanged.connect(self._sync_config); self.transparent_feather.valueChanged.connect(self._sync_config)
         self.semantic_enabled.toggled.connect(self._sync_config); self.semantic_backend.currentIndexChanged.connect(self._sync_config); self.semantic_strategy.currentIndexChanged.connect(self._sync_config); self.semantic_apply_reveal.toggled.connect(self._sync_config); self.semantic_save_overlay.toggled.connect(self._sync_config)
@@ -1202,13 +1203,13 @@ class ProjectPage(QWidget):
                 if hasattr(self, "direct_clarity_section"):
                     self.direct_clarity_section.setSummary("已关闭 · 沿用当前模式原始 SOURCE 像素")
 
-    def _refresh_reletter_font_catalog(self):
+    def _refresh_reletter_font_catalog(self, *, force: bool = False):
         if not hasattr(self,"reletter_font_catalog"):
             return
         current=self.reletter_font.text().strip()
         self.reletter_font_catalog.blockSignals(True)
         self.reletter_font_catalog.clear(); self.reletter_font_catalog.addItem("自动扫描字体库", "")
-        for frow in discover_fonts(limit=160):
+        for frow in discover_fonts(limit=160, force=force):
             self.reletter_font_catalog.addItem(str(frow.get("name") or Path(frow.get("path","")).stem), str(frow.get("path") or ""))
         self.reletter_font_catalog.blockSignals(False)
         if current:
@@ -1355,14 +1356,30 @@ class ProjectPage(QWidget):
         cfg.pairing.prefer_name_pairing = self.prefer_name_pair.isChecked(); cfg.pairing.prefer_order_pairing = self.prefer_order_pair.isChecked(); cfg.pairing.remake_pair_verifier_enabled = self.remake_pair_verify.isChecked()
         cfg.cache.enabled = self.cache_check.isChecked()
 
+    def _persist_reletter_font_expression(self):
+        raw=self.reletter_font.text().strip()
+        if not raw:
+            return
+        try:
+            stored=persist_font_expression(raw, strict=True)
+        except Exception as exc:
+            QMessageBox.warning(self,"字体不可用",str(exc)); return
+        if stored != raw:
+            self.reletter_font.setText(stored); self._refresh_reletter_font_catalog(); self._sync_config()
+
     def _pick_reletter_font(self):
-        start = self.reletter_font.text().strip() or str(Path.home())
+        raw=self.reletter_font.text().strip()
+        start = str(Path(raw).expanduser().parent) if raw and Path(raw).expanduser().exists() else str(Path.home())
         path, _ = QFileDialog.getOpenFileName(
-            self, "选择 OCR重排字体", start,
+            self, "导入 OCR 字体到 Folirina 字体库", start,
             "字体文件 (*.ttf *.ttc *.otf *.otc);;所有文件 (*)",
         )
         if path:
-            self.reletter_font.setText(path)
+            try:
+                row=import_font_to_library(path)
+            except Exception as exc:
+                QMessageBox.warning(self,"字体导入失败",str(exc)); return
+            self.reletter_font.setText(str(row.get("path") or "")); self._refresh_reletter_font_catalog(); self._sync_config()
 
     def _clear_reletter_font(self):
         self.reletter_font.clear()
@@ -1543,8 +1560,12 @@ class ProjectPage(QWidget):
         description = PAGE_TYPE_INFO.get(mark.page_type, PAGE_TYPE_INFO["content"]).get("description", "")
         reason_text = f"{origin} · {description}\n{mark.reason or '尚未进行自动页面检查'}"
         self.detail_reason.setText(reason_text); self.detail_reason.setToolTip(reason_text)
-        method = {"name":"名称", "order":"顺序", "smart":"智能"}.get(pairing_method(pair), pairing_method(pair))
-        stats_text = f"配对：{method} · {pair.confidence:.3f}　页面：{'手动分类' if mark.origin == 'manual' else '默认正文'}"
+        method_key = pairing_method(pair)
+        method = {"name":"名称", "order":"顺序", "smart":"智能", "restored":"已处理结果"}.get(method_key, method_key)
+        if method_key == "restored":
+            stats_text = f"来源：{method} · 尚未智能配对　页面：{'手动分类' if mark.origin == 'manual' else '默认正文'}"
+        else:
+            stats_text = f"配对：{method} · {pair.confidence:.3f}　页面：{'手动分类' if mark.origin == 'manual' else '默认正文'}"
         self.detail_stats.setText(stats_text); self.detail_stats.setToolTip(stats_text)
         combo_index = self.page_type.findData(mark.page_type)
         if combo_index >= 0: self.page_type.setCurrentIndex(combo_index)
@@ -1745,7 +1766,9 @@ class ProjectPage(QWidget):
         s = self.window.state
         self.source.set_path(s.source_dir); self.target.set_path(s.target_dir); self.output.set_path(s.output_dir)
         configured = sum(bool(str(value or "").strip()) for value in (s.source_dir, s.target_dir, s.output_dir))
-        if s.pairs:
+        if s.pairs and bool(getattr(s, "restored_processed_only", False)):
+            self.project_summary.setText(f"已读取 {len(s.pairs)} 页已处理结果 · 尚未智能配对 · {configured}/3 路径")
+        elif s.pairs:
             self.project_summary.setText(f"已配对 {len(s.pairs)} 页 · {configured}/3 路径")
         elif configured:
             self.project_summary.setText(f"已配置 {configured}/3 路径")
@@ -1783,7 +1806,7 @@ class ProjectPage(QWidget):
             try:
                 self.table.setRowCount(len(s.pairs))
                 for i, pair in enumerate(s.pairs):
-                    key = Path(pair.target_path).name; state, route = s.batch_status.get(key, ("等待", "—")); method = {"name":"名称", "order":"顺序", "smart":"智能"}.get(pairing_method(pair), pairing_method(pair))
+                    key = Path(pair.target_path).name; state, route = s.batch_status.get(key, ("等待", "—")); method = {"name":"名称", "order":"顺序", "smart":"智能", "restored":"已处理结果"}.get(pairing_method(pair), pairing_method(pair))
                     mark = self.window.page_mark_for_pair(pair); origin = "手动" if mark.origin == "manual" else "默认"; action = "✓ 处理" if mark.should_process else "— 跳过"
                     vals = [str(i+1), action, f"{mark.label} · {origin}", Path(pair.source_path).name, key, f"{method} · {pair.confidence:.3f}", state, route]
                     for c, v in enumerate(vals):
@@ -1804,7 +1827,10 @@ class ProjectPage(QWidget):
         process_count = sum(1 for pair in s.pairs if self.window.page_mark_for_pair(pair).should_process); skip_count = len(s.pairs)-process_count
         manual_count = sum(1 for pair in s.pairs if self.window.page_mark_for_pair(pair).origin == "manual"); unmatched_count = len(s.unmatched_source)+len(s.unmatched_target)
         self.sum_pairs.setText(f"{len(s.pairs)} 页")
-        self.sum_hint.setText((f"处理 {process_count} · 跳过 {skip_count} · 手动标记 {manual_count} · 未匹配 {unmatched_count}" if s.pairs else "等待页面配对"))
+        if bool(getattr(s, "restored_processed_only", False)):
+            self.sum_hint.setText(f"已读取 {len(s.pairs)} 页已处理结果 · 尚未智能配对")
+        else:
+            self.sum_hint.setText((f"处理 {process_count} · 跳过 {skip_count} · 手动标记 {manual_count} · 未匹配 {unmatched_count}" if s.pairs else "等待页面配对"))
         exp_visible = False
         if self.show_experimental.isChecked() != exp_visible:
             self.show_experimental.blockSignals(True); self.show_experimental.setChecked(exp_visible); self.show_experimental.blockSignals(False)

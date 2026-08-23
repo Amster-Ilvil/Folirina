@@ -15,6 +15,7 @@ from ...bubbles import detect_target_colored_containers, detect_unseeded_white_c
 from ...config import AlignedOverlayRevealConfig, BubbleConfig
 from ...models import BubbleInstance, RegistrationResult
 from ...pipeline_bubble_service import primary_bubbles_cached
+from ...run_status import classify_page_run_status
 from .container_detector import detect_text_barrier_containers
 
 
@@ -639,8 +640,8 @@ def run_aligned_overlay_reveal(
     judgment = np.where(diff_mask[..., None] > 0, cv2.addWeighted(judgment, 0.50, red, 0.50, 0), judgment)
     _imwrite(page_dir / "aligned_overlay_reveal_judgment.png", judgment)
     _imwrite(page_dir / "aligned_overlay_reveal_layer.png", lower_rgba)
-    _imwrite(page_dir / "jp_layer_rgba.png", upper_rgba)
-    _imwrite(page_dir / "cn_layer_rgb.png", warped_source)
+    _imwrite(page_dir / "aligned_overlay_reveal_jp_layer_rgba.png", upper_rgba)
+    _imwrite(page_dir / "aligned_overlay_reveal_cn_layer_rgb.png", warped_source)
     _imwrite(page_dir / output_final_name, flat)
     _imwrite(page_dir / "review_preview.png", flat)
 
@@ -648,9 +649,9 @@ def run_aligned_overlay_reveal(
     try:
         run_state = _load_json(run_state_path)
     except Exception:
-        run_state = {"schema": "manga_hd_translation_transfer.run_state.v2"}
+        run_state = {"schema": "manga_hd_translation_transfer.run_state.v3"}
     run_state.update({
-        "status": "success",
+        "status": str(classify_page_run_status(integrity_pass=True, changed_pixels=changed_pixels)),
         "mode": "aligned_overlay_reveal",
         "selected_strategy": "aligned_overlay_reveal",
         "workspace_integrity": {
@@ -688,6 +689,8 @@ def run_aligned_overlay_reveal(
             "regions": "aligned_overlay_reveal_regions.png",
             "layer": "aligned_overlay_reveal_layer.png",
             "source_ink": "aligned_overlay_reveal_source_ink.png",
+            "jp_layer_rgba": "aligned_overlay_reveal_jp_layer_rgba.png",
+            "cn_layer_rgb": "aligned_overlay_reveal_cn_layer_rgb.png",
         },
         "final": output_final_name,
         "review_preview": "review_preview.png",

@@ -87,10 +87,14 @@ def _font_codepoints(path: str) -> frozenset[int] | None:
     if TTFont is None:
         return None
     try:
-        cps: set[int] = set()
+        cps: set[int] = set(); coll = None
+        # Pillow/ImageFont.truetype(path, size) renders face index 0 unless an
+        # explicit index is supplied. Coverage must therefore be checked against
+        # that same face; unioning every face in a TTC could falsely claim that
+        # the actually rendered face contains a glyph that only exists elsewhere.
         if str(path).lower().endswith((".ttc", ".otc")) and TTCollection is not None:
             coll = TTCollection(path, lazy=True)
-            fonts = list(coll.fonts)
+            fonts = list(coll.fonts[:1])
         else:
             fonts = [TTFont(path, lazy=True)]
         for font in fonts:
@@ -103,6 +107,9 @@ def _font_codepoints(path: str) -> frozenset[int] | None:
                 font.close()
             except Exception:
                 pass
+        if coll is not None:
+            try: coll.close()
+            except Exception: pass
         return frozenset(cps) if cps else None
     except Exception:
         return None
@@ -171,11 +178,105 @@ def find_default_font(explicit: str | None = None) -> str:
     raise FileNotFoundError("No usable font found. Set lettering.font_path or MHD_FONT.")
 
 
-def _font_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, stroke_width: int = 0) -> float:
+def _tracked_text_metrics(
+    draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont,
+    stroke_width: int = 0, letter_spacing_px: float = 0.0,
+) -> tuple[float, tuple[float, float, float, float], list[float]]:
+    """Measure one horizontal line with optional manual tracking.
+
+    Pillow's normal ``textbbox`` includes font kerning but has no tracking
+    control.  The live OCR editor exposes letter spacing, so measurement and
+    painting must use the exact same per-character advances; otherwise a preview
+    can fit while the committed raster overflows.
+    """
     if not text:
-        return 0.0
-    box = draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width)
-    return float(box[2] - box[0])
+        return 0.0, (0.0, 0.0, 0.0, 0.0), []
+    tracking = float(letter_spacing_px)
+    if abs(tracking) < 1e-6:
+        box = draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width)
+        return float(box[2] - box[0]), tuple(float(v) for v in box), [0.0]
+    offsets: list[float] = []
+    cursor = 0.0
+    minx = miny = float('inf'); maxx = maxy = float('-inf')
+    for index, ch in enumerate(text):
+        offsets.append(cursor)
+        box = draw.textbbox((cursor, 0), ch, font=font, stroke_width=stroke_width)
+        minx=min(minx,float(box[0])); miny=min(miny,float(box[1])); maxx=max(maxx,float(box[2])); maxy=max(maxy,float(box[3]))
+        try:
+            advance=float(draw.textlength(ch,font=font))
+        except Exception:
+            advance=float(box[2]-box[0])
+        cursor += advance
+        if index < len(text)-1:
+            cursor += tracking
+    if not np.isfinite(minx):
+        return 0.0, (0.0,0.0,0.0,0.0), offsets
+    return float(maxx-minx), (minx,miny,maxx,maxy), offsets
+
+
+def _font_width(
+    draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont,
+    stroke_width: int = 0, letter_spacing_px: float = 0.0,
+) -> float:
+    return _tracked_text_metrics(draw,text,font,stroke_width,letter_spacing_px)[0]
+
+
+def _draw_horizontal_tracked(
+    draw: ImageDraw.ImageDraw, text: str, origin_x: float, origin_y: float,
+    font: ImageFont.FreeTypeFont, *, stroke_width: int, letter_spacing_px: float,
+) -> tuple[float,float,float,float]:
+    width, box, offsets = _tracked_text_metrics(draw,text,font,stroke_width,letter_spacing_px)
+    if abs(float(letter_spacing_px)) < 1e-6:
+        draw.text((origin_x,origin_y),text,font=font,fill=255,stroke_width=stroke_width,stroke_fill=255)
+        return (origin_x+box[0],origin_y+box[1],origin_x+box[2],origin_y+box[3])
+    for ch,dx in zip(text,offsets):
+        draw.text((origin_x+dx,origin_y),ch,font=font,fill=255,stroke_width=stroke_width,stroke_fill=255)
+    return (origin_x+box[0],origin_y+box[1],origin_x+box[2],origin_y+box[3])
+
+
+def _font_visual_metrics(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    stroke_width: int = 0,
+) -> dict[str, int]:
+    """Measure the *actual selected face* instead of assuming one CJK sample.
+
+    External fonts often have different side bearings, ascender/descender values
+    or glyph boxes than PingFang/Noto.  Deriving horizontal line pitch and
+    vertical cells from only ``国`` / ``国Ag`` can therefore make the fit search
+    accept a size whose real glyphs overlap after drawing.  Measure every unique
+    character used by this block plus a small baseline sample so measurement and
+    rendering share the same FreeType face and pixel size.
+    """
+    chars = list(dict.fromkeys((str(text or "").replace("\n", "") + "国Ag，。！？（）【】")))
+    boxes: list[tuple[int, int, int, int]] = []
+    for ch in chars:
+        if not ch or ch.isspace():
+            continue
+        try:
+            b = draw.textbbox((0, 0), ch, font=font, stroke_width=stroke_width)
+        except Exception:
+            continue
+        if b[2] > b[0] and b[3] > b[1]:
+            boxes.append(tuple(int(v) for v in b))
+    if not boxes:
+        b = draw.textbbox((0, 0), "国Ag", font=font, stroke_width=stroke_width)
+        boxes = [tuple(int(v) for v in b)]
+    top = min(b[1] for b in boxes); bottom = max(b[3] for b in boxes)
+    max_w = max(max(1, b[2] - b[0]) for b in boxes)
+    max_h = max(max(1, b[3] - b[1]) for b in boxes)
+    union_h = max(1, bottom - top)
+    # Keep a small floor tied to requested px size. Some decorative fonts report
+    # tiny ink boxes for punctuation-only strings even though their line pitch is
+    # normal. This floor is deliberately conservative and does not change normal
+    # CJK fonts whose actual glyph boxes are larger.
+    requested = max(1, int(getattr(font, "size", 0) or 1))
+    return {
+        "line_h": max(union_h, int(round(requested * 0.72))),
+        "glyph_w": max(max_w, int(round(requested * 0.48))),
+        "glyph_h": max(max_h, int(round(requested * 0.72))),
+    }
 
 
 def _is_cjk(text: str) -> bool:
@@ -451,7 +552,9 @@ def _draw_vertical_glyph(
     tb = draw.textbbox((0, 0), ch, font=font, stroke_width=cfg.stroke_width)
     cw = tb[2] - tb[0]
     chh = tb[3] - tb[1]
-    px = x + (cell_w - cw) / 2
+    # Center by visual ink bounds. A non-zero left bearing is common in
+    # imported/display fonts and must not shift every glyph within its column.
+    px = x + (cell_w - cw) / 2 - tb[0]
     py = y - tb[1]
     if bool(getattr(cfg, "vertical_punctuation", True)):
         if ch in "、，。．":
@@ -465,6 +568,166 @@ def _draw_vertical_glyph(
         elif ch in "（【《「『〈〔［｛":
             px -= cell_w * 0.08
     draw.text((px, py), ch, font=font, fill=255, stroke_width=cfg.stroke_width, stroke_fill=255)
+
+
+
+def _runs_1d(valid: np.ndarray) -> list[tuple[int, int]]:
+    arr = np.asarray(valid, dtype=bool).reshape(-1)
+    if arr.size == 0:
+        return []
+    padded = np.pad(arr.astype(np.int8), (1, 1), constant_values=0)
+    d = np.diff(padded)
+    starts = np.where(d == 1)[0]
+    ends = np.where(d == -1)[0]
+    return [(int(a), int(b)) for a, b in zip(starts, ends) if b > a]
+
+
+def _run_near_anchor(runs: list[tuple[int, int]], anchor: float) -> tuple[int, int] | None:
+    if not runs:
+        return None
+    containing = [r for r in runs if r[0] <= anchor < r[1]]
+    if containing:
+        return max(containing, key=lambda r: r[1] - r[0])
+    return max(runs, key=lambda r: (r[1] - r[0]) - 0.35 * abs(((r[0] + r[1]) * 0.5) - anchor))
+
+
+def _horizontal_safe_span(mask: np.ndarray, y0: int, y1: int, anchor_x: float) -> tuple[int, int] | None:
+    h, w = mask.shape[:2]
+    y0 = max(0, min(h, int(y0))); y1 = max(0, min(h, int(y1)))
+    if y1 <= y0:
+        return None
+    # A column is usable only when the whole glyph-height band is inside the
+    # safe region. This is the mask-aware equivalent of BallonsTranslator's
+    # per-line edge tests and prevents curved balloon edges clipping glyphs.
+    valid = np.all(mask[y0:y1, :] > 0, axis=0)
+    return _run_near_anchor(_runs_1d(valid), anchor_x)
+
+
+def _vertical_safe_span(mask: np.ndarray, x0: int, x1: int, anchor_y: float) -> tuple[int, int] | None:
+    h, w = mask.shape[:2]
+    x0 = max(0, min(w, int(x0))); x1 = max(0, min(w, int(x1)))
+    if x1 <= x0:
+        return None
+    valid = np.all(mask[:, x0:x1] > 0, axis=1)
+    return _run_near_anchor(_runs_1d(valid), anchor_y)
+
+
+def _hard_shape_metrics(text_mask: np.ndarray, safe_mask: np.ndarray) -> tuple[float, int, int]:
+    core = text_mask > 0
+    total = int(np.count_nonzero(core))
+    if total <= 0:
+        return 0.0, 0, 0
+    outside = int(np.count_nonzero(core & (safe_mask <= 0)))
+    return float((total - outside) / total), outside, total
+
+
+def _variable_cjk_lines(
+    text: str,
+    draw: ImageDraw.ImageDraw,
+    font: ImageFont.FreeTypeFont,
+    widths: list[int],
+    stroke_width: int,
+    measure_cache: dict[tuple[int, int], float] | None = None,
+    letter_spacing_px: float = 0.0,
+) -> list[str] | None:
+    text = text.replace("\n", "")
+    n = len(text); line_count = len(widths)
+    if n == 0 or line_count <= 0 or line_count > n:
+        return None
+    inf = 1e30
+    dp = np.full((line_count + 1, n + 1), inf, dtype=np.float64)
+    prev = np.full((line_count + 1, n + 1), -1, dtype=np.int32)
+    dp[0, 0] = 0.0
+    # Width measurement is independent of row geometry.  A curved balloon tries
+    # several row counts and vertical offsets at the same font size, so share one
+    # exact substring cache across those candidates instead of calling PIL for the
+    # same CJK slice hundreds of times.  This follows the pre-measured glyph/word
+    # length idea used by established manga lettering engines while preserving our
+    # final hard-mask validation.
+    cache = measure_cache if measure_cache is not None else {}
+    for k in range(1, line_count + 1):
+        max_w = max(1.0, float(widths[k - 1]))
+        target = max_w * 0.80
+        min_j = k
+        max_j = n - (line_count - k)
+        for j in range(min_j, max_j + 1):
+            # Keep at least one char in every earlier line.
+            for i in range(k - 1, j):
+                if not np.isfinite(dp[k - 1, i]):
+                    continue
+                key = (i, j)
+                width = cache.get(key)
+                if width is None:
+                    width = _font_width(draw, text[i:j], font, stroke_width, letter_spacing_px)
+                    cache[key] = width
+                if width > max_w:
+                    continue
+                piece = text[i:j]
+                score = dp[k - 1, i] + _line_penalty(piece, width, target, line_index=k - 1, line_count=line_count)
+                # Prefer using the available balloon width without forcing one
+                # character into a lonely final line.
+                fill = width / max_w
+                score += (0.78 - min(0.78, fill)) ** 2 * 0.45
+                if len(piece) == 1 and line_count > 1:
+                    score += 0.8
+                if score < dp[k, j]:
+                    dp[k, j] = score; prev[k, j] = i
+    if not np.isfinite(dp[line_count, n]):
+        return None
+    out: list[str] = []
+    j = n
+    for k in range(line_count, 0, -1):
+        i = int(prev[k, j])
+        if i < 0:
+            return None
+        out.append(text[i:j]); j = i
+    return list(reversed(out))
+
+
+def _variable_word_lines(
+    text: str,
+    draw: ImageDraw.ImageDraw,
+    font: ImageFont.FreeTypeFont,
+    widths: list[int],
+    stroke_width: int,
+    measure_cache: dict[tuple[int, int], float] | None = None,
+    letter_spacing_px: float = 0.0,
+) -> list[str] | None:
+    words = [w for w in text.replace("\n", " ").split() if w]
+    if not words or len(widths) <= 0 or len(widths) > len(words):
+        return None
+    L, n = len(widths), len(words)
+    inf = 1e30
+    dp = np.full((L + 1, n + 1), inf, dtype=np.float64)
+    prev = np.full((L + 1, n + 1), -1, dtype=np.int32)
+    dp[0, 0] = 0.0
+    for k in range(1, L + 1):
+        max_w = max(1.0, float(widths[k - 1])); target = max_w * 0.82
+        for j in range(k, n - (L - k) + 1):
+            for i in range(k - 1, j):
+                if not np.isfinite(dp[k - 1, i]):
+                    continue
+                piece = " ".join(words[i:j])
+                key = (i, j)
+                width = measure_cache.get(key) if measure_cache is not None else None
+                if width is None:
+                    width = _font_width(draw, piece, font, stroke_width, letter_spacing_px)
+                    if measure_cache is not None:
+                        measure_cache[key] = width
+                if width > max_w:
+                    continue
+                score = dp[k - 1, i] + ((width - target) / max(1.0, target)) ** 2
+                if score < dp[k, j]:
+                    dp[k, j] = score; prev[k, j] = i
+    if not np.isfinite(dp[L, n]):
+        return None
+    out: list[str] = []; j = n
+    for k in range(L, 0, -1):
+        i = int(prev[k, j])
+        if i < 0:
+            return None
+        out.append(" ".join(words[i:j])); j = i
+    return list(reversed(out))
 
 
 def _render_horizontal_candidate(
@@ -483,60 +746,113 @@ def _render_horizontal_candidate(
     avail_w, avail_h = x1 - x0, y1 - y0
     if avail_w <= 2 or avail_h <= 2:
         return None
-    dummy = Image.new("L", (8, 8), 0)
-    draw = ImageDraw.Draw(dummy)
-    max_width = max(1, int(avail_w * (1.0 - 2 * cfg.side_padding_ratio)))
-    mode = str(getattr(cfg, "line_break_mode", "smart") or "smart").lower()
-    lines = None
-    if mode == "source":
-        has_explicit_breaks = len([ln for ln in text.split("\n") if ln.strip()]) > 1
-        lines = _source_lines_if_fit(text, draw, font, max_width, cfg.max_lines, cfg.stroke_width)
-        # If explicit/manual breaks exist, prefer shrinking the font until they
-        # fit rather than silently reflowing them at a larger size.
-        if has_explicit_breaks and lines is None:
-            return None
-    if lines is None and _is_cjk(text):
-        if mode == "balanced":
-            compact = text.replace("\n", "")
-            lines = _balanced_cjk_lines(compact, draw, font, max_width, cfg.max_lines, cfg.stroke_width, phrase_first=False)
-        else:
-            lines = _balanced_cjk_lines(text, draw, font, max_width, cfg.max_lines, cfg.stroke_width, phrase_first=True)
-    elif lines is None:
-        lines = _balanced_word_lines(text, draw, font, max_width, cfg.max_lines, cfg.stroke_width)
-    if not lines:
-        return None
-    sample_box = draw.textbbox((0, 0), "国Ag", font=font, stroke_width=cfg.stroke_width)
-    line_h = max(1, sample_box[3] - sample_box[1])
+    dummy = Image.new("L", (8, 8), 0); measure = ImageDraw.Draw(dummy)
+    font_metrics = _font_visual_metrics(measure, text, font, cfg.stroke_width)
+    line_h = int(font_metrics["line_h"])
+    tracking = float(font_size) * float(np.clip(getattr(cfg,"letter_spacing_ratio",0.0),-0.25,0.80))
     spacing = max(0, round(font_size * cfg.line_spacing_ratio))
-    total_h = line_h * len(lines) + spacing * (len(lines) - 1)
-    if total_h > avail_h:
-        return None
-
+    step_h = max(1, line_h + spacing)
+    compact = text.replace("\n", "")
+    token_count = max(1, len(compact) if _is_cjk(text) else len(text.split()))
+    max_lines = min(int(cfg.max_lines), token_count, max(1, (avail_h + spacing) // step_h))
     cx, cy = _layout_anchor(safe_mask, cfg)
-    step = max(3, int(round(font_size * 0.18)))
-    offsets = [(0, 0), (-step, 0), (step, 0), (0, -step), (0, step), (-2*step, 0), (2*step, 0), (0, -2*step), (0, 2*step)]
+    side_pad = max(1, int(round(font_size * max(0.0, float(cfg.side_padding_ratio)))))
+    source_lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    mode = str(getattr(cfg, "line_break_mode", "smart") or "smart").lower()
     best = None
-    for ox, oy in offsets:
-        canvas = Image.new("L", (w, h), 0)
-        d = ImageDraw.Draw(canvas)
-        top = cy - total_h / 2 + oy
-        minx, miny, maxx, maxy = w, h, 0, 0
-        for li, line in enumerate(lines):
-            tb = d.textbbox((0, 0), line, font=font, stroke_width=cfg.stroke_width)
-            lw = tb[2] - tb[0]
-            x = round(cx - lw / 2 + ox)
-            y = round(top + li * (line_h + spacing) - tb[1])
-            d.text((x, y), line, font=font, fill=255, stroke_width=cfg.stroke_width, stroke_fill=255)
-            minx, miny = min(minx, x), min(miny, y + tb[1])
-            maxx, maxy = max(maxx, x + lw), max(maxy, y + tb[3])
-        arr = np.asarray(canvas, dtype=np.uint8)
-        cov = _coverage(arr, safe_mask)
-        rbbox = (max(0, minx), max(0, miny), min(w, maxx), min(h, maxy))
-        score = cov - 0.0005 * (abs(ox) + abs(oy)) - _bbox_shape_penalty(rbbox, safe_mask, cfg)
-        if best is None or score > best[0]:
-            best = (score, arr, rbbox, cov)
-    assert best is not None
-    return best[1], lines, best[2], best[3]
+    # Shared for every line-count/offset candidate at this font size.
+    cjk_measure_cache: dict[tuple[int, int], float] = {}
+    word_measure_cache: dict[tuple[int, int], float] = {}
+
+    for line_count in range(1, max_lines + 1):
+        if mode == "source" and len(source_lines) > 1 and line_count != len(source_lines):
+            continue
+        total_h = line_h * line_count + spacing * (line_count - 1)
+        if total_h > avail_h:
+            continue
+        base_top = cy - total_h / 2.0
+        y_offsets = [0, -step_h * 0.25, step_h * 0.25, -step_h * 0.5, step_h * 0.5]
+        for yoff in y_offsets:
+            top = int(round(base_top + yoff))
+            spans: list[tuple[int, int]] = []
+            widths: list[int] = []
+            ok = True
+            for li in range(line_count):
+                ly0 = top + li * step_h
+                span = _horizontal_safe_span(safe_mask, ly0, ly0 + line_h, cx)
+                if span is None:
+                    ok = False; break
+                a, b = span
+                a += side_pad; b -= side_pad
+                if b - a < max(2, int(font_size * 0.55)):
+                    ok = False; break
+                spans.append((a, b)); widths.append(b - a)
+            if not ok:
+                continue
+            if mode == "source" and len(source_lines) > 1:
+                lines = source_lines if all(_font_width(measure, ln, font, cfg.stroke_width, tracking) <= widths[i] for i, ln in enumerate(source_lines)) else None
+            elif _is_cjk(text):
+                lines = _variable_cjk_lines(
+                    text, measure, font, widths, cfg.stroke_width, cjk_measure_cache, tracking
+                )
+            else:
+                lines = _variable_word_lines(
+                    text, measure, font, widths, cfg.stroke_width, word_measure_cache, tracking
+                )
+            if not lines or len(lines) != line_count:
+                continue
+            canvas = Image.new("L", (w, h), 0); d = ImageDraw.Draw(canvas)
+            minx, miny, maxx, maxy = w, h, 0, 0
+            utilizations = []
+            for li, line in enumerate(lines):
+                lw, tb, _ = _tracked_text_metrics(d,line,font,cfg.stroke_width,tracking)
+                a, b = spans[li]
+                align=str(getattr(cfg,"text_alignment","center") or "center").lower()
+                if align == "left":
+                    ink_left=float(a)
+                elif align == "right":
+                    ink_left=float(b)-float(lw)
+                else:
+                    ink_left=(float(a)+float(b)-float(lw))/2.0
+                # Align the real ink box, including negative bearings.
+                x=float(ink_left)-float(tb[0])
+                y=float(top + li * step_h)-float(tb[1])
+                rb=_draw_horizontal_tracked(d,line,x,y,font,stroke_width=cfg.stroke_width,letter_spacing_px=tracking)
+                minx=min(minx,int(np.floor(rb[0]))); miny=min(miny,int(np.floor(rb[1])))
+                maxx=max(maxx,int(np.ceil(rb[2]))); maxy=max(maxy,int(np.ceil(rb[3])))
+                utilizations.append(lw / max(1.0, float(b - a)))
+            arr = np.asarray(canvas, dtype=np.uint8)
+            cov, outside, total = _hard_shape_metrics(arr, safe_mask)
+            if total <= 0 or outside != 0 or cov < max(float(cfg.min_safe_coverage), 0.9999):
+                continue
+            rbbox = (max(0, minx), max(0, miny), min(w, maxx), min(h, maxy))
+            score = float(np.mean(utilizations)) - 0.018 * float(np.std(utilizations))
+            score -= 0.001 * abs(float(yoff))
+            score -= _bbox_shape_penalty(rbbox, safe_mask, cfg)
+            if best is None or score > best[0]:
+                best = (score, arr, lines, rbbox, cov)
+    if best is None:
+        return None
+    return best[1], best[2], best[3], best[4]
+
+
+def _allocate_vertical_counts(total: int, capacities: list[int]) -> list[int] | None:
+    cols = len(capacities)
+    if cols <= 0 or total < cols or sum(capacities) < total or any(c <= 0 for c in capacities):
+        return None
+    counts: list[int] = []
+    remain = int(total)
+    for i, cap in enumerate(capacities):
+        left_cols = cols - i
+        later_cap = sum(capacities[i + 1:])
+        min_here = max(1, remain - later_cap)
+        max_here = min(int(cap), remain - (left_cols - 1))
+        if max_here < min_here:
+            return None
+        ideal = int(round(remain / max(1, left_cols)))
+        take = int(np.clip(ideal, min_here, max_here))
+        counts.append(take); remain -= take
+    return counts if remain == 0 else None
 
 
 def _rebalance_vertical_counts(text: str, counts: list[int], max_rows: int) -> list[int]:
@@ -586,95 +902,98 @@ def _render_vertical_candidate(
     avail_w, avail_h = x1 - x0, y1 - y0
     if avail_w <= 2 or avail_h <= 2:
         return None
-    dummy = Image.new("L", (8, 8), 0)
-    d0 = ImageDraw.Draw(dummy)
-    char_box = d0.textbbox((0, 0), "国", font=font, stroke_width=cfg.stroke_width)
-    cell_h = max(1, int((char_box[3] - char_box[1]) * 1.04))
-    cell_w = max(1, int((char_box[2] - char_box[0]) * (1.08 + max(0.0, float(getattr(cfg, "column_spacing_ratio", 0.06))))))
+    dummy = Image.new("L", (8, 8), 0); d0 = ImageDraw.Draw(dummy)
+    font_metrics = _font_visual_metrics(d0, text, font, cfg.stroke_width)
+    glyph_h = int(font_metrics["glyph_h"]); glyph_w = int(font_metrics["glyph_w"])
+    letter_ratio=float(np.clip(getattr(cfg,"letter_spacing_ratio",0.0),-0.25,0.80))
+    cell_h = max(1, int(round(glyph_h * max(0.70, 1.04 + letter_ratio))))
+    cell_w = max(1, int(round(glyph_w * max(0.72, 1.08 + float(np.clip(getattr(cfg, "column_spacing_ratio", 0.06),-0.25,0.80))))))
     text = text.replace("\n", "")
     if not text:
         return None
-    max_rows = max(1, avail_h // cell_h)
-    max_cols = max(1, min(cfg.max_lines, avail_w // cell_w))
-    if max_rows <= 0 or max_cols <= 0:
-        return None
+    max_cols = max(1, min(int(cfg.max_lines), avail_w // max(1, cell_w), len(text)))
     preferred_cols = int(getattr(cfg, "preferred_columns", 0) or 0)
-    est_cols = int(np.clip(int(ceil(len(text) / max(1, max_rows))), 1, max_cols))
-    candidate_cols: list[int] = []
-    for c in [preferred_cols, est_cols, est_cols-1, est_cols+1, max(1, int(round(np.sqrt(max(1, len(text)) * (avail_w / max(1.0, avail_h))))))]:
-        if 1 <= c <= max_cols and c not in candidate_cols:
-            candidate_cols.append(c)
+    # Source/target hints are preferences. Explore neighbouring counts first, then
+    # the full range so curved balloons can choose the largest readable layout.
+    est = int(np.clip(int(round(np.sqrt(max(1, len(text)) * max(0.35, avail_w / max(1.0, avail_h))))), 1, max_cols))
+    order: list[int] = []
+    for c in [preferred_cols, est, est - 1, est + 1]:
+        if 1 <= c <= max_cols and c not in order:
+            order.append(c)
     for c in range(1, max_cols + 1):
-        if c not in candidate_cols:
-            candidate_cols.append(c)
+        if c not in order:
+            order.append(c)
     cx, cy = _layout_anchor(safe_mask, cfg)
+    side_pad = max(1, int(round(font_size * max(0.0, float(cfg.side_padding_ratio)))))
     best = None
-    phrase_units = _split_cjk_phrases(text) if _is_cjk(text) else list(text)
-    for cols in candidate_cols:
-        rows = int(ceil(len(text) / cols))
-        if rows > max_rows or cols > max_cols:
+
+    for cols in order:
+        total_w = cols * cell_w
+        if total_w > avail_w:
             continue
-        # Column balancing: distribute char counts almost evenly but prefer the
-        # original/source columns when available.
-        base = len(text) // cols
-        rem = len(text) % cols
-        counts = [base + (1 if i < rem else 0) for i in range(cols)]
-        # Re-balance around phrase boundaries when possible.
-        if _is_cjk(text) and len(phrase_units) > 1:
-            remaining = [len(u) for u in phrase_units]
-            counts = []
-            total_left = len(text)
-            units_left = remaining[:]
-            for col in range(cols):
-                target_n = int(round(total_left / max(1, cols - col)))
-                acc = 0
-                while units_left and (acc < target_n or acc == 0):
-                    nxt = units_left[0]
-                    if acc > 0 and acc + nxt > max_rows and acc >= max(1, target_n - 1):
-                        break
-                    acc += units_left.pop(0)
-                    if acc >= target_n and acc >= max(1, base):
-                        break
-                acc = int(np.clip(acc, 1, max_rows))
-                counts.append(acc)
-                total_left -= acc
-            if sum(counts) != len(text):
-                counts = [base + (1 if i < rem else 0) for i in range(cols)]
-        counts = _rebalance_vertical_counts(text, counts, max_rows)
-        if any(cn > max_rows or cn <= 0 for cn in counts):
-            continue
-        cols = len(counts)
-        total_w, total_h = cols * cell_w, max(counts) * cell_h
-        if total_w > avail_w or total_h > avail_h:
-            continue
-        canvas = Image.new("L", (w, h), 0)
-        d = ImageDraw.Draw(canvas)
-        left = round(cx - total_w / 2)
-        top = round(cy - total_h / 2)
-        pos = 0
-        rendered_cols: list[str] = []
-        for ci, cnt in enumerate(counts):
-            column = text[pos:pos + cnt]
-            pos += cnt
-            rendered_cols.append(column)
-            x = left + (cols - 1 - ci) * cell_w
-            for ri, ch in enumerate(column):
-                y = top + ri * cell_h
-                _draw_vertical_glyph(d, ch, x, y, cell_w, cell_h, font, cfg)
-        arr = np.asarray(canvas, dtype=np.uint8)
-        cov = _coverage(arr, safe_mask)
-        if cov < cfg.min_safe_coverage:
-            continue
-        score = cov
-        if preferred_cols > 0:
-            score -= 0.035 * abs(cols - preferred_cols)
-        score -= 0.012 * np.std(np.asarray(counts, dtype=np.float32))
-        # Prefer larger column counts only when they preserve readable balance.
-        score -= 0.0015 * cols
-        bbox = (max(0, left), max(0, top), min(w, left + total_w), min(h, top + total_h))
-        score -= _bbox_shape_penalty(bbox, safe_mask, cfg)
-        if best is None or score > best[0]:
-            best = (score, arr, rendered_cols, bbox, cov)
+        base_left = cx - total_w / 2.0
+        x_offsets = [0, -cell_w * 0.25, cell_w * 0.25, -cell_w * 0.5, cell_w * 0.5]
+        for xoff in x_offsets:
+            left = int(round(base_left + xoff))
+            spans: list[tuple[int, int]] = []
+            capacities: list[int] = []
+            ok = True
+            # Logical vertical CJK order is right-to-left.
+            for ci in range(cols):
+                xx = left + (cols - 1 - ci) * cell_w
+                span = _vertical_safe_span(safe_mask, xx, xx + cell_w, cy)
+                if span is None:
+                    ok = False; break
+                a, b = span
+                a += side_pad; b -= side_pad
+                cap = max(0, (b - a) // max(1, cell_h))
+                if cap <= 0:
+                    ok = False; break
+                spans.append((a, b)); capacities.append(cap)
+            if not ok:
+                continue
+            counts = _allocate_vertical_counts(len(text), capacities)
+            if counts is None:
+                continue
+            smoothed = _rebalance_vertical_counts(text, counts, max(capacities))
+            if len(smoothed) == len(counts) and sum(smoothed) == len(text) and all(0 < smoothed[i] <= capacities[i] for i in range(cols)):
+                counts = smoothed
+            canvas = Image.new("L", (w, h), 0); d = ImageDraw.Draw(canvas)
+            pos = 0; rendered_cols: list[str] = []; tops: list[int] = []
+            global_top = int(round(cy - max(counts) * cell_h / 2.0))
+            minx, miny, maxx, maxy = w, h, 0, 0
+            for ci, cnt in enumerate(counts):
+                column = text[pos:pos + cnt]; pos += cnt; rendered_cols.append(column)
+                xx = left + (cols - 1 - ci) * cell_w
+                a, b = spans[ci]
+                align=str(getattr(cfg,"text_alignment","center") or "center").lower()
+                if align == "left":
+                    desired_top=a
+                elif align == "right":
+                    desired_top=max(a,b-cnt*cell_h)
+                else:
+                    desired_top=global_top
+                top = int(np.clip(desired_top, a, max(a, b - cnt * cell_h)))
+                tops.append(top)
+                for ri, ch in enumerate(column):
+                    yy = top + ri * cell_h
+                    _draw_vertical_glyph(d, ch, xx, yy, cell_w, cell_h, font, cfg)
+                minx = min(minx, xx); miny = min(miny, top)
+                maxx = max(maxx, xx + cell_w); maxy = max(maxy, top + cnt * cell_h)
+            arr = np.asarray(canvas, dtype=np.uint8)
+            cov, outside, total = _hard_shape_metrics(arr, safe_mask)
+            if total <= 0 or outside != 0 or cov < max(float(cfg.min_safe_coverage), 0.9999):
+                continue
+            bbox = (max(0, minx), max(0, miny), min(w, maxx), min(h, maxy))
+            score = cov
+            if preferred_cols > 0:
+                score -= 0.030 * abs(cols - preferred_cols)
+            score -= 0.010 * float(np.std(np.asarray(counts, dtype=np.float32)))
+            score -= 0.002 * float(np.std(np.asarray(tops, dtype=np.float32)) / max(1.0, cell_h))
+            score -= 0.001 * abs(float(xoff))
+            score -= _bbox_shape_penalty(bbox, safe_mask, cfg)
+            if best is None or score > best[0]:
+                best = (score, arr, rendered_cols, bbox, cov)
     if best is None:
         return None
     return best[1], best[2], best[3], best[4]
@@ -707,6 +1026,12 @@ def _fit_text_uncropped(
         hi = _fit_text_uncropped((h * factor, w * factor), hi_mask, unit, text, hi_cfg)
         if hi.success and hi.text_mask is not None:
             low_mask = cv2.resize(hi.text_mask, (w, h), interpolation=cv2.INTER_LANCZOS4)
+            # Lanczos may create a one-pixel alpha fringe outside the low-res safe
+            # mask even though the supersampled glyph itself fitted perfectly.
+            # Remove only that resampling fringe; the real glyph core already has
+            # an eroded container margin, so this never serves as a substitute for
+            # fitting oversized text.
+            low_mask[safe_mask <= 0] = 0
             # Keep true grayscale alpha from supersampling; do not threshold it back
             # to a jagged binary mask.
             x0, y0, x1, y1 = hi.bbox

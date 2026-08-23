@@ -443,6 +443,10 @@ def run_page_flow(
         trace.event(
             "matching_done", route=str((getattr(match_result, "diagnostics", {}) or {}).get("route") or "geometric"),
             total_matches=len(matches), accepted_matches=len(accepted),
+            paired_reletter_binding=bool(match_stage.paired_reletter_binding),
+            pair_confidence_bypassed=bool(match_stage.pair_confidence_bypassed),
+            pair_confidence=float(pair.confidence),
+            registration_confidence=float(registration.confidence),
             unmatched_source=len(getattr(match_result, "unmatched_source", []) or []),
             unmatched_target=len(getattr(match_result, "unmatched_target", []) or []),
         )

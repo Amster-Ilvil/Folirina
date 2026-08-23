@@ -18,6 +18,7 @@ class TextMatchStageResult:
     matches: list[UnitMatch]
     accepted: list[UnitMatch]
     paired_reletter_binding: bool
+    pair_confidence_bypassed: bool
 
 
 def accepted_matches(
@@ -28,8 +29,17 @@ def accepted_matches(
     matches: list[UnitMatch],
     *,
     config: Any,
+    paired_reletter_authority: bool = False,
 ) -> list[UnitMatch]:
-    if pair.confidence < config.pairing.confidence_floor:
+    # A restored photographed-page pair can carry a weak historical pairing
+    # heuristic even after SIFT/ECC registration has proven the geometry and
+    # Reletter has built deterministic SOURCE↔TARGET region IDs.  Treating the
+    # old page-pair score as a second hard veto silently dropped *all* OCR
+    # lettering (the supplied page 009 had 5 paired matches and 0 accepted).
+    # Only explicit target-driven Reletter may bypass this one heuristic gate;
+    # registration, OCR confidence, kind, relation and match confidence remain
+    # mandatory below. Direct/Mask/Hybrid semantics are unchanged.
+    if pair.confidence < config.pairing.confidence_floor and not paired_reletter_authority:
         return []
     if registration_confidence < config.qa.registration_min_confidence:
         return []
@@ -96,6 +106,12 @@ def run_text_matching_stage(
             source_units, target_units, registration, config.matching
         )
     matches = match_result.matches
+    pair_confidence_bypassed = bool(
+        float(pair.confidence) < float(config.pairing.confidence_floor)
+        and paired_reletter_binding
+        and target_driven_reletter_regions
+        and float(registration.confidence) >= float(config.qa.registration_min_confidence)
+    )
     accepted = accepted_matches(
         pair,
         float(registration.confidence),
@@ -103,6 +119,7 @@ def run_text_matching_stage(
         target_units,
         matches,
         config=config,
+        paired_reletter_authority=pair_confidence_bypassed,
     )
     return TextMatchStageResult(
         source_units=source_units,
@@ -111,6 +128,7 @@ def run_text_matching_stage(
         matches=matches,
         accepted=accepted,
         paired_reletter_binding=paired_reletter_binding,
+        pair_confidence_bypassed=pair_confidence_bypassed,
     )
 
 

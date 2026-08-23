@@ -131,6 +131,15 @@ def validate_page_workspace(page_root: str | Path, project: Any, mode: str, *, s
     hybrid_used = bool(hybrid_meta.get("used"))
     reletter_meta = meta.get("reletter") or {}
     reletter_count = int(reletter_meta.get("successful_regions") or reletter_meta.get("applied_count") or 0)
+    if requested_mode == "reletter" and bool(reletter_meta.get("target_driven_regions_used")):
+        region_diag = reletter_meta.get("target_driven_region_diagnostics") or {}
+        recognized = int(region_diag.get("recognized_regions") or region_diag.get("region_count") or 0)
+        if recognized > 0 and reletter_count <= 0:
+            issues.append({
+                "code": "reletter_no_published_regions",
+                "recognized_regions": recognized,
+                "successful_regions": reletter_count,
+            })
     hybrid_reletter_count = int(hybrid_meta.get("reletter_fallback_success_count") or 0)
     required: list[str] = []
     if direct_used:

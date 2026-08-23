@@ -77,6 +77,7 @@ def page_completion_message(project: Any, *, reprocessed: bool = False) -> str:
     compared = bool(effect.get("pixel_comparison_available"))
     identical = bool(effect.get("pixel_identical")) if compared else False
     changed = effect.get("changed_pixels")
+    run_status = str(meta.get("run_status") or "").strip().lower()
     if bool(effect.get("mode_changed")):
         if compared and identical:
             return f"模式切换已执行 · {previous} → {current} · 新结果与上一模式逐像素相同（不是旧结果缓存复用）"
@@ -84,6 +85,14 @@ def page_completion_message(project: Any, *, reprocessed: bool = False) -> str:
             return f"模式切换完成 · {previous} → {current} · 输出已更新 {int(changed or 0)} px · 应用 {applied} 个区域"
         return f"模式切换完成 · {previous} → {current} · 应用 {applied} 个区域"
     prefix = "重新处理完成" if reprocessed else "当前页处理完成"
+    if run_status == "partial":
+        return f"{prefix} · 部分区域成功，仍有区域失败或需复核 · 已应用 {applied} 个区域"
+    if run_status == "skipped":
+        return f"{prefix} · 当前页按页面规则跳过，已保留稳定输出"
+    if run_status == "integrity_failed":
+        return f"{prefix} · 输出完整性检查未通过，请查看日志后再导出"
+    if run_status == "noop" and not compared:
+        return f"{prefix} · 当前模式已执行，但没有安全可发布的迁移区域"
     if compared and identical:
         return f"{prefix} · 已重新执行当前模式，但输出与处理前逐像素相同 · 应用 {applied} 个区域"
     if compared:

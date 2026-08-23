@@ -26,7 +26,11 @@ def _active_mask_config(config: Any, mode: str):
 
 def _resolve_private_pixel_stage(*, mode: str, direct_container_fast: bool):
     key = str(mode or "").strip().lower()
-    if direct_container_fast or key == "direct_patch":
+    if direct_container_fast and key not in {"direct_patch", "auto"}:
+        raise RuntimeError(
+            f"mode isolation violation: direct_container_fast cannot route mode={key or mode}"
+        )
+    if key == "direct_patch" or (key == "auto" and direct_container_fast):
         from .modes.direct_patch import pixel_stage
         return "direct_patch", pixel_stage
     if key == "hybrid":
