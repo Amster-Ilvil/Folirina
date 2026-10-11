@@ -52,7 +52,9 @@ def main() -> int:
             lines.append(
                 f'log_file=$(mktemp); if {line} >"$log_file" 2>&1; then printf "[{name}] PASS\\n"; '
                 f'else rc=$?; printf "[{name}] FAIL (exit %s)\\n" "$rc"; '
-                f'tail -n 100 "$log_file"; rm -f "$log_file"; exit $rc; fi; rm -f "$log_file"'
+                f'grep -E "\\": false|\\": null" "$log_file" | head -n 50 || true; '
+                f'head -n 75 "$log_file"; tail -n 80 "$log_file"; '
+                f'rm -f "$log_file"; exit $rc; fi; rm -f "$log_file"'
             )
         lines.append("printf '{\"pass\":true}\\n'")
         script = "\n".join(lines)
