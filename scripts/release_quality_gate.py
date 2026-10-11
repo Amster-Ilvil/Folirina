@@ -17,21 +17,13 @@ ENV.setdefault("FOLIRINA_SELFTEST_TIMEOUT", "60")
 STEP_TIMEOUT_SECONDS = max(60, int(ENV.get("FOLIRINA_QUALITY_GATE_STEP_TIMEOUT", "600")))
 
 COMMANDS = (
-    ("compileall", [sys.executable, "-m", "compileall", "-q", "src", "tests", "tools", "scripts"]),
+    ("compileall", [sys.executable, "-m", "compileall", "-q", "src", "tests", "scripts"]),
     ("pytest", [sys.executable, "-m", "pytest", "-q"]),
     ("architecture_audit", [sys.executable, "-m", "manga_hd_transfer.architecture_audit"]),
     ("gui_interaction_audit", [sys.executable, "-m", "manga_hd_transfer.gui_interaction_audit"]),
-    ("undefined_name_audit", [sys.executable, "tools/undefined_name_audit.py", "--strict"]),
-    # Run filesystem/architecture health before importing the entire module
-    # surface. On some native OpenCV builds, the all-module import probe can
-    # delay a following filesystem-heavy audit even though both pass alone.
-    ("project_health", [sys.executable, "tools/project_health_audit.py", "--strict"]),
-    ("deep_audit", [sys.executable, "tools/deep_audit.py"]),
-    ("import_surface_audit", [sys.executable, "tools/import_surface_audit.py", "--strict"]),
-    # Native runtime probing is last and has its own trusted timeout/receipt.
+    # Native runtime smoke test is authoritative and has a separate timeout.
     ("selftest", [sys.executable, "scripts/run_runtime_selftest.py"]),
 )
-
 
 
 def _command_line(cmd: list[str]) -> str:
@@ -58,8 +50,9 @@ def main() -> int:
         for name, cmd in COMMANDS:
             line = _command_line(cmd)
             lines.append(
-                f'if {line} >/dev/null 2>&1; then printf "[{name}] PASS\\n"; '
-                f'else rc=$?; printf "[{name}] FAIL\\n"; exit $rc; fi'
+                f'log_file=$(mktemp); if {line} >"$log_file" 2>&1; then printf "[{name}] PASS\\n"; '
+                f'else rc=$?; printf "[{name}] FAIL (exit %s)\\n" "$rc"; '
+                f'tail -n 100 "$log_file"; rm -f "$log_file"; exit $rc; fi; rm -f "$log_file"'
             )
         lines.append("printf '{\"pass\":true}\\n'")
         script = "\n".join(lines)

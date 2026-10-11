@@ -47,12 +47,6 @@ jobs:
         run: python scripts/privacy_audit.py
       - name: Full release quality gate
         run: python scripts/release_quality_gate.py
-      - name: Runtime selftest
-        # Run the synthetic end-to-end runtime probe as its own OS-bounded step.
-        # Native CV/font runtimes may keep process-global worker pools until the
-        # interpreter exits; isolating this from the static gate prevents a
-        # successful release audit from being held open by a leaked worker.
-        run: FOLIRINA_SELFTEST_TIMEOUT=120 python scripts/run_runtime_selftest.py
 
   metadata:
     name: Version metadata
@@ -255,11 +249,7 @@ jobs:
         run: |
           set -euo pipefail
           NOTES=$(mktemp)
-          cat > "$NOTES" <<EOF
-          ## Folirina ${RELEASE_TAG}
-          Multi-platform build from a clean checkout after the full core quality gate and privacy audit.
-          See SHA256SUMS.txt and BUILD-INFO.txt for verification.
-          EOF
+          cp RELEASE_NOTES.md "$NOTES"
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release edit "$RELEASE_TAG" --title "Folirina ${RELEASE_TAG}" --notes-file "$NOTES" --latest
           else
