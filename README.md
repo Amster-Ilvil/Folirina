@@ -68,7 +68,13 @@ Windows PowerShell 将激活命令改为 `.venv\Scripts\Activate.ps1`，其余�
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=Amster-Ilvil/Folirina&type=Date)](https://www.star-history.com/#Amster-Ilvil/Folirina&Date)
+<a href="https://www.star-history.com/?repos=Amster-Ilvil%2FFolirina&type=date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=Amster-Ilvil/Folirina&type=date&theme=dark">
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=Amster-Ilvil/Folirina&type=date">
+    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=Amster-Ilvil/Folirina&type=date">
+  </picture>
+</a>
 
 ## 许可
 

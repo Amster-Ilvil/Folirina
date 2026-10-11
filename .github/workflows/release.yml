@@ -14,7 +14,6 @@ on:
       - "run_gui.py"
       - ".github/workflows/**"
   push:
-    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 

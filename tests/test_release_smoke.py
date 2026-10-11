@@ -44,7 +44,7 @@ def test_desktop_entrypoints_and_platform_icons_present():
 def test_release_documentation_includes_platforms_and_star_history():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     notes = (ROOT / "RELEASE_NOTES.md").read_text(encoding="utf-8")
-    assert "api.star-history.com/svg?repos=Amster-Ilvil/Folirina" in readme
+    assert "api.star-history.com/chart?repos=Amster-Ilvil/Folirina" in readme
     assert "GitHub Releases" in readme
     for token in ("Windows", "Linux", "Apple Silicon", "Intel"):
         assert token in readme
