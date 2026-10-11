@@ -19,7 +19,7 @@ from typing import Callable, Type
 
 from .cache import load_completed_page
 from .mode_contracts import mode_scoped_config_payload
-from .io_utils import save_json, stem_id
+from .io_utils import list_images, save_json, stem_id
 from .models import BookProject, PagePair, PageProject
 from .project_store import DiskBackedPageList
 from .page_memory import release_page_heavy_arrays
@@ -28,8 +28,85 @@ from .page_management import PageMark, resolve_mark
 from .pairing import pair_directories
 from .qa import qa_summary
 from .runtime import empty_accelerator_cache, runtime_summary
+from .m6_runtime_plan import build_m6_runtime_plan, should_auto_decode_prefetch
 
 logger = logging.getLogger(__name__)
+
+
+def _low_memory_page_boundary_cleanup_needed() -> bool:
+    """Return True when a completed page should trigger immediate runtime cleanup.
+
+    Normal machines keep the historical periodic cleanup cadence for throughput.
+    Small cloud/CI CPU containers can have only ~4-6 GiB available; after a
+    complex Direct page, decoded/OpenCV arrays and recently stopped RF-DETR
+    workers may not be reclaimed before the next model process starts.  Detect
+    that pressure dynamically rather than forcing all users to unload per page.
+    """
+    try:
+        from .accelerator_policy import detect_apple_hardware, current_available_memory_gb
+        hw = detect_apple_hardware()
+        available = float(current_available_memory_gb() or 0.0)
+        if available <= 0.0:
+            return False
+        floor = 5.0 if (hw.unified_memory or hw.is_apple_silicon) else 6.0
+        return available < floor
+    except Exception:
+        return False
+
+
+def _release_page_boundary_runtime_memory(config) -> None:
+    """Best-effort low-memory cleanup between completed pages.
+
+    The runtime trim helpers never start an unused worker.  Unloading is used
+    only under detected pressure; readiness probes remain cached separately.
+    """
+    try:
+        from .vision_runtime import recycle_runtime_worker
+        recycle_runtime_worker()
+    except Exception:
+        logger.debug("page-boundary vision worker recycle failed", exc_info=True)
+    try:
+        from .deep_registration_runtime import trim_runtime_cache as trim_deep_runtime_cache
+        trim_deep_runtime_cache(unload_models=True)
+    except Exception:
+        logger.debug("page-boundary deep registration cleanup failed", exc_info=True)
+    empty_accelerator_cache(config.runtime.device)
+
+
+def _is_target_only_passthrough_pair(pair: PagePair) -> bool:
+    return any(str(reason) == "pairing=target_only_passthrough" for reason in list(pair.reasons or []))
+
+
+def _promote_unmatched_targets_to_passthrough_pairs(
+    pairs: list[PagePair], unmatched_target: list[str], target_dir: str | Path,
+) -> list[PagePair]:
+    """Preserve TARGET-only physical pages in final book order.
+
+    They stay listed in ``unmatched_target`` for QA/diagnostics, but are also
+    represented by a synthetic identity pair so the ordinary page pipeline can
+    publish the untouched TARGET image.  SOURCE is deliberately set to TARGET
+    only because the forced ``target_only`` PageMark exits before destructive
+    registration/transfer.
+    """
+    if not unmatched_target:
+        return list(pairs)
+    target_paths = [str(p) for p in list_images(target_dir)]
+    index_by_path = {str(Path(path)): idx for idx, path in enumerate(target_paths)}
+    out = list(pairs)
+    occupied = {int(p.target_index) for p in out}
+    for path in unmatched_target:
+        key = str(Path(path))
+        target_index = index_by_path.get(key)
+        if target_index is None or target_index in occupied:
+            continue
+        out.append(PagePair(
+            source_path=key, target_path=key, source_index=-1, target_index=int(target_index),
+            confidence=1.0, score=0.0,
+            reasons=["pairing=target_only_passthrough", "unmatched_target=preserve"],
+        ))
+        occupied.add(int(target_index))
+    out.sort(key=lambda pair: (int(pair.target_index), int(pair.source_index)))
+    return out
 
 
 def _planned_book_pages(pairs: list[PagePair], output: Path) -> list[tuple[int, PagePair, Path, Path]]:
@@ -196,36 +273,45 @@ class _ResumeSlidingWindow:
 
 
 class _DecodeLookahead:
-    """One-page CPU/I/O decode lane; never overlaps accelerator/model execution."""
+    """Bounded CPU/I/O decode lane that never overlaps accelerator execution.
 
-    def __init__(self, planned, *, decode_fn: Callable | None, enabled: bool):
+    M6 performance-tier machines can keep two future pages in flight. The
+    accelerator remains single-lane; only page decoding/read-ahead is parallel.
+    This keeps the memory bound explicit while hiding filesystem/decode latency.
+    """
+
+    def __init__(self, planned, *, decode_fn: Callable | None, enabled: bool, depth: int = 1):
         self._planned = planned
         self._decode_fn = decode_fn
+        self._depth = max(1, min(2, int(depth or 1)))
         self._enabled = bool(enabled and decode_fn is not None and len(planned) > 1)
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mhd-decode") if self._enabled else None
-        self._future = None
-        self._index = 0
+        workers = self._depth if self._enabled else 1
+        self._executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="mhd-decode") if self._enabled else None
+        self._futures: dict[int, object] = {}
 
     def schedule(self, one_based_index: int) -> None:
         if not self._enabled or self._executor is None:
             return
         if one_based_index < 1 or one_based_index > len(self._planned):
             return
-        # Exactly one future/result may be resident. Do not queue multiple 4K
-        # pages behind a slow renderer; bounded memory is more important than
-        # speculative depth.
-        if self._future is not None:
+        if one_based_index in self._futures:
+            return
+        if len(self._futures) >= self._depth:
             return
         _, pair, _, _ = self._planned[one_based_index - 1]
-        self._index = one_based_index
-        self._future = self._executor.submit(self._decode_fn, pair)
+        self._futures[one_based_index] = self._executor.submit(self._decode_fn, pair)
+
+    def prime(self, current_index: int) -> None:
+        """Fill the bounded decode window starting after the current page."""
+        if not self._enabled:
+            return
+        for offset in range(1, self._depth + 1):
+            self.schedule(int(current_index) + offset)
 
     def take(self, one_based_index: int):
-        if self._future is None or self._index != one_based_index:
+        fut = self._futures.pop(int(one_based_index), None)
+        if fut is None:
             return None
-        fut = self._future
-        self._future = None
-        self._index = 0
         try:
             return fut.result()
         except Exception:
@@ -236,10 +322,13 @@ class _DecodeLookahead:
     def close(self) -> None:
         ex = self._executor
         self._executor = None
-        fut = self._future
-        self._future = None
-        if fut is not None:
-            fut.cancel()
+        futures = list(self._futures.values())
+        self._futures.clear()
+        for fut in futures:
+            try:
+                fut.cancel()
+            except Exception:
+                pass
         if ex is not None:
             ex.shutdown(wait=True, cancel_futures=True)
 
@@ -394,6 +483,7 @@ def run_book_orchestration(
 
     if pairs_override is None:
         pairs, unmatched_source, unmatched_target = pair_directories(source_dir, target_dir, config.pairing)
+        pairs = _promote_unmatched_targets_to_passthrough_pairs(pairs, unmatched_target, target_dir)
     else:
         pairs = list(pairs_override)
         unmatched_source, unmatched_target = [], []
@@ -421,17 +511,20 @@ def run_book_orchestration(
         scoped_config_payload=resume_config_payload,
         allow_compatible_identity=allow_compatible_resume,
     )
-    decode_prefetch_depth = max(0, min(1, int(getattr(config.batch, "decode_prefetch_pages", 1) or 0)))
+    planned_depth = int(getattr(build_m6_runtime_plan(config), "decode_prefetch_pages", 1) or 1) if should_auto_decode_prefetch(config) else 1
+    configured_depth = int(getattr(config.batch, "decode_prefetch_pages", 1) or 1)
+    decode_prefetch_depth = max(0, min(2, max(configured_depth, planned_depth)))
     decode_prefetch_requested = (
-        bool(getattr(config.batch, "decode_prefetch_enabled", False))
-        and bool(getattr(config.batch, "decode_prefetch_experimental_opt_in", False))
+        bool(should_auto_decode_prefetch(config) or (
+            bool(getattr(config.batch, "decode_prefetch_enabled", False))
+            and bool(getattr(config.batch, "decode_prefetch_experimental_opt_in", False))
+        ))
         and decode_prefetch_depth > 0
     )
     # Resume admission may skip arbitrary future pages; avoid decoding full 4K
     # images speculatively on continue-runs. From-scratch runs get one-page
     # look-ahead while the current page performs CPU/model/composition work.
     use_decode_prefetch = bool(decode_prefetch_requested and not resume_enabled and prefetch_page_images is not None)
-    decode_lookahead = _DecodeLookahead(planned, decode_fn=prefetch_page_images, enabled=use_decode_prefetch)
     try:
         proc_params = inspect.signature(process_page).parameters.values()
         proc_params = list(proc_params)
@@ -445,6 +538,12 @@ def run_book_orchestration(
         process_accepts_prefetched = True
         process_accepts_progress = True
 
+    # A single page or a consumer without prefetched_images cannot benefit.
+    use_decode_prefetch = bool(use_decode_prefetch and len(planned) > 1 and process_accepts_prefetched)
+    decode_lookahead = _DecodeLookahead(
+        planned, decode_fn=prefetch_page_images, enabled=use_decode_prefetch, depth=decode_prefetch_depth
+    )
+
     stream_threshold = max(0, int(getattr(config.batch, "stream_book_page_threshold", 96) or 0))
     use_disk_backed_pages = bool(stream_threshold > 0 and len(planned) >= stream_threshold)
     pages: list[PageProject] = []
@@ -456,6 +555,7 @@ def run_book_orchestration(
     completed_count = 0
     started = time.perf_counter()
     cancelled = False
+    stopped_on_blocking_qa = False
     released_array_bytes = 0
     pruned_cache_bytes = 0
     pruned_cache_pages = 0
@@ -491,10 +591,25 @@ def run_book_orchestration(
     def emit(done: int, total: int, pair: PagePair | None, status: str, cache_hit: bool = False, message: str = ""):
         if progress_cb is None:
             return
-        try:
-            progress_cb(done, total, pair, status, cache_hit, message)
-        except TypeError:
-            progress_cb(done, total, status)
+        payload = {
+            "done": int(done), "total": int(total), "pair": pair,
+            "status": str(status), "cache_hit": bool(cache_hit),
+            "message": str(message or ""),
+        }
+        # Progress/reporting is observational only: an old GUI/plugin callback
+        # must never abort a long-running book job.
+        for args in (
+            (done, total, pair, status, cache_hit, message),
+            (done, total, status),
+            (payload,),
+        ):
+            try:
+                progress_cb(*args)
+                return
+            except TypeError:
+                continue
+            except Exception:
+                return
 
     def save_checkpoint(
         last_index: int, *, current_pair: PagePair | None = None,
@@ -561,7 +676,14 @@ def run_book_orchestration(
                 break
             prefetched_images = decode_lookahead.take(idx) if use_decode_prefetch else None
 
-            requested_mark = resolve_mark(page_marks, pair) if page_marks is not None else None
+            if _is_target_only_passthrough_pair(pair):
+                requested_mark = PageMark(
+                    page_type="target_only", origin="auto", confidence=1.0,
+                    reason="unmatched_target_preserved",
+                    source_name="", target_name=Path(pair.target_path).name,
+                )
+            else:
+                requested_mark = resolve_mark(page_marks, pair) if page_marks is not None else None
             if resume_enabled:
                 # Do not tell the GUI/log that an already-completed page is being
                 # processed before resume admission has even been checked.
@@ -597,10 +719,14 @@ def run_book_orchestration(
             emit(idx, len(pairs), pair, "running", False, "正在处理")
             try:
                 if use_decode_prefetch and idx < len(planned):
-                    next_pair = planned[idx][1]
-                    next_mark = resolve_mark(page_marks, next_pair) if page_marks is not None else None
-                    if next_mark is None or next_mark.should_process:
-                        decode_lookahead.schedule(idx + 1)
+                    # Prime a bounded look-ahead window. Resume/continuation runs
+                    # never enter this path, so skipped pages cannot consume decoded
+                    # memory speculatively.
+                    for look_idx in range(idx + 1, min(len(planned), idx + decode_prefetch_depth) + 1):
+                        next_pair = planned[look_idx - 1][1]
+                        next_mark = resolve_mark(page_marks, next_pair) if page_marks is not None else None
+                        if next_mark is None or next_mark.should_process:
+                            decode_lookahead.schedule(look_idx)
                 process_kwargs = {"page_mark": requested_mark, "cancel_cb": cancel_cb}
                 if prefetched_images is not None and process_accepts_prefetched:
                     process_kwargs["prefetched_images"] = prefetched_images
@@ -613,6 +739,18 @@ def run_book_orchestration(
                 if bool(getattr(config.runtime, "detach_completed_page_arrays", True)):
                     released_array_bytes += release_page_heavy_arrays(page)
                 record_page(page, page_dir, pair)
+                blocking_qa = [q for q in list(getattr(page, "qa", []) or []) if str(getattr(q, "severity", "")) == "error"]
+                if blocking_qa and bool(getattr(config.batch, "stop_on_error", False)):
+                    stopped_on_blocking_qa = True
+                    codes = [str(getattr(q, "code", "qa_error")) for q in blocking_qa]
+                    row = {
+                        "index": idx, "source": pair.source_path, "target": pair.target_path,
+                        "error": "Blocking QA: " + ", ".join(codes), "qa_codes": codes,
+                    }
+                    failures.append(row)
+                    emit(idx, len(pairs), pair, "failed", False, row["error"])
+                    save_checkpoint(idx, current_pair=pair, status="failed", force=True)
+                    break
                 if bool((page.meta or {}).get("passthrough")):
                     pm = (page.meta or {}).get("page_management", {}) or {}
                     reason = str((page.meta or {}).get("passthrough_reason") or "")
@@ -644,7 +782,41 @@ def run_book_orchestration(
                 idx, current_pair=pair,
                 status="failed" if failures and failures[-1].get("index") == idx else "completed",
             )
+            # On small cloud/CI hosts, reclaim page-local cycles and any already
+            # running model caches *before* launching the next RF-DETR process.
+            # This closes a real 0081 -> 0082 failure mode where each page works
+            # alone but the second page stalls during Koharu model startup.
+            low_memory_boundary_cleanup = bool(idx < len(pairs) and _low_memory_page_boundary_cleanup_needed())
+            if low_memory_boundary_cleanup:
+                _release_page_boundary_runtime_memory(config)
             if config.runtime.release_cache_every > 0 and idx % config.runtime.release_cache_every == 0:
+                # Heavy Torch models live in isolated persistent workers, not in
+                # the GUI process. Trim those caches first; helpers are no-ops
+                # when a worker has never been started, so cleanup cannot create
+                # an otherwise-unused runtime.
+                # Normal periodic maintenance keeps hot models resident and only
+                # releases allocator fragments. Under genuine low-memory pressure
+                # we additionally unload worker model caches so unified memory can
+                # recover before the next page.
+                unload_models = False
+                try:
+                    from .accelerator_policy import detect_apple_hardware
+                    live_hw = detect_apple_hardware()
+                    live_available = float(live_hw.available_memory_gb or 0.0)
+                    pressure_floor = 5.0 if (live_hw.unified_memory or live_hw.is_apple_silicon) else 3.0
+                    unload_models = bool(0.0 < live_available < pressure_floor)
+                except Exception:
+                    logger.debug("live memory pressure probe failed", exc_info=True)
+                try:
+                    from .vision_runtime import trim_runtime_cache as trim_vision_runtime_cache
+                    trim_vision_runtime_cache(unload_models=unload_models)
+                except Exception:
+                    logger.debug("vision worker cache trim failed", exc_info=True)
+                try:
+                    from .deep_registration_runtime import trim_runtime_cache as trim_deep_runtime_cache
+                    trim_deep_runtime_cache(unload_models=unload_models)
+                except Exception:
+                    logger.debug("deep registration worker cache trim failed", exc_info=True)
                 empty_accelerator_cache(config.runtime.device)
             if config.batch.save_manifest_every > 0 and idx % config.batch.save_manifest_every == 0:
                 save_manifest(idx)
@@ -668,6 +840,7 @@ def run_book_orchestration(
             "page_management_updates": page_management_updates,
             "failed_count": len(failures), "failures": failures, "cancelled": cancelled,
             "elapsed_seconds": round(elapsed, 3), "runtime": runtime_summary(config.runtime.device),
+            "m6_runtime_plan": build_m6_runtime_plan(config.runtime).to_dict(),
             "registration_routes": route_counts, "stage_cache_hits": int(stage_cache_hits),
             "long_run_memory_released_bytes": int(released_array_bytes),
             "stage_cache_pruned_pages": int(pruned_cache_pages),
@@ -690,7 +863,9 @@ def run_book_orchestration(
             "checkpoint_writes_before_final": int(checkpoint_writes),
             "manifest_writes_before_final": int(manifest_writes),
             "qa_errors": int(qa_errors),
+            "stopped_on_blocking_qa": bool(stopped_on_blocking_qa),
             "qa_warnings": int(qa_warnings),
+            "target_only_passthrough_count": sum(1 for p in pairs if _is_target_only_passthrough_pair(p)),
         },
     )
     _save_book_project_streaming(output / "book_project.json", book)
@@ -705,6 +880,7 @@ def run_book_orchestration(
 
 __all__ = [
     "_planned_book_pages", "_resume_mark_allows_cached", "_prefetch_resume_hits",
+    "_is_target_only_passthrough_pair", "_promote_unmatched_targets_to_passthrough_pairs",
     "_save_book_project_streaming", "_save_qa_summary_streaming",
     "run_book_orchestration",
 ]

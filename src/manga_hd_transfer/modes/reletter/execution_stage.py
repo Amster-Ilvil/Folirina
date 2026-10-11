@@ -19,6 +19,7 @@ from ...qa import run_direct_patch_qa, run_mask_replace_qa, run_page_qa
 from .pixel_stage import run_pixel_transfer_stage, _merge_mask_transfer
 from ...pipeline_transfer_authority import (
     collect_transfer_layout_authority,
+    apply_target_koharu_page_furniture_guard,
     _filter_completion_pairs_by_koharu_authority,
 )
 from ...pipeline_transfer_qa import (
@@ -106,7 +107,7 @@ def run_transfer_execution_stage(
     # Auxiliary detectors never gain destructive ownership.
     authority = collect_transfer_layout_authority(
         config=config, source=source, target=target, stage_cache=stage_cache,
-        cache_stats=cache_stats, source_path=source_path, target_path=target_path,
+        cache_stats=cache_stats, source_path=source_path, target_path=target_path, registration=registration,
     )
     source_layout_authority = authority.source
     target_layout_authority = authority.target
@@ -124,6 +125,11 @@ def run_transfer_execution_stage(
         cache_stats=cache_stats, target_path=target_path,
     )
     mask_transfer = pixel_state.mask_transfer
+    koharu_page_furniture_diag = apply_target_koharu_page_furniture_guard(
+        mask_transfer, target, target_layout_authority,
+    ) if mask_transfer is not None else {"enabled": False, "protected_items": 0, "restored_pixels": 0}
+    if cache_stats is not None:
+        cache_stats["koharu_page_furniture_guard"] = dict(koharu_page_furniture_diag)
     unseeded_white_pair_count = pixel_state.unseeded_white_pair_count
     completion_display_source = pixel_state.completion_display_source
     completion_display_target = pixel_state.completion_display_target
@@ -467,10 +473,30 @@ def run_transfer_execution_stage(
                     rendered[use] = mask_transfer.image[use]
 
         if mode == "reletter":
+            # QA must validate the regions that were actually accepted for
+            # publication, not every OCR proposal that was deliberately held for
+            # review. Feeding all matched-but-low-confidence proposals into
+            # run_page_qa creates false lettering_missing errors for regions we
+            # intentionally did not erase or typeset.
+            accepted_source_ids = {m.source_unit_id for m in fallback_matches}
+            accepted_target_ids = {m.target_unit_id for m in fallback_matches}
+            qa_source_units = [u for u in source_units if u.id in accepted_source_ids]
+            qa_target_units = [u for u in target_units if u.id in accepted_target_ids]
             qa = run_page_qa(
-                pair, registration, source_units, target_units, matches, lettering,
+                pair, registration, qa_source_units, qa_target_units, fallback_matches, lettering,
                 mask_result, inpaint_result.image, config.qa,
             )
+            held_for_review = [
+                u for u in source_units
+                if u.id not in accepted_source_ids
+                and str(getattr(u, "text", "") or "").strip()
+            ]
+            for unit in held_for_review:
+                qa.append(QAItem(
+                    "reletter_ocr_review", "warning",
+                    "OCR transcript was kept out of automatic lettering because confidence was below the publication threshold; TARGET pixels were preserved for manual review.",
+                    unit.id, float(getattr(unit, "confidence", 0.0)), float(config.qa.ocr_min_confidence),
+                ))
             # In target-driven Reletter, deterministic paired-ID binding plus a
             # valid registration supersedes only the *initial* page-pair
             # heuristic. Keep the diagnostic visible, but do not report a false

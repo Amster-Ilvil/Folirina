@@ -20,6 +20,8 @@ from .pixel_stage import run_pixel_transfer_stage, _merge_mask_transfer
 from ...pipeline_transfer_authority import (
     collect_transfer_layout_authority,
     _filter_completion_pairs_by_koharu_authority,
+    apply_target_koharu_protect_guard,
+    apply_target_koharu_page_furniture_guard,
 )
 from ...pipeline_transfer_qa import (
     _append_koharu_semantic_coverage_qa,
@@ -111,7 +113,7 @@ def run_transfer_execution_stage(
     # Auxiliary detectors never gain destructive ownership.
     authority = collect_transfer_layout_authority(
         config=config, source=source, target=target, stage_cache=stage_cache,
-        cache_stats=cache_stats, source_path=source_path, target_path=target_path,
+        cache_stats=cache_stats, source_path=source_path, target_path=target_path, registration=registration,
     )
     source_layout_authority = authority.source
     target_layout_authority = authority.target
@@ -129,6 +131,16 @@ def run_transfer_execution_stage(
         cache_stats=cache_stats, target_path=target_path,
     )
     mask_transfer = pixel_state.mask_transfer
+    koharu_protect_diag = apply_target_koharu_protect_guard(
+        mask_transfer, target, target_layout_authority, allow_dilate_px=12,
+    ) if mask_transfer is not None else {"enabled": False, "protect_pixels": 0, "restored_pixels": 0, "mask_pixels_removed": 0}
+    if cache_stats is not None:
+        cache_stats["koharu_target_protect_guard"] = dict(koharu_protect_diag)
+    koharu_page_furniture_diag = apply_target_koharu_page_furniture_guard(
+        mask_transfer, target, target_layout_authority,
+    ) if mask_transfer is not None else {"enabled": False, "protected_items": 0, "restored_pixels": 0}
+    if cache_stats is not None:
+        cache_stats["koharu_page_furniture_guard"] = dict(koharu_page_furniture_diag)
     unseeded_white_pair_count = pixel_state.unseeded_white_pair_count
     completion_display_source = pixel_state.completion_display_source
     completion_display_target = pixel_state.completion_display_target

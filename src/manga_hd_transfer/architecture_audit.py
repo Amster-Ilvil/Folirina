@@ -134,6 +134,7 @@ def run_architecture_audit() -> dict:
     project_assembly_src = _read_text(package_root / "pipeline_project_assembly.py")
     reveal_persistence_src = _read_text(package_root / "pipeline_reveal_persistence.py")
     gui_src = _read_text(package_root / "gui_qt.py")
+    studio_ocr_editor_src = _read_text(package_root / "studio_ocr_editor.py")
     mode_cross_import_violations = _mode_package_cross_import_violations(package_root)
     shared_renderer_import_violations = _shared_renderer_import_violations(package_root)
     private_file_checks = _active_mode_private_file_checks(package_root)
@@ -233,10 +234,10 @@ def run_architecture_audit() -> dict:
             and "from .pipeline_reveal_persistence import emit_transparent_bubble_page" not in pipeline_route_src
         ),
         "gui_ocr_editor_dispatches_private_mode_modules": (
-            "from .modes.reletter import ocr_edit_blocks as _reletter_ocr_edit_blocks" in gui_src
-            and "from .modes.hybrid import ocr_edit_blocks as _hybrid_ocr_edit_blocks" in gui_src
-            and "from .ocr_edit_blocks import" not in gui_src
-            and "from .ocr_edit_render import" not in gui_src
+            "from .modes.reletter import ocr_edit_blocks as _reletter_ocr_edit_blocks" in studio_ocr_editor_src
+            and "from .modes.hybrid import ocr_edit_blocks as _hybrid_ocr_edit_blocks" in studio_ocr_editor_src
+            and "from .ocr_edit_blocks import" not in studio_ocr_editor_src
+            and "from .ocr_edit_render import" not in studio_ocr_editor_src
         ),
         "pixel_stage_has_no_shared_reletter_renderer_helpers": (
             "from .reletter_binding import" not in pipeline_src

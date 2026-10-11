@@ -423,6 +423,8 @@ def transfer_koharu_semantic_regions(
     *,
     exclude_mask: np.ndarray | None = None,
     include_sfx: bool = False,
+    bubble_min_confidence: float | None = None,
+    text_min_confidence: float | None = None,
 ) -> MaskTransferResult:
     """Recover Koharu regions missed by container pairing without OCR.
 
@@ -455,8 +457,19 @@ def transfer_koharu_semantic_regions(
     patch_matches: list[BubblePatchMatch] = []
 
     max_overlap = float(getattr(cfg, "koharu_semantic_max_existing_overlap", 0.28))
-    bubble_min = float(getattr(cfg, "koharu_semantic_bubble_min_confidence", 0.70))
-    text_min = float(getattr(cfg, "koharu_semantic_text_min_confidence", 0.75))
+    # A selected primary detector owns candidate admission.  Do not silently
+    # re-threshold a Koharu bubble/text above the threshold that already admitted
+    # it at the layout stage; doing so creates the confusing state "detected in
+    # overlay, never replaced".  Renderer-specific floors remain the fallback
+    # only when no primary threshold was supplied.
+    bubble_min = float(
+        bubble_min_confidence if bubble_min_confidence is not None
+        else getattr(cfg, "koharu_semantic_bubble_min_confidence", 0.70)
+    )
+    text_min = float(
+        text_min_confidence if text_min_confidence is not None
+        else getattr(cfg, "koharu_semantic_text_min_confidence", 0.75)
+    )
     change_min = float(getattr(cfg, "koharu_semantic_standalone_min_change_ratio", 0.18))
 
     bubbles = [x for x in list(getattr(evidence, "items", []) or []) if str(getattr(x, "label", "")) == "bubble"]
@@ -1822,6 +1835,7 @@ def transfer_paired_diff_regions(
         _evaluate_content_completeness(
             rec, src_audit, tgt_audit, rendered, cfg,
             tolerance_px=audit_tol,
+            target_invalidation_mask=write_mask,
         )
         if region_kind == "bubble" and not rec.content_complete:
             repaired, repaired_mask, repair_diag = _repair_content_region(
@@ -2387,6 +2401,7 @@ def transfer_bubble_patches(
         _evaluate_content_completeness(
             rec, src_audit, tgt_audit, rendered, cfg,
             tolerance_px=max(3, 5 if is_photo_pair else 3),
+            target_invalidation_mask=paste_mask,
         )
         records.append(rec)
 

@@ -28,7 +28,10 @@ from .geometry_ops import BubblePatchMatch
 from .transfer_models import MaskTransferRecord, MaskTransferResult
 from ...models import BubbleInstance, RegistrationResult
 from ...plugins import REGISTRY as PROVIDER_REGISTRY
-from .text_transfer import transfer_text_only, target_container_border_mask, target_text_mask_in_container
+from .text_transfer import (
+    transfer_text_only, target_container_border_mask, target_text_mask_in_container,
+    target_white_container_text_mask,
+)
 from .overlay import compose_direct_overlay
 from .content_audit import _evaluate_content_completeness
 
@@ -40,6 +43,213 @@ class DirectContainerPlan:
     target_bubbles: list[BubbleInstance]
     diagnostics: dict
     safe_to_skip_other_paths: bool
+
+
+def _complete_white_source_hint_semantic_authority(
+    base_mask: np.ndarray,
+    source_semantic_text: np.ndarray | None,
+    target_semantic_text: np.ndarray | None,
+    cfg,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Complete an under-segmented white Direct hint with glyph pixels only."""
+    base = np.asarray(base_mask) > 0
+    out = base.copy()
+    diag: dict[str, object] = {
+        "enabled": bool(getattr(cfg, "source_direct_semantic_hint_completion_enabled", True)),
+        "applied": False, "reason": "disabled", "added_pixels": 0,
+    }
+    if not diag["enabled"]:
+        return out, diag
+    shape = base.shape
+    if not isinstance(source_semantic_text, np.ndarray) or source_semantic_text.shape != shape:
+        diag["reason"] = "source_semantic_unavailable"; return out, diag
+    if not isinstance(target_semantic_text, np.ndarray) or target_semantic_text.shape != shape:
+        diag["reason"] = "target_semantic_unavailable"; return out, diag
+    src = source_semantic_text > 0; tgt = target_semantic_text > 0
+    min_pixels = max(1, int(getattr(cfg, "source_direct_semantic_hint_completion_min_pixels", 18)))
+    if int(np.count_nonzero(src)) < min_pixels or int(np.count_nonzero(tgt)) < min_pixels:
+        diag["reason"] = "insufficient_bilateral_text"; return out, diag
+    max_dist = max(0, int(getattr(cfg, "source_direct_semantic_hint_completion_max_distance_px", 96)))
+    if max_dist <= 0:
+        diag["reason"] = "zero_distance"; return out, diag
+    dist = cv2.distanceTransform((~base).astype(np.uint8), cv2.DIST_L2, 3)
+    # TARGET text is bilateral proof / erase authority only.  Writable completion
+    # comes exclusively from SOURCE semantic glyphs; otherwise a coarse TARGET
+    # detection that spills onto hair/artwork can authorize SOURCE pixels there.
+    semantic = src
+    addition = semantic & (dist <= float(max_dist)) & ~base
+    add_px = int(np.count_nonzero(addition)); base_px = max(1, int(np.count_nonzero(base)))
+    max_ratio = float(getattr(cfg, "source_direct_semantic_hint_completion_max_added_ratio", 0.80))
+    if add_px <= 0:
+        diag["reason"] = "no_missing_semantic_pixels"; return out, diag
+    if add_px / base_px > max_ratio:
+        diag.update({"reason": "semantic_addition_too_large", "added_pixels": add_px,
+                     "added_ratio": round(add_px / base_px, 6)})
+        return out, diag
+    out[addition] = True
+    diag.update({
+        "applied": True, "reason": "nearby_bilateral_semantic_glyph_completion",
+        "added_pixels": add_px, "added_ratio": round(add_px / base_px, 6),
+        "source_semantic_pixels": int(np.count_nonzero(src)),
+        "target_semantic_pixels": int(np.count_nonzero(tgt)),
+        "max_distance_px": max_dist,
+    })
+    return out, diag
+
+
+def _bounded_target_semantic_clear_authority(
+    base_clear_mask: np.ndarray,
+    target_semantic_text: np.ndarray | None,
+    cfg,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Extend TARGET erase authority only by a tiny touching semantic fringe.
+
+    This authority is deliberately independent from SOURCE write authority.  A
+    target semantic component must already touch the trusted clear geometry, and
+    only pixels within a small distance of that geometry may be added.  Coarse
+    detector spill farther into hair/artwork therefore stays protected.
+    """
+    base = np.asarray(base_clear_mask) > 0
+    out = base.copy()
+    diag: dict[str, object] = {
+        "enabled": bool(getattr(cfg, "source_direct_semantic_target_clear_fringe_enabled", True)),
+        "applied": False, "reason": "disabled", "added_pixels": 0, "accepted_components": 0,
+    }
+    if not diag["enabled"]:
+        return out, diag
+    if not isinstance(target_semantic_text, np.ndarray) or target_semantic_text.shape != base.shape:
+        diag["reason"] = "target_semantic_unavailable"; return out, diag
+    sem = (target_semantic_text > 0).astype(np.uint8)
+    if not np.any(sem) or not np.any(base):
+        diag["reason"] = "empty_evidence"; return out, diag
+    max_dist = max(0, int(getattr(cfg, "source_direct_semantic_target_clear_fringe_max_distance_px", 6)))
+    if max_dist <= 0:
+        diag["reason"] = "zero_distance"; return out, diag
+    seed_dilate = max(0, int(getattr(cfg, "source_direct_semantic_target_clear_fringe_seed_dilate_px", 1)))
+    seed = base.astype(np.uint8) * 255
+    if seed_dilate > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * seed_dilate + 1, 2 * seed_dilate + 1))
+        seed = cv2.dilate(seed, k, iterations=1)
+    min_seed = max(1, int(getattr(cfg, "source_direct_semantic_target_clear_fringe_min_seed_pixels", 4)))
+    dist = cv2.distanceTransform((~base).astype(np.uint8), cv2.DIST_L2, 3)
+    labels_n, labels = cv2.connectedComponents(sem, 8)
+    addition = np.zeros(base.shape, bool)
+    accepted = 0
+    for lab in range(1, labels_n):
+        comp = labels == lab
+        if int(np.count_nonzero(comp & (seed > 0))) < min_seed:
+            continue
+        fringe = comp & ~base & (dist <= float(max_dist))
+        if np.any(fringe):
+            addition |= fringe
+            accepted += 1
+    add_px = int(np.count_nonzero(addition)); base_px = max(1, int(np.count_nonzero(base)))
+    max_ratio = max(0.0, float(getattr(cfg, "source_direct_semantic_target_clear_fringe_max_added_ratio", 0.35)))
+    if add_px <= 0:
+        diag["reason"] = "no_touching_semantic_fringe"; return out, diag
+    if add_px / base_px > max_ratio:
+        diag.update({"reason": "target_semantic_fringe_too_large", "added_pixels": add_px,
+                     "added_ratio": round(add_px / base_px, 6), "accepted_components": accepted})
+        return out, diag
+    out[addition] = True
+    diag.update({"applied": True, "reason": "bounded_touching_target_semantic_fringe",
+                 "added_pixels": add_px, "added_ratio": round(add_px / base_px, 6),
+                 "accepted_components": accepted, "max_distance_px": max_dist})
+    return out, diag
+
+
+def _crop_semantic_text_context(
+    semantic_text_mask: np.ndarray | None,
+    *,
+    source_shape: tuple[int, ...],
+    crop_bounds: tuple[int, int, int, int],
+    fallback_shape: tuple[int, int],
+) -> np.ndarray:
+    """Keep semantic glyph evidence inside the bounded candidate crop.
+
+    The detector/refiner mask is intentionally allowed to under-segment text.
+    Clipping semantic evidence to that same mask before semantic completion made
+    completion impossible by construction.  The crop rectangle is already a
+    bounded spatial authority, so retain semantic pixels within it and let the
+    later distance/ratio gates decide which pixels may become writable support.
+    """
+    if not isinstance(semantic_text_mask, np.ndarray) or semantic_text_mask.shape[:2] != source_shape[:2]:
+        return np.zeros(fallback_shape, np.uint8)
+    sx0, sy0, sx1, sy1 = crop_bounds
+    return semantic_text_mask[sy0:sy1, sx0:sx1].copy()
+
+
+def _semantic_supported_content_audit_mask(
+    source_ink_mask: np.ndarray | None,
+    semantic_source_text_mask: np.ndarray | None,
+    cfg: MaskReplaceConfig | DirectPatchConfig,
+) -> tuple[np.ndarray | None, dict]:
+    """Remove non-text structural ink from Direct completeness evidence.
+
+    ``source_ink_mask`` is the renderer's compact dark-pixel estimate.  On small
+    white balloons it can occasionally pick up a border/tail fragment as one
+    extra connected component.  Koharu's SOURCE text evidence gives us an
+    independent semantic support map.  We *do not* audit the filled semantic
+    mask itself; instead we keep only literal SOURCE ink that lies on (or within
+    a tiny tolerance of) that semantic text evidence.
+
+    The filtered mask is accepted only when it retains a substantial majority
+    of the original literal ink.  This prevents a weak/partial detector mask
+    from hiding a genuinely missing glyph.  With insufficient semantic support
+    the caller receives the original mask unchanged.
+    """
+    diag = {
+        "enabled": bool(getattr(cfg, "content_audit_semantic_support_enabled", True)),
+        "used": False,
+        "reason": "unavailable",
+        "source_pixels": 0,
+        "semantic_pixels": 0,
+        "supported_pixels": 0,
+        "retained_ratio": 0.0,
+    }
+    if source_ink_mask is None:
+        return source_ink_mask, diag
+    src = (source_ink_mask > 0).astype(np.uint8) * 255
+    src_count = int(cv2.countNonZero(src))
+    diag["source_pixels"] = src_count
+    if not diag["enabled"]:
+        diag["reason"] = "disabled"
+        return src, diag
+    if (
+        semantic_source_text_mask is None
+        or semantic_source_text_mask.shape != src.shape
+    ):
+        diag["reason"] = "semantic_shape_unavailable"
+        return src, diag
+    sem = (semantic_source_text_mask > 0).astype(np.uint8) * 255
+    sem_count = int(cv2.countNonZero(sem))
+    diag["semantic_pixels"] = sem_count
+    min_ink = max(1, int(getattr(cfg, "content_completeness_min_ink_pixels", 18)))
+    if src_count < min_ink or sem_count < min_ink:
+        diag["reason"] = "insufficient_evidence"
+        return src, diag
+
+    dilate_px = max(0, int(getattr(cfg, "content_audit_semantic_support_dilate_px", 2)))
+    if dilate_px > 0:
+        sem = cv2.dilate(
+            sem,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_px * 2 + 1, dilate_px * 2 + 1)),
+        )
+    supported = cv2.bitwise_and(src, sem)
+    supported_count = int(cv2.countNonZero(supported))
+    retained_ratio = float(supported_count / max(1, src_count))
+    diag["supported_pixels"] = supported_count
+    diag["retained_ratio"] = retained_ratio
+    min_retained = float(getattr(cfg, "content_audit_semantic_support_min_retained_ratio", 0.65))
+    if supported_count < min_ink:
+        diag["reason"] = "supported_ink_too_small"
+        return src, diag
+    if retained_ratio < min_retained:
+        diag["reason"] = "semantic_support_too_partial"
+        return src, diag
+    diag["used"] = True
+    diag["reason"] = "koharu_semantic_text_supported_literal_ink"
+    return supported, diag
 
 
 def _mapped_bbox(coord_space: SourceCoordinateSpace, bbox: tuple[int, int, int, int], target_shape: tuple[int, int], pad: int = 6) -> list[int]:
@@ -234,11 +444,12 @@ def _warp_similarity_patch(
     crop_mask: np.ndarray,
     crop_boundary: np.ndarray,
     crop_origin: tuple[int, int],
+    extra_mask: np.ndarray | None,
     source_center: tuple[float, float],
     target_center: tuple[float, float],
     scale: float,
     angle_deg: float,
-) -> tuple[int, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[int, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Warp one source container by a shape-preserving local similarity only."""
     sx0, sy0 = crop_origin
     cx, cy = source_center
@@ -256,6 +467,7 @@ def _warp_similarity_patch(
             return (
                 int(sx0 + rdx), int(sy0 + rdy),
                 crop.copy(), crop_gray.copy(), crop_mask.copy(), crop_boundary.copy(),
+                (extra_mask.copy() if isinstance(extra_mask, np.ndarray) else np.zeros(crop_mask.shape, np.uint8)),
             )
     rad = math.radians(float(angle_deg))
     c, s = math.cos(rad), math.sin(rad)
@@ -291,7 +503,14 @@ def _warp_similarity_patch(
         crop_boundary, M, (out_w, out_h), flags=cv2.INTER_NEAREST,
         borderMode=cv2.BORDER_CONSTANT, borderValue=0,
     )
-    return base_x, base_y, warped_crop, warped_gray, warped_mask, warped_boundary
+    if isinstance(extra_mask, np.ndarray) and extra_mask.shape[:2] == crop_mask.shape[:2]:
+        warped_extra = cv2.warpAffine(
+            extra_mask, M, (out_w, out_h), flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+        )
+    else:
+        warped_extra = np.zeros((out_h, out_w), np.uint8)
+    return base_x, base_y, warped_crop, warped_gray, warped_mask, warped_boundary, warped_extra
 
 
 def _boundary_alignment_score(
@@ -928,7 +1147,22 @@ def _restore_damaged_target_structural_lines(
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * band_px + 1, 2 * band_px + 1)),
         iterations=1,
     ) > 0
-    core_candidates = lost_dark & edge_strip & band
+    compact_text = target_text_mask_in_container(target_before, geom * 255)
+    white_text = target_white_container_text_mask(target_before, geom * 255)
+    text_exclusion = cv2.bitwise_or(compact_text, white_text)
+    text_dilate = max(0, int(getattr(cfg, "direct_post_structural_restore_text_exclusion_dilate_px", 2)))
+    if text_dilate > 0 and cv2.countNonZero(text_exclusion) > 0:
+        text_exclusion = cv2.dilate(
+            text_exclusion, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * text_dilate + 1, 2 * text_dilate + 1))
+        )
+    structural_authority = target_container_border_mask(
+        target_before, geom * 255, band_px=max(3, band_px)
+    ) > 0
+    blocked_text = (text_exclusion > 0) & ~structural_authority
+    diag["target_text_exclusion_pixels"] = int(cv2.countNonZero(text_exclusion))
+    diag["structural_authority_pixels"] = int(np.count_nonzero(structural_authority))
+    diag["blocked_text_lost_pixels"] = int(np.count_nonzero(lost_dark & blocked_text))
+    core_candidates = lost_dark & edge_strip & band & ~blocked_text
     n, labels, stats, _ = cv2.connectedComponentsWithStats(core_candidates.astype(np.uint8), 8)
     restore_core = np.zeros(geom.shape, np.uint8)
     min_area = max(3, int(getattr(cfg, "direct_post_structural_restore_min_area_px", 10)))
@@ -962,7 +1196,7 @@ def _restore_damaged_target_structural_lines(
     if fringe_px > 0:
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * fringe_px + 1, 2 * fringe_px + 1))
         halo = cv2.dilate(restore_core, k, iterations=1) > 0
-        restore |= halo & changed & (tg <= int(getattr(cfg, "direct_post_structural_restore_fringe_gray_max", 238)))
+        restore |= halo & changed & (tg <= int(getattr(cfg, "direct_post_structural_restore_fringe_gray_max", 238))) & ~blocked_text
     restore_u8 = restore.astype(np.uint8) * 255
     out = candidate.copy()
     out[restore] = target_before[restore]
@@ -1039,6 +1273,8 @@ def build_source_direct_container_plan(
     registration: RegistrationResult,
     cfg: MaskReplaceConfig | DirectPatchConfig | None = None,
     source_hint_bubbles: list[BubbleInstance] | None = None,
+    source_semantic_text_mask: np.ndarray | None = None,
+    target_semantic_text_mask: np.ndarray | None = None,
 ) -> DirectContainerPlan | None:
     """Build and render a fast whole-container plan from the translated source.
 
@@ -1328,6 +1564,12 @@ def build_source_direct_container_plan(
         crop = source[sy0:sy1, sx0:sx1]
         crop_gray = source_gray[sy0:sy1, sx0:sx1]
         crop_mask = inner[sy0:sy1, sx0:sx1]
+        crop_semantic_text = _crop_semantic_text_context(
+            source_semantic_text_mask,
+            source_shape=source.shape,
+            crop_bounds=(sx0, sy0, sx1, sy1),
+            fallback_shape=crop_mask.shape,
+        )
         # Boundary is a guide only; it is not part of crop_mask.
         crop_boundary = cv2.morphologyEx(
             filled[sy0:sy1, sx0:sx1], cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8)
@@ -1407,9 +1649,9 @@ def build_source_direct_container_plan(
             candidate_angle = local_angle + float(ad)
             warped = _warp_similarity_patch(
                 crop, crop_gray, crop_mask, crop_boundary,
-                (sx0, sy0), (cx, cy), (tcx, tcy), candidate_scale, candidate_angle,
+                (sx0, sy0), crop_semantic_text, (cx, cy), (tcx, tcy), candidate_scale, candidate_angle,
             )
-            bx, by, wcrop, wgray, wmask, wboundary = warped
+            bx, by, wcrop, wgray, wmask, wboundary, wsemantic = warped
             score, dx0, dy0 = _boundary_alignment_score(
                 wboundary, bx, by, target_edge_distance, search, coarse_step=coarse_step,
             )
@@ -1450,7 +1692,7 @@ def build_source_direct_container_plan(
                         ch = _ink_change_score(sg, tg, vm.astype(np.uint8) * 255)
                         floor = float(getattr(cfg, "source_direct_white_min_ink_change", 0.07)) if white_ok else float(getattr(cfg, "source_direct_colored_min_ink_change", 0.18))
                         viable = ch > floor
-            variant_candidates.append((float(score), bool(viable), int(dx0), int(dy0), (candidate_scale, candidate_angle, bx, by, wcrop, wgray, wmask, wboundary)))
+            variant_candidates.append((float(score), bool(viable), int(dx0), int(dy0), (candidate_scale, candidate_angle, bx, by, wcrop, wgray, wmask, wboundary, wsemantic)))
 
         # The page registration already supplies the most likely local scale and
         # rotation. Pixel-locked same-canvas regions bypass the warp/refine path
@@ -1460,7 +1702,7 @@ def build_source_direct_container_plan(
             variant_candidates.append((
                 float(identity_raw_boundary_score if identity_raw_boundary_score is not None else 0.0),
                 True, 0, 0,
-                (1.0, 0.0, sx0, sy0, crop.copy(), crop_gray.copy(), crop_mask.copy(), crop_boundary.copy()),
+                (1.0, 0.0, sx0, sy0, crop.copy(), crop_gray.copy(), crop_mask.copy(), crop_boundary.copy(), crop_semantic_text.copy()),
             ))
         else:
             probe_variant(1.0, 0.0)
@@ -1477,7 +1719,7 @@ def build_source_direct_container_plan(
         best_score, _best_viable, best_dx, best_dy, best_variant = chosen
 
         # One exact translation refinement around the best coarse solution.
-        chosen_scale, chosen_angle, base_x, base_y, resized_crop, resized_gray, resized_mask, resized_boundary = best_variant
+        chosen_scale, chosen_angle, base_x, base_y, resized_crop, resized_gray, resized_mask, resized_boundary, resized_semantic_text = best_variant
         if identity_lock:
             fine_score, fine_dx, fine_dy = float(best_score), 0, 0
             best_dx = best_dy = 0
@@ -1528,6 +1770,11 @@ def build_source_direct_container_plan(
         original_local_raster_mask = local_mask.copy()
         local_src = resized_crop[oy0:oy1, ox0:ox1]
         local_src_gray = resized_gray[oy0:oy1, ox0:ox1]
+        local_semantic_source_text = resized_semantic_text[oy0:oy1, ox0:ox1].copy()
+        if isinstance(target_semantic_text_mask, np.ndarray) and target_semantic_text_mask.shape[:2] == target.shape[:2]:
+            local_semantic_target_text = target_semantic_text_mask[ty0:ty1, tx0:tx1].copy()
+        else:
+            local_semantic_target_text = np.zeros(local_mask.shape, np.uint8)
         local_tgt_gray = target_gray[ty0:ty1, tx0:tx1]
         local_tgt_hsv = target_hsv[ty0:ty1, tx0:tx1]
         local_registered_geometry = registered_inner[ty0:ty1, tx0:tx1] > 0
@@ -1749,6 +1996,10 @@ def build_source_direct_container_plan(
                     local_src_gray, M_text, (local_src_gray.shape[1], local_src_gray.shape[0]),
                     flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REPLICATE,
                 )
+                local_semantic_source_text = cv2.warpAffine(
+                    local_semantic_source_text, M_text, (local_semantic_source_text.shape[1], local_semantic_source_text.shape[0]),
+                    flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+                )
 
         # v1.0.7: Direct is now a *text-only* transfer contract on colour masters.
         # SOURCE background RGB is never permitted to enter TARGET, even for a
@@ -1758,7 +2009,40 @@ def build_source_direct_container_plan(
         # ink over the original TARGET artwork.
         dst_region = rendered[ty0:ty1, tx0:tx1]
         target_region_before = dst_region.copy()
+        semantic_hint_completion_diag = {"enabled": False, "applied": False, "reason": "not_white_source_hint"}
+        target_semantic_clear_diag = {"enabled": False, "applied": False, "reason": "not_white_source_hint"}
+        if white_mode and is_source_hint:
+            local_mask, semantic_hint_completion_diag = _complete_white_source_hint_semantic_authority(
+                local_mask, local_semantic_source_text, local_semantic_target_text, cfg
+            )
+            # TARGET erase authority is independent from SOURCE completion.  Even
+            # when SOURCE is already complete, TARGET glyphs may protrude a few
+            # pixels beyond the registered clear geometry (p0135 class).
+            local_target_clear_geometry, target_semantic_clear_diag = _bounded_target_semantic_clear_authority(
+                local_target_clear_geometry, local_semantic_target_text, cfg
+            )
+            semantic_hint_completion_diag["target_clear"] = dict(target_semantic_clear_diag)
+        # ``original_local_raster_mask`` is the detector/refiner support that made
+        # this Direct candidate safe in the first place.  Semantic hint completion
+        # may add *glyph pixels only* outside that under-segmented support.  Passing
+        # the old support unchanged to ``compose_direct_overlay`` makes its strict
+        # support guard clip those proven glyphs a second time, undoing the
+        # completion.  Extend support only by the semantic pixels that the bounded
+        # completion actually admitted; never by a rectangle or arbitrary raster.
+        overlay_support_mask = original_local_raster_mask.copy()
+        if bool(semantic_hint_completion_diag.get("applied", False)):
+            # SOURCE semantic evidence alone may expand writable/support pixels.
+            # TARGET semantic evidence is erase-only and is handled independently.
+            semantic_support = (local_semantic_source_text > 0)
+            semantic_completed_support = local_mask & semantic_support
+            overlay_support_mask = overlay_support_mask | semantic_completed_support
+            semantic_hint_completion_diag["overlay_support_added_pixels"] = int(
+                np.count_nonzero(overlay_support_mask & ~original_local_raster_mask)
+            )
         region_u8 = local_mask.astype(np.uint8) * 255
+        forced_source_text = cv2.bitwise_and(local_semantic_source_text, region_u8)
+        target_clear_u8 = local_target_clear_geometry.astype(np.uint8) * 255
+        forced_target_text = cv2.bitwise_and(local_semantic_target_text, target_clear_u8)
         candidate_region_ratio = float(np.count_nonzero(region_u8) / max(1, th * tw))
         complete_white_ink = bool(
             white_mode
@@ -1768,12 +2052,14 @@ def build_source_direct_container_plan(
             candidate_region, local_write_mask, local_source_text_mask, colored_transfer_diag = compose_direct_overlay(
                 dst_region.copy(), local_src, region_u8,
                 white_mode=bool(complete_white_ink),
-                support_mask=original_local_raster_mask.astype(np.uint8) * 255,
+                support_mask=overlay_support_mask.astype(np.uint8) * 255,
                 border_guard_px=max(0, int(getattr(cfg, "direct_white_overlay_border_guard_px", 2))),
                 clear_target_text=bool(getattr(cfg, "direct_clear_target_text_before_overlay", True)),
                 clear_dilate_px=max(0, int(getattr(cfg, "source_direct_colored_clear_dilate_px", 1))),
                 inpaint_radius=float(getattr(cfg, "source_direct_colored_inpaint_radius", 2.5)),
                 target_clear_region_mask=local_target_clear_geometry.astype(np.uint8) * 255 if white_mode else None,
+                forced_target_clear_mask=forced_target_text if cv2.countNonZero(forced_target_text) > 0 else None,
+                forced_source_text_mask=forced_source_text if cv2.countNonZero(forced_source_text) > 0 else None,
                 white_source_clarity_enabled=bool(getattr(cfg, "direct_white_clarity_enhance_enabled", True)),
                 white_source_clarity_alpha_gamma=float(getattr(cfg, "direct_white_clarity_alpha_gamma", 1.0)),
                 white_source_clarity_black_boost=int(getattr(cfg, "direct_white_clarity_black_boost", 0)),
@@ -1788,6 +2074,7 @@ def build_source_direct_container_plan(
                 post_structural_restore_min_area_px=int(getattr(cfg, "direct_post_structural_restore_min_area_px", 10)),
                 post_structural_restore_fringe_px=int(getattr(cfg, "direct_post_structural_restore_fringe_px", 1)),
                 post_structural_restore_fringe_gray_max=int(getattr(cfg, "direct_post_structural_restore_fringe_gray_max", 238)),
+                post_structural_restore_text_exclusion_dilate_px=int(getattr(cfg, "direct_post_structural_restore_text_exclusion_dilate_px", 2)),
             )
         else:
             candidate_region, local_write_mask, local_source_text_mask, colored_transfer_diag = transfer_text_only(
@@ -1805,9 +2092,13 @@ def build_source_direct_container_plan(
                 white_clear_inset_px=int(getattr(cfg, "white_container_clear_inset_px", 0)),
                 white_clear_border_guard_px=int(getattr(cfg, "white_container_clear_border_guard_px", 0)),
                 target_clear_region_mask=local_target_clear_geometry.astype(np.uint8) * 255 if white_mode else None,
+                forced_target_clear_mask=forced_target_text if cv2.countNonZero(forced_target_text) > 0 else None,
+                forced_source_text_mask=forced_source_text if cv2.countNonZero(forced_source_text) > 0 else None,
             )
         colored_transfer_diag["complete_white_ink"] = bool(complete_white_ink)
         colored_transfer_diag["candidate_region_ratio"] = float(candidate_region_ratio)
+        colored_transfer_diag["koharu_semantic_source_text_pixels"] = int(cv2.countNonZero(forced_source_text))
+        colored_transfer_diag["koharu_semantic_target_text_pixels"] = int(cv2.countNonZero(forced_target_text))
         colored_transfer_diag["text_raster_shift"] = text_raster_shift_diag
 
         # A face/shirt can accidentally satisfy a loose low-saturation "white"
@@ -2012,6 +2303,7 @@ def build_source_direct_container_plan(
         rec.local_dx = float(text_raster_dx); rec.local_dy = float(text_raster_dy)
         rec.meta["geometry_local_shift"] = {"dx": int(best_dx), "dy": int(best_dy)}
         rec.meta["text_raster_local_shift"] = dict(text_raster_shift_diag)
+        rec.meta["semantic_hint_completion"] = dict(semantic_hint_completion_diag)
         rec.meta["text_only_transfer"] = dict(colored_transfer_diag)
         rec.meta["direct_transform_contract"] = {
             "source_on_top": bool(getattr(cfg, "direct_source_on_top", True)),
@@ -2061,14 +2353,33 @@ def build_source_direct_container_plan(
             0.92 if source_fidelity_audit else 0.94,
             float(getattr(cfg, "content_completeness_min_source_coverage", 0.90)),
         )
+        source_audit_mask = local_source_text_mask
+        semantic_audit_diag = {
+            "enabled": False,
+            "used": False,
+            "reason": "not_source_fidelity_audit",
+        }
+        if source_fidelity_audit:
+            source_audit_mask, semantic_audit_diag = _semantic_supported_content_audit_mask(
+                local_source_text_mask,
+                forced_source_text,
+                cfg,
+            )
         _evaluate_content_completeness(
-            rec, local_source_text_mask, target_audit_mask, dst_region, cfg,
+            rec, source_audit_mask, target_audit_mask, dst_region, cfg,
             tolerance_px=max(2, int(getattr(cfg, "content_completeness_tolerance_px", 2))),
             min_source_coverage=audit_min_source_coverage,
             max_target_residual=min(0.06, float(getattr(cfg, "content_completeness_max_target_residual", 0.10))),
+            target_invalidation_mask=local_write_mask,
         )
         rec.meta["content_audit_min_source_coverage"] = float(audit_min_source_coverage)
         rec.meta["source_raster_fidelity_audit"] = bool(source_fidelity_audit)
+        rec.meta["content_audit_semantic_source_support"] = dict(semantic_audit_diag)
+        rec.meta["content_audit_source_basis"] = (
+            "koharu_semantic_supported_literal_ink"
+            if bool(semantic_audit_diag.get("used"))
+            else "renderer_compact_source_ink"
+        )
         if not bool(rec.content_complete):
             rec.review_required = True
             rec.review_reason = "direct_content_incomplete_after_render"

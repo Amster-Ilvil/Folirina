@@ -204,6 +204,12 @@ def _merge_mask_transfer(base, extra):
         if base.clear_mask is None:
             base.clear_mask = np.zeros_like(base.composite_mask)
         base.clear_mask = np.maximum(base.clear_mask, extra.clear_mask)
+    extra_allow = getattr(extra, "authority_allow_mask", None)
+    if isinstance(extra_allow, np.ndarray) and extra_allow.shape == base.composite_mask.shape:
+        base_allow = getattr(base, "authority_allow_mask", None)
+        if not isinstance(base_allow, np.ndarray) or base_allow.shape != base.composite_mask.shape:
+            base.authority_allow_mask = np.zeros_like(base.composite_mask)
+        base.authority_allow_mask = np.maximum(base.authority_allow_mask, extra_allow)
     base.matches.extend(extra.matches)
     base.records.extend(extra.records)
     return base
@@ -520,6 +526,8 @@ def run_pixel_transfer_stage(
                 semantic_cfg,
                 exclude_mask=semantic_exclude_mask,
                 include_sfx=bool(getattr(semantic_cfg, "koharu_semantic_include_sfx", False)),
+                bubble_min_confidence=float(getattr(config.bubbles, "koharu_layout_bubble_threshold", 0.50)),
+                text_min_confidence=float(getattr(config.bubbles, "koharu_layout_text_threshold", 0.25)),
             )
             if cache_stats is not None:
                 cache_stats["koharu_semantic_candidates"] = str(len(semantic_extra.records))

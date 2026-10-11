@@ -87,6 +87,10 @@ def page_completion_message(project: Any, *, reprocessed: bool = False) -> str:
     prefix = "重新处理完成" if reprocessed else "当前页处理完成"
     if run_status == "partial":
         return f"{prefix} · 部分区域成功，仍有区域失败或需复核 · 已应用 {applied} 个区域"
+    if run_status == "degraded":
+        degraded = dict(meta.get("degraded") or {}) if isinstance(meta.get("degraded"), dict) else {}
+        fallback = str(degraded.get("fallback") or "安全回退")
+        return f"{prefix} · 已降级完成（{fallback}）· OCR/上游证据不足但已发布安全结果 · 已应用 {applied} 个区域"
     if run_status == "skipped":
         return f"{prefix} · 当前页按页面规则跳过，已保留稳定输出"
     if run_status == "integrity_failed":

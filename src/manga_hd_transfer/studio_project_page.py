@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QSplitter, QSizePolicy,
 )
 
+from .gui_toast import notify
 from .gui_components import (
     _configure_responsive_dialog, Card, PathRow, ImageView, StableThumbnailList,
     ZoomPreviewView, StableComboBox, StableSpinBox, StableDoubleSpinBox,
@@ -285,14 +286,14 @@ class PagePreviewDialog(QDialog):
 
     def _apply_current_role(self):
         if self.project_page.window._busy_running():
-            QMessageBox.information(self, "任务进行中", "请先停止或等待当前任务完成，再修改页面类型。")
+            notify(self, "请先停止或等待当前任务完成，再修改页面类型。", "warning")
             return
         self.project_page.window.mark_page_rows([self._index], str(self.role_combo.currentData() or "content"))
         self._sync_role_ui()
 
     def _go_workbench(self):
         self.project_page.window.set_selected_page(self._index)
-        self.project_page.window.show_page(2)
+        self.project_page.window.show_page_key("workbench")
 
     def _fit(self):
         self.source_view.fit_to_window(); self.target_view.fit_to_window()
@@ -1452,7 +1453,7 @@ class ProjectPage(QWidget):
             preview_action = menu.addAction("并排打开旧中文 / 高清日文")
             preview_action.triggered.connect(lambda _checked=False, row=rows[0]: self.open_preview(row))
             workbench_action = menu.addAction("进入替换工作台")
-            workbench_action.triggered.connect(lambda _checked=False, row=rows[0]: (self.window.set_selected_page(row), self.window.show_page(2)))
+            workbench_action.triggered.connect(lambda _checked=False, row=rows[0]: (self.window.set_selected_page(row), self.window.show_page_key("workbench")))
         menu.exec(global_pos)
 
     def _thumb_context_menu(self, pos):
@@ -1572,7 +1573,7 @@ class ProjectPage(QWidget):
 
     def _go_workbench(self):
         if self.window.state.pairs:
-            self.window.set_selected_page(self.window.state.selected_index); self.window.show_page(2)
+            self.window.set_selected_page(self.window.state.selected_index); self.window.show_page_key("workbench")
 
     def open_preview(self, index: int):
         if not self.window.state.pairs:

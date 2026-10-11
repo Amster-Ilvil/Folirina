@@ -60,6 +60,10 @@ class TransparentBubbleRegion:
     applied: bool = True
     clear_mode: str = "full_bubble"
     text_bbox: tuple[int, int, int, int] | None = None
+    # Set only by the detector/planner after a strict neutral-white closed
+    # container check. Synthetic/manual regions default False, so an open text
+    # corridor can never gain whole-bubble authority merely from brightness.
+    container_verified: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -72,6 +76,7 @@ class TransparentBubbleRegion:
             "reason": self.reason,
             "applied": bool(self.applied),
             "clear_mode": self.clear_mode,
+            "container_verified": bool(self.container_verified),
             "clear_pixels": int(cv2.countNonZero(self.clear_mask)),
             **({"text_bbox": [int(v) for v in self.text_bbox]} if self.text_bbox is not None else {}),
         }
@@ -236,15 +241,37 @@ def _target_text_seed_blocks(
                 iy = max(0.0, min(y1, oy1) - max(y0, oy0))
                 inter = ix * iy
                 area = min((x1-x0)*(y1-y0), (ox1-ox0)*(oy1-oy0))
-                if area > 0 and inter / area >= 0.72:
-                    duplicate = True
-                    break
+                if area > 0:
+                    overlap = inter / area
+                    old_area = max(1.0, (ox1-ox0)*(oy1-oy0))
+                    new_area = max(1.0, (x1-x0)*(y1-y0))
+                    size_ratio = max(old_area, new_area) / max(1.0, min(old_area, new_area))
+                    # Preserve materially tighter nested text seeds: they may
+                    # recover a closed narration/speech container even when a
+                    # broad seed also touches neighbouring printed material.
+                    if overlap >= 0.92 and size_ratio < 1.25:
+                        duplicate = True
+                        break
             if duplicate:
                 continue
             meta = dict(row.meta or {})
             meta.update({"backend": backend, "target_only": True, "text_seed": True})
+            seed_polygon = list(row.polygon)
+            if backend == "koharu_layout":
+                # RF-DETR segmentation is often a tight glyph mask while its
+                # predicted box is the semantic text *region*.  Use that box for
+                # seed/corridor geometry so translated CN columns are not clipped
+                # to the JP glyph silhouette.  Preserve the exact segmentation
+                # polygon separately for destructive TARGET-text masks.
+                raw_box = meta.get("raw_box")
+                if isinstance(raw_box, (list, tuple)) and len(raw_box) == 4:
+                    rx0, ry0, rx1, ry1 = [float(v) for v in raw_box]
+                    if rx1 > rx0 and ry1 > ry0:
+                        meta["layout_segmentation_polygon"] = list(row.polygon)
+                        seed_polygon = [(rx0, ry0), (rx1, ry0), (rx1, ry1), (rx0, ry1)]
+                        meta["seed_geometry"] = "rfdetr_box"
             blocks.append(TextBlock(
-                id=f"target-text-{len(blocks):04d}", polygon=list(row.polygon),
+                id=f"target-text-{len(blocks):04d}", polygon=seed_polygon,
                 text=str(row.text or ""), confidence=float(row.confidence), kind=row.kind,
                 reading_order=len(blocks), meta=meta,
             ))
@@ -552,7 +579,7 @@ def _candidate_target_text_presence(
     has_text_bbox = isinstance(text_bbox, (list, tuple)) and len(text_bbox) == 4
     seed_backend = str(meta.get("text_seed_backend", "") or "").strip().lower()
     backend = str(meta.get("backend", "") or "").strip().lower()
-    strong_seed_backend = seed_backend in {"koharu_layout", "ocr", "paddle", "apple", "apple_live_text", "manga_ocr", "baberu_ocr", "ocr48px"}
+    strong_seed_backend = seed_backend in {"koharu_layout", "ocr", "paddle", "apple", "apple_live_text", "manga_ocr", "baberu_ocr", "ocr48px", "hayai_ocr"}
     strong_text_bbox = bool(has_text_bbox and (strong_seed_backend or backend == "koharu_layout"))
 
     seed_support_ids: list[str] = []
@@ -570,7 +597,7 @@ def _candidate_target_text_presence(
         if mask_u8[scy, scx] > 0 or overlap / seed_area >= 0.18:
             seed_support_ids.append(str(seed.id))
             sb = str((seed.meta or {}).get("backend", "") or "").strip().lower()
-            if sb in {"koharu_layout", "ocr", "paddle", "apple", "apple_live_text", "manga_ocr", "baberu_ocr", "ocr48px"}:
+            if sb in {"koharu_layout", "ocr", "paddle", "apple", "apple_live_text", "manga_ocr", "baberu_ocr", "ocr48px", "hayai_ocr"}:
                 strong_seed_support_ids.append(str(seed.id))
 
     comp_count = len(inside)
@@ -603,8 +630,29 @@ def _candidate_target_text_presence(
             ca >= 180 and min(cw, ch) >= 18 and max(cw / max(1, ch), ch / max(1, cw)) <= 2.8
             and backend in {"text_seed_white_container", "text_seed_fallback", "target_text_contour"}
         )
+    # A tight heuristic text bbox is not semantic authority by itself, but a
+    # tall/narrow seed corridor containing several compact components is strong
+    # *geometric* evidence of ordinary vertical manga text.  Japanese kana and
+    # punctuation have very uneven heights, so the generic height-CV gate above
+    # can incorrectly reject a real short balloon such as 「まったく」 even when
+    # detection already isolated its exact text column. Keep this rescue strict:
+    # it requires an attached seed, 4+ components, and clear one-dimensional
+    # vertical alignment. It does not admit wide artwork/SFX blobs.
+    seeded_vertical = False
+    if has_text_bbox and seed_support_ids:
+        try:
+            tx0, ty0, tx1, ty1 = [float(v) for v in text_bbox]
+            tw = max(1.0, tx1 - tx0); th = max(1.0, ty1 - ty0)
+            seeded_vertical = bool(
+                th >= tw * 1.55
+                and comp_count >= max(4, min_components + 2)
+                and line_ratio <= 0.48
+                and backend in {"text_seed_white_container", "text_seed_fallback", "target_text_contour"}
+            )
+        except Exception:
+            seeded_vertical = False
     strong_semantic = bool(strong_text_bbox or strong_seed_support_ids)
-    accepted = bool(strong_semantic and comp_count >= 1) or dense or aligned or compact_grid or single_effect
+    accepted = bool(strong_semantic and comp_count >= 1) or dense or aligned or compact_grid or single_effect or seeded_vertical
     reason = "insufficient_target_text_presence"
     if strong_semantic and comp_count >= 1:
         reason = "strong_semantic_text_support"
@@ -616,6 +664,8 @@ def _candidate_target_text_presence(
         reason = "compact_multi_glyph_text"
     elif single_effect:
         reason = "single_stylized_effect_component"
+    elif seeded_vertical:
+        reason = "seeded_vertical_text_components"
     return accepted, {
         "reason": reason,
         "accepted": accepted,
@@ -633,6 +683,7 @@ def _candidate_target_text_presence(
         "aligned": bool(aligned),
         "compact_grid": bool(compact_grid),
         "single_effect": bool(single_effect),
+        "seeded_vertical": bool(seeded_vertical),
         "candidate_area": area,
         "candidate_bbox": [int(x), int(y), int(x + w), int(y + h)],
     }
@@ -646,6 +697,32 @@ def _text_has_semantic_character(value: str) -> bool:
         if 0x3040 <= code <= 0x30FF or 0x3400 <= code <= 0x9FFF or 0xFF66 <= code <= 0xFF9D:
             return True
     return False
+
+
+def _combine_target_text_presence(
+    target_text_ok: bool,
+    ocr_text_ok: bool | None,
+    cfg: TransparentBubbleRevealConfig,
+) -> tuple[bool, str]:
+    """Combine geometry/component and OCR evidence without authority inversion.
+
+    TARGET geometry/components own destructive eligibility. OCR may rescue a weak
+    candidate; it may veto a geometry-positive candidate only when the explicit
+    compatibility switch is enabled.
+    """
+    use_ocr = bool(getattr(cfg, "target_text_presence_ocr_enabled", False))
+    if not use_ocr:
+        return bool(target_text_ok), "geometry_only"
+    negative_veto = bool(getattr(cfg, "target_text_presence_ocr_negative_veto", False))
+    if ocr_text_ok is True:
+        return True, "ocr_positive_rescue" if not target_text_ok else "geometry_plus_ocr_positive"
+    if ocr_text_ok is False and negative_veto:
+        return False, "explicit_ocr_negative_veto"
+    if target_text_ok:
+        return True, "geometry_authority"
+    if ocr_text_ok is None and bool(getattr(cfg, "target_text_presence_ocr_fail_open", True)):
+        return False, "ocr_unavailable_geometry_negative"
+    return False, "no_positive_text_evidence"
 
 
 def _candidate_ocr_text_presence(
@@ -888,7 +965,11 @@ def _detect_target_bubbles(
                 "authority_rejected": sum(1 for row in authority_audit if not row.get("accepted")),
             })
             if strategy != STRATEGY_ALWAYS and len(accepted) > before:
-                break
+                # geometry_white is a complementary bundle.  A successful
+                # target_text_contour pass must not suppress the following
+                # seeded_white container pass.
+                if backend != "target_text_contour":
+                    break
         except Exception as exc:
             audit.append({"backend": backend, "status": "unavailable", "phase": "fallback", "error": str(exc)})
     return accepted, audit
@@ -1060,6 +1141,7 @@ def _attach_text_seed_bbox_to_containers(
     cfg: TransparentBubbleRevealConfig,
     bubble_cfg: BubbleConfig | None = None,
     *,
+    aligned_source: np.ndarray | None = None,
     stage_cache=None,
     cache_stats: dict[str, Any] | None = None,
     target_path: str | None = None,
@@ -1075,6 +1157,8 @@ def _attach_text_seed_bbox_to_containers(
         return bubbles, [{"backend": "container_text_seed_attach", "status": "unavailable", "error": str(exc)}]
     h, w = target.shape[:2]
     attached = 0
+    paired_change_rejected = 0
+    paired_change_accepted = 0
     rows: list[BubbleInstance] = []
     for bubble in bubbles:
         meta = dict(bubble.meta or {})
@@ -1096,6 +1180,20 @@ def _attach_text_seed_bbox_to_containers(
             near_y = max(18.0, float(bh) * 0.14)
         selected: list[TextBlock] = []
         for seed in seeds:
+            # A semantic TARGET text detector can occasionally label unchanged
+            # character/art detail as text (p-194's small chibi is a real case).
+            # Such a false-positive must not widen the SOURCE-write corridor.
+            # Pairwise registered change evidence is used only for this corridor
+            # expansion decision; TARGET text-presence verification remains
+            # independent and Koharu remains the primary detector authority.
+            if aligned_source is not None:
+                change_ok, _change_diag, _change_region, _src_unique, _dst_unique = _translation_evidence_for_seed(
+                    aligned_source, target, seed
+                )
+                if not bool(change_ok):
+                    paired_change_rejected += 1
+                    continue
+                paired_change_accepted += 1
             x0, y0, x1, y1 = seed.bbox
             cx = int(np.clip(round((x0 + x1) * 0.5), 0, w - 1))
             cy = int(np.clip(round((y0 + y1) * 0.5), 0, h - 1))
@@ -1145,12 +1243,37 @@ def _attach_text_seed_bbox_to_containers(
                 meta["text_bbox"] = [x0, y0, x1, y1]
                 meta["text_seed_ids"] = [s.id for s in selected]
                 meta["text_seed_attached"] = True
+                # Koharu text polygons are semantic TARGET-text authority.  Preserve
+                # their exact mask on the BubbleInstance so text-only rendering can
+                # clear Japanese glyphs (including shared CJK glyphs) without
+                # widening the destructive area to the whole coloured container.
+                verified = np.zeros(target.shape[:2], np.uint8)
+                verified_count = 0
+                for seed in selected:
+                    seed_backend = str((seed.meta or {}).get("backend", "")).strip().lower()
+                    if seed_backend != "koharu_layout":
+                        continue
+                    seg_poly = (seed.meta or {}).get("layout_segmentation_polygon") or seed.polygon
+                    sm = rasterize_polygon(seg_poly, target.shape[:2])
+                    if cv2.countNonZero(sm) <= 0:
+                        continue
+                    verified = cv2.bitwise_or(verified, sm)
+                    verified_count += 1
+                if verified_count > 0:
+                    verified = cv2.bitwise_and(verified, (mask > 0).astype(np.uint8) * 255)
+                    if cv2.countNonZero(verified) > 0:
+                        meta["verified_target_text_mask"] = verified
+                        meta["verified_target_text_backend"] = "koharu_layout"
+                        meta["verified_target_text_seed_count"] = int(verified_count)
                 attached += 1
         bubble.meta = meta
         rows.append(bubble)
     return rows, [*seed_audit, {
         "backend": "container_text_seed_attach", "status": "ok",
         "bubble_count": len(bubbles), "attached": attached,
+        "paired_change_filter_used": aligned_source is not None,
+        "paired_change_accepted": int(paired_change_accepted),
+        "paired_change_rejected": int(paired_change_rejected),
     }]
 
 
@@ -1166,7 +1289,13 @@ def _add_verified_seed_fallbacks(
     target_path: str | None = None,
     cache_enabled: bool = True,
 ) -> tuple[list[BubbleInstance], list[dict[str, Any]]]:
-    if str(cfg.bubble_backend or "auto").strip().lower() != "auto":
+    requested_backend = str(cfg.bubble_backend or "auto").strip().lower()
+    # Standalone text-seed fallbacks are intentionally AUTO-only.  When Koharu
+    # is explicitly selected, its semantic bubble/container instances are the
+    # authority.  RF-DETR raw text boxes may widen the evidence corridor INSIDE
+    # those containers, but must not synthesize new open containers (charts,
+    # captions, page furniture, etc.).
+    if requested_backend != "auto":
         return bubbles, []
     try:
         seeds, seed_audit = _target_text_seed_blocks(
@@ -1175,6 +1304,8 @@ def _add_verified_seed_fallbacks(
         )
     except Exception as exc:
         return bubbles, [{"backend": "text_seed_fallback", "status": "unavailable", "error": str(exc)}]
+    if requested_backend == "koharu_layout":
+        seeds = [s for s in seeds if str((s.meta or {}).get("backend", "")).strip().lower() == "koharu_layout"]
     out = list(bubbles)
     audit: list[dict[str, Any]] = [*seed_audit]
     authority = None
@@ -1199,6 +1330,20 @@ def _add_verified_seed_fallbacks(
             continue
         ok, evidence, evidence_region, source_unique, target_unique = _translation_evidence_for_seed(aligned_source, target, seed)
         row = _seed_fallback_bubble(seed, target, cfg)
+        # Open text-seed fallbacks have no closed-container geometry authority.
+        # They are only allowed to write pixels when the paired SOURCE/TARGET
+        # editions independently prove that translated text exists in the same
+        # corridor.  Recovered white containers keep their geometry authority.
+        row_backend = str((row.meta or {}).get("backend", "") or "").strip().lower()
+        if row_backend == "text_seed_fallback" and not bool(ok):
+            audit.append({
+                "backend": "text_seed_fallback",
+                "status": "seed_rejected_open_text_without_source_evidence",
+                "seed_id": str(seed.id),
+                "bbox": [int(round(v)) for v in seed.bbox],
+                "translation_evidence": evidence,
+            })
+            continue
         protected_hit, protected_diag = _seed_fallback_hits_protected_container(row, protected_masks)
         if protected_hit:
             audit.append({
@@ -1369,7 +1514,15 @@ def _candidate_text_only_clear_mask(
     else:
         # For geometry-only containers, do not trust all dark pixels. Keep only
         # edition-specific TARGET ink and compact target components touching it.
-        clear = target_unique.copy()
+        # When Koharu supplied an exact TARGET text segmentation for this bubble,
+        # it becomes the primary clear authority. This fixes shared CJK glyphs
+        # that a SOURCE/TARGET diff cannot distinguish, while the bubble mask still
+        # bounds every destructive pixel.
+        cached_verified = (bubble.meta or {}).get("verified_target_text_mask")
+        if isinstance(cached_verified, np.ndarray) and cached_verified.shape == target.shape[:2]:
+            clear = cv2.bitwise_or(target_unique, ((cached_verified > 0).astype(np.uint8) * 255))
+        else:
+            clear = target_unique.copy()
         if cv2.countNonZero(clear) > 0:
             heuristic = _text_only_clear_mask(target, base, cfg)
             support = cv2.dilate((clear > 0).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))) > 0
@@ -2009,11 +2162,29 @@ def _auto_candidate_safe(target: np.ndarray, row: BubbleInstance, backend: str) 
     if backend == "target_text_contour":
         return bool(_bubble_is_white(target, mask) or _effect_container_candidate_safe(target, mask))
     if backend == "koharu_layout":
-        # Koharu's `bubble` label is already semantic closed-container evidence.
-        # v2.3.69 accidentally had no Koharu branch here, so every primary
-        # Koharu bubble was detected and then rejected by the final destructive
-        # gate. Keep the pixel safety check, but honor the semantic authority.
-        return bool(_bubble_is_white(target, mask) or _effect_container_candidate_safe(target, mask))
+        # Koharu's `bubble` label is semantic closed-container evidence. Small
+        # neutral/effect bubbles keep the conservative pixel gate. Large coloured
+        # speech containers (for example a page-wide starburst) are allowed only
+        # through a bounded semantic gate; the renderer will still demote any
+        # non-white container to text-only, preserving TARGET RGB/artwork.
+        if _bubble_is_white(target, mask) or _effect_container_candidate_safe(target, mask):
+            return True
+        area_ratio = _candidate_area_ratio(mask)
+        x, y, bw, bh = cv2.boundingRect((mask > 0).astype(np.uint8))
+        confidence = float(getattr(row, "confidence", 0.0) or 0.0)
+        # Keep this semantic gate aligned with the detector's calibrated bubble
+        # confidence range. Real large/burst bubbles can land around 0.58 at the
+        # cloud regression size (p-194); rejecting them here after Koharu already
+        # classified them as ``bubble`` prevents the later TARGET-text-presence
+        # and text-only safety gates from doing their job.  0.55 remains a hard
+        # floor for large coloured containers, while small neutral/effect bubbles
+        # still use the stricter pixel gates above.
+        return bool(
+            confidence >= 0.55
+            and 0.003 <= area_ratio <= 0.30
+            and bw / max(1, mask.shape[1]) <= 0.82
+            and bh / max(1, mask.shape[0]) <= 0.62
+        )
     if backend in {"seeded_white", "unseeded_white", "unseeded"}:
         return _fallback_white_candidate_safe(target, mask)
     # Model-based bubble detectors are still constrained before destructive use.
@@ -2481,6 +2652,41 @@ def _white_container_source_translation_evidence(
 
 
 
+def _verified_seeded_white_text_container(
+    region: TransparentBubbleRegion,
+    target: np.ndarray,
+    poly_mask: np.ndarray,
+) -> bool:
+    """Promote a contour-derived text corridor to white-container authority.
+
+    ``target_text_contour`` normally owns only a tight search corridor.  On a
+    real speech/narration bubble that can clip translated SOURCE glyphs because
+    Japanese and Chinese column layouts differ.  Promotion is deliberately
+    strict and image-derived: the polygon must itself be a compact neutral white
+    container, contain a real text bbox, and provide materially more paper area
+    than the text bbox.  This avoids hard-coded coordinates while preventing
+    small white gaps/skin highlights from becoming full reveal holes.
+    """
+    if str(region.backend or "").strip().lower() != "target_text_contour":
+        return False
+    if region.text_bbox is None or cv2.countNonZero(poly_mask) <= 0:
+        return False
+    if not _bubble_is_white(target, poly_mask):
+        return False
+    x0, y0, x1, y1 = [int(v) for v in region.text_bbox]
+    text_area = max(1, max(0, x1 - x0) * max(0, y1 - y0))
+    poly_area = int(cv2.countNonZero(poly_mask))
+    if poly_area < max(900, int(round(text_area * 1.75))):
+        return False
+    # The tight text bbox must substantially intersect the candidate polygon.
+    h, w = poly_mask.shape[:2]
+    x0=max(0,min(w,x0)); x1=max(0,min(w,x1)); y0=max(0,min(h,y0)); y1=max(0,min(h,y1))
+    if x1 <= x0 or y1 <= y0:
+        return False
+    overlap = int(np.count_nonzero(poly_mask[y0:y1, x0:x1] > 0))
+    return bool(overlap / max(1, text_area) >= 0.55)
+
+
 def _closed_transparent_container_authority(backend: str) -> bool:
     """Whether this detector family is allowed to own a full transparent hole.
 
@@ -2802,7 +3008,7 @@ def build_transparent_bubble_plan(
         target_path=target_path, cache_enabled=cache_enabled,
     )
     bubbles, attach_audit = _attach_text_seed_bbox_to_containers(
-        bubbles, target, cfg, bubble_config, stage_cache=stage_cache, cache_stats=cache_stats,
+        bubbles, target, cfg, bubble_config, aligned_source=aligned, stage_cache=stage_cache, cache_stats=cache_stats,
         target_path=target_path, cache_enabled=cache_enabled,
     )
     audit.extend(attach_audit)
@@ -2879,9 +3085,22 @@ def build_transparent_bubble_plan(
             or _neutral_white_full_reveal_safe(target, base)
         )
         target_text_ok, target_text_diag = _candidate_target_text_presence(target, bubble, support_seeds, cfg)
-        ocr_text_ok, ocr_text_diag = _candidate_ocr_text_presence(
-            target, bubble, cfg, target_text_ocr, target_path=target_path,
-        )
+        use_ocr_presence = bool(getattr(cfg, "target_text_presence_ocr_enabled", False))
+        negative_veto = bool(getattr(cfg, "target_text_presence_ocr_negative_veto", False))
+        # With the default evidence-only policy, strong geometry/component text
+        # evidence does not need OCR at all. OCR is queried only to rescue weak
+        # candidates. A legacy explicit negative-veto policy may still query all.
+        should_query_ocr = bool(use_ocr_presence and ((not bool(target_text_ok)) or negative_veto))
+        if should_query_ocr:
+            ocr_text_ok, ocr_text_diag = _candidate_ocr_text_presence(
+                target, bubble, cfg, target_text_ocr, target_path=target_path,
+            )
+        else:
+            ocr_text_ok, ocr_text_diag = None, {
+                "status": "skipped_strong_geometry",
+                "accepted": None,
+                "reason": "geometry_already_confirmed_text",
+            }
         evidence_ok, evidence_diag = _source_translation_evidence_for_candidate(
             bubble, aligned, target, base, prefer_white_container=base_is_neutral_white,
         )
@@ -2894,19 +3113,12 @@ def build_transparent_bubble_plan(
             "translation_evidence_optional": not bool(getattr(cfg, "require_source_translation_evidence", False)),
         })
         verify_target = bool(getattr(cfg, "verify_target_text_presence", True))
-        use_ocr_presence = bool(getattr(cfg, "target_text_presence_ocr_enabled", False))
-        if use_ocr_presence:
-            if ocr_text_ok is True:
-                # OCR positive may rescue stylized text that the cheap component
-                # verifier cannot confidently classify.
-                combined_target_text_ok = True
-            elif ocr_text_ok is False:
-                combined_target_text_ok = False
-            else:
-                ocr_unavailable += 1
-                combined_target_text_ok = bool(target_text_ok) if bool(getattr(cfg, "target_text_presence_ocr_fail_open", True)) else False
-        else:
-            combined_target_text_ok = bool(target_text_ok)
+        combined_target_text_ok, text_presence_authority = _combine_target_text_presence(
+            bool(target_text_ok), ocr_text_ok, cfg
+        )
+        bubble.meta["target_text_presence_authority"] = text_presence_authority
+        if use_ocr_presence and ocr_text_ok is None and not bool(target_text_ok):
+            ocr_unavailable += 1
         if verify_target and not combined_target_text_ok:
             if use_ocr_presence and ocr_text_ok is False:
                 skipped_ocr_text += 1
@@ -2916,13 +3128,32 @@ def build_transparent_bubble_plan(
         if bool(getattr(cfg, "require_source_translation_evidence", False)) and not evidence_ok:
             skipped_source_evidence += 1
             continue
-        if backend_name in {"text_seed_fallback", "target_text_contour"}:
-            # Open/effect text never owns a whole transparent container, even if
-            # the user selected the strict full-bubble preference.  Its geometry
-            # is only a search corridor; the actual alpha authority is compact
-            # TARGET text ink.  This prevents white/open panels from becoming
-            # oversized transparent windows.
+        if backend_name == "text_seed_fallback":
+            # Open/effect text never owns a whole transparent container. Its
+            # geometry is only a search corridor; the actual alpha authority is
+            # compact TARGET text ink.
             mode = "text_only"
+        elif backend_name == "target_text_contour":
+            # A contour recovered *around* a text seed is not automatically a
+            # full-bubble authority.  However, when the contour itself is a
+            # compact neutral-white closed container with strong text evidence,
+            # keeping it text-only creates exactly the opposite failure: only
+            # part of the Japanese glyph is cleared and the registered Chinese
+            # lower layer looks ghosted. Promote only this strict subset to a
+            # whole-bubble transparent hole; open/weak contour candidates remain
+            # text-only. This mirrors the container-first safety principle used
+            # by Koharu/BallonsTranslator without borrowing another Folirina
+            # renderer.
+            meta = dict(bubble.meta or {})
+            contour_white = float(meta.get("white_ratio", 0.0) or 0.0) >= 0.88
+            contour_dark = float(meta.get("dark_ratio", 1.0) or 1.0) <= 0.12
+            contour_ratio = float(meta.get("area_to_text_ratio", 999.0) or 999.0)
+            contour_closed = bool(meta.get("container_bbox")) and 1.35 <= contour_ratio <= 12.0
+            strong_text = bool(meta.get("text_seed_attached") or meta.get("text_bbox"))
+            mode = "full_bubble" if (
+                contour_closed and contour_white and contour_dark and strong_text
+                and base_is_neutral_white
+            ) else "text_only"
         elif mode == "hybrid" and backend_name in {"text_seed_white_container", "text_seed_white_rect"}:
             # These backends only exist after the strict seeded-container quality
             # gate has recovered a closed neutral-white container. Treat that
@@ -2963,11 +3194,21 @@ def build_transparent_bubble_plan(
             triage, reason = "REVIEW", "semantic_review_region"
         _tb = (bubble.meta or {}).get("text_bbox")
         text_bbox = tuple(int(round(float(v))) for v in _tb) if isinstance(_tb, (list, tuple)) and len(_tb) == 4 else None
+        contour_verified = bool(
+            backend_name == "target_text_contour"
+            and mode == "full_bubble"
+            and bool((bubble.meta or {}).get("container_bbox"))
+            and float((bubble.meta or {}).get("white_ratio", 0.0) or 0.0) >= 0.88
+            and float((bubble.meta or {}).get("dark_ratio", 1.0) or 1.0) <= 0.12
+            and 1.35 <= float((bubble.meta or {}).get("area_to_text_ratio", 999.0) or 999.0) <= 12.0
+            and base_is_neutral_white
+        )
         candidates.append(TransparentBubbleRegion(
             id=f"transparent-{i:04d}", target_bbox=_bbox_int(list(bubble.polygon), target.shape[:2]),
             polygon=list(bubble.polygon), clear_mask=local, confidence=float(bubble.confidence),
             backend=str((bubble.meta or {}).get("backend", cfg.bubble_backend)), triage=triage,
             reason=reason, applied=pixels > 0, clear_mode=mode, text_bbox=text_bbox,
+            container_verified=contour_verified,
         ))
 
     # Enforce the per-page destructive cap without cutting a bubble in half. High
@@ -3810,6 +4051,7 @@ def _apply_text_only_region(
     base_envelope = envelope.copy()
     base_forced = forced.copy()
     target_is_white = _bubble_is_white(target, poly_mask)
+    seeded_white_text_container = _verified_seeded_white_text_container(region, target, poly_mask)
     source_anchor = cv2.bitwise_or(forced, (region.clear_mask > 0).astype(np.uint8) * 255)
     paper_env = white_container_paper_mask(target, (poly_mask > 0).astype(np.uint8) * 255, source_anchor)
     use_paper_envelope = False
@@ -3831,7 +4073,7 @@ def _apply_text_only_region(
         # neutral/white TARGET paper field may broaden SOURCE discovery; pale
         # coloured effect frames stay on the effect-safe route.
         if (
-            _closed_transparent_container_authority(region.backend)
+            (_closed_transparent_container_authority(region.backend) or seeded_white_text_container)
             and paper_env_neutral
             and paper_pixels >= max(900, int(round(base_pixels * 0.34)))
         ):
@@ -3849,13 +4091,48 @@ def _apply_text_only_region(
         "boundary_geometry_components": 0,
         "boundary_geometry_pixels": 0,
     }
-    if use_paper_envelope or target_is_white:
-        # Open text on white artwork stays inside its tight text corridor. Only
-        # a detector with closed-container authority may broaden to paper_env.
-        text_surface = paper_env if use_paper_envelope and cv2.countNonZero(paper_env) > 0 else envelope
-        complete_target_text = target_white_container_text_mask(target, text_surface)
+    backend_name = str(region.backend or "").strip().lower()
+    # Open/effect text can still sit on plain white manga paper (burst bubbles,
+    # borderless narration, white SFX corridors).  Difference-only masks are not
+    # enough there: JP and CN layouts can be disjoint, leaving intact Japanese
+    # glyphs with no SOURCE-difference neighbour.  If the *tight text corridor*
+    # itself is paper-like, complete all compact target glyph components inside
+    # that corridor.  The existing linear/boundary guards below still remove
+    # rays, panel rules and bubble outlines from the destructive mask.
+    seed_corridor_paper_like = bool(
+        backend_name in {"target_text_contour", "text_seed_fallback"}
+        and _preclear_background_is_paper_like(target, forced, envelope)
+    )
+    if seed_corridor_paper_like:
+        # The original clear mask may contain only the JP/CN difference seed.
+        # Once that seed is proven to lie on neutral manga paper, promote the
+        # detector's *tight text bbox* to the cleanup corridor so disjoint JP
+        # columns/punctuation can also be removed. This never promotes the whole
+        # burst/effect container and therefore cannot eat surrounding artwork.
+        bbox_support = _region_text_bbox_support(region, target.shape[:2], pad=4)
+        if cv2.countNonZero(bbox_support) > 0:
+            envelope = cv2.bitwise_or(envelope, bbox_support)
+    if use_paper_envelope or target_is_white or seed_corridor_paper_like:
+        # Closed containers may broaden to recovered paper; open text is confined
+        # to its already-verified tight envelope, never to the surrounding art.
+        text_surface = (
+            paper_env
+            if use_paper_envelope and cv2.countNonZero(paper_env) > 0
+            else envelope
+        )
+        # Paper colour may be estimated from the whole verified container, but
+        # that must not turn every dark object on the paper into TARGET text.
+        # Koharu can occasionally label nearby character/art detail as ``text``;
+        # after the paired-change filter has established a tight translated-text
+        # bbox, keep destructive completion inside that corridor (+ small halo).
+        completion_surface = text_surface
+        if backend_name == "koharu_layout" and region.text_bbox is not None:
+            text_support = _region_text_bbox_support(region, target.shape[:2], pad=16)
+            if cv2.countNonZero(text_support) > 0:
+                completion_surface = cv2.bitwise_and(text_surface, text_support)
+        complete_target_text = target_white_container_text_mask(target, completion_surface)
         complete_target_text, boundary_geometry_guard, boundary_geometry_diag = _split_boundary_geometry_from_text_mask(
-            complete_target_text, text_surface
+            complete_target_text, completion_surface
         )
         if cv2.countNonZero(complete_target_text) > 0:
             forced = cv2.bitwise_or(forced, complete_target_text)
@@ -3987,6 +4264,8 @@ def _apply_text_only_region(
         "paper_like": paper_like,
         "paper_envelope_used": bool(use_paper_envelope),
         "paper_envelope_neutral": bool(paper_env_neutral),
+        "seeded_white_text_container": bool(seeded_white_text_container),
+        "seed_corridor_paper_like": bool(seed_corridor_paper_like),
         "paper_envelope_pixels": int(cv2.countNonZero(paper_env)) if 'paper_env' in locals() else 0,
         "base_envelope_pixels": int(cv2.countNonZero(base_envelope)) if 'base_envelope' in locals() else int(cv2.countNonZero(envelope)),
         "complete_target_text_pixels": int(cv2.countNonZero(complete_target_text)),
@@ -3998,6 +4277,168 @@ def _apply_text_only_region(
             cv2.countNonZero(structure_guard) == 0
             or np.array_equal(local_out[structure_guard > 0], target[structure_guard > 0])
         ),
+        "paper_reconstruct": paper_diag,
+    }
+    return diag, write_mask, cleared, cn_ink
+
+
+def _cross_rendition_text_only_guard(
+    aligned_source: np.ndarray,
+    target: np.ndarray,
+    cfg: TransparentBubbleRevealConfig,
+) -> tuple[bool, dict[str, float | bool]]:
+    """Detect mono/low-saturation SOURCE -> colour TARGET rendition mismatch.
+
+    Whole-bubble alpha reveal assumes the two editions share not only page
+    geometry but also locally compatible raster content.  A translated grayscale
+    scan aligned to a colour master violates that assumption: tiny silhouette
+    differences expose SOURCE face/art pixels even when the Koharu bubble mask is
+    correct.  In Hybrid mode we therefore keep TARGET pixels authoritative and
+    move only registered text ink.
+    """
+    if not bool(getattr(cfg, "cross_rendition_full_reveal_guard", True)):
+        return False, {"enabled": False}
+    try:
+        ss = cv2.cvtColor(aligned_source, cv2.COLOR_BGR2HSV)[..., 1]
+        ts = cv2.cvtColor(target, cv2.COLOR_BGR2HSV)[..., 1]
+        source_p90 = float(np.percentile(ss, 90.0))
+        target_p90 = float(np.percentile(ts, 90.0))
+    except Exception:
+        return False, {"enabled": True, "probe_failed": True}
+    src_max = float(getattr(cfg, "cross_rendition_source_saturation_p90_max", 28.0))
+    tgt_min = float(getattr(cfg, "cross_rendition_target_saturation_p90_min", 55.0))
+    min_gap = float(getattr(cfg, "cross_rendition_min_saturation_gap", 30.0))
+    gap = target_p90 - source_p90
+    active = bool(source_p90 <= src_max and target_p90 >= tgt_min and gap >= min_gap)
+    return active, {
+        "enabled": True,
+        "active": active,
+        "source_saturation_p90": round(source_p90, 3),
+        "target_saturation_p90": round(target_p90, 3),
+        "saturation_gap": round(gap, 3),
+        "source_max": src_max,
+        "target_min": tgt_min,
+        "min_gap": min_gap,
+    }
+
+
+def _apply_cross_rendition_white_container_region(
+    final: np.ndarray,
+    target: np.ndarray,
+    aligned: np.ndarray,
+    alpha: np.ndarray,
+    region: TransparentBubbleRegion,
+    cfg: TransparentBubbleRevealConfig,
+) -> tuple[dict[str, Any], np.ndarray, int, int]:
+    """TARGET-authoritative cross-rendition text transfer for a Koharu bubble.
+
+    Detection geometry is trusted, SOURCE raster is not.  The old implementation
+    delegated to ``transfer_text_only`` which is difference-driven; on a grayscale
+    translated edition aligned to a colour master, almost every coloured TARGET
+    pixel differs from SOURCE and could therefore be misclassified as transferable
+    content.  That produced the characteristic black/gray punched-out balloons.
+
+    This implementation follows the staged detector/mask/inpaint/render contract:
+    1. keep only the eroded Koharu bubble interior;
+    2. recover neutral paper independently on SOURCE and TARGET;
+    3. derive compact glyph masks independently (no cross-rendition RGB diff);
+    4. reconstruct TARGET only under TARGET glyphs;
+    5. composite only SOURCE glyph opacity, never SOURCE background/art.
+
+    Outside the two glyph masks TARGET remains byte-identical.  For the RGBA
+    deliverable, only SOURCE glyph pixels become transparent so the registered
+    lower SOURCE layer can still supply the actual Chinese glyphs; erased JP paper
+    stays opaque TARGET paper.
+    """
+    shape = target.shape[:2]
+    poly = rasterize_polygon(region.polygon, shape)
+    if cv2.countNonZero(poly) <= 0:
+        poly = (region.clear_mask > 0).astype(np.uint8) * 255
+    if cv2.countNonZero(poly) <= 0:
+        return {"region_id": region.id, "status": "empty_container"}, np.zeros(shape, np.uint8), 0, 0
+
+    # Keep bubble outline/tail immutable.  A 3 px inset is enough to remove the
+    # detector perimeter without shrinking small punctuation corridors away.
+    safe_region = cv2.erode(poly, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)), iterations=1)
+    if cv2.countNonZero(safe_region) <= 0:
+        safe_region = poly.copy()
+
+    # Recover neutral paper on each rendition independently, then admit their
+    # union only inside the trusted Koharu interior.  The union tolerates small
+    # edition-specific balloon-shape/layout shifts while the TARGET polygon keeps
+    # faces, hair, panels and coloured effects out of the write authority.
+    target_paper = white_container_paper_mask(target, safe_region, safe_region)
+    source_paper = white_container_paper_mask(aligned, safe_region, safe_region)
+    paper = cv2.bitwise_or(target_paper, source_paper)
+    paper = cv2.bitwise_and(paper, safe_region)
+    if cv2.countNonZero(paper) > 0:
+        paper = cv2.erode(paper, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
+    if cv2.countNonZero(paper) <= 0:
+        return {
+            "region_id": region.id,
+            "status": "no_verified_paper",
+            "cross_rendition_white_container": True,
+        }, np.zeros(shape, np.uint8), 0, 0
+
+    # Crucially, these two masks are derived independently.  No SOURCE/TARGET
+    # colour difference participates, so grayscale-vs-colour artwork cannot turn
+    # into a giant false text mask.
+    source_mask = _tight_verified_text_ink_mask(aligned, paper)
+    target_mask = _tight_verified_text_ink_mask(target, paper)
+    if cv2.countNonZero(source_mask) <= 0:
+        return {
+            "region_id": region.id,
+            "status": "no_source_glyphs_fail_closed",
+            "cross_rendition_white_container": True,
+            "paper_pixels": int(cv2.countNonZero(paper)),
+        }, np.zeros(shape, np.uint8), 0, 0
+
+    # Include TARGET antialias fringe but never leave the verified paper island.
+    if cv2.countNonZero(target_mask) > 0:
+        target_mask = cv2.dilate(
+            target_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1
+        )
+        target_mask = cv2.bitwise_and(target_mask, paper)
+
+    clean, effective_clear, paper_diag = _local_paper_reconstruct_under_text(
+        target, target_mask, paper, dilate_px=1, ring_px=7,
+    )
+
+    glyph_alpha, source_gray = source_text_render(aligned, source_mask)
+    glyph_alpha = glyph_alpha.copy()
+    glyph_alpha[paper == 0] = 0.0
+    a3 = glyph_alpha[..., None]
+    glyph_rgb = np.repeat(source_gray[..., None], 3, axis=2).astype(np.float32)
+    composed = np.clip(
+        clean.astype(np.float32) * (1.0 - a3) + glyph_rgb * a3,
+        0, 255,
+    ).astype(np.uint8)
+
+    glyph_pixels = glyph_alpha > 0
+    write = (effective_clear > 0) | glyph_pixels
+    write_mask = write.astype(np.uint8) * 255
+    if np.any(write):
+        final[write] = composed[write]
+    # Preserve true Transparent semantics without exposing SOURCE paper/art:
+    # only glyph locations are holes into the registered SOURCE lower layer.
+    if np.any(glyph_pixels):
+        alpha[glyph_pixels] = 0
+
+    cleared = int(cv2.countNonZero(effective_clear))
+    cn_ink = int(cv2.countNonZero(source_mask))
+    diag = {
+        "region_id": region.id,
+        "status": "applied" if cv2.countNonZero(write_mask) > 0 else "no_effect",
+        "cross_rendition_white_container": True,
+        "container_pixels": int(cv2.countNonZero(safe_region)),
+        "paper_pixels": int(cv2.countNonZero(paper)),
+        "source_text_pixels": cn_ink,
+        "target_text_pixels": int(cv2.countNonZero(target_mask)),
+        "effective_write_pixels": int(cv2.countNonZero(write_mask)),
+        "cleared_target_pixels": cleared,
+        "source_background_composited": False,
+        "target_background_authoritative": True,
+        "alpha_hole_policy": "source_glyph_pixels_only",
         "paper_reconstruct": paper_diag,
     }
     return diag, write_mask, cleared, cn_ink
@@ -4016,7 +4457,6 @@ def execute_transparent_bubble(
     - ``full_bubble`` truly clears/reveals the full bubble interior again.
     - ``text_only`` keeps the safer text-mask behaviour for coloured/open art.
     """
-    del source
     if not plan.accepted:
         jp_rgba = cv2.cvtColor(target, cv2.COLOR_BGR2RGBA)
         return TransparentBubbleResult(
@@ -4029,6 +4469,7 @@ def execute_transparent_bubble(
     if aligned.shape[:2] != target.shape[:2]:
         aligned = cv2.resize(aligned, (target.shape[1], target.shape[0]), interpolation=cv2.INTER_LINEAR)
 
+    cross_rendition_guard, cross_rendition_diag = _cross_rendition_text_only_guard(aligned, target, cfg)
     final = target.copy()
     gray_t = cv2.cvtColor(target, cv2.COLOR_BGR2GRAY)
     gray_c = cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY)
@@ -4088,7 +4529,10 @@ def execute_transparent_bubble(
             # This keeps skin/art byte-exact while still exposing all CN text in
             # the recovered white interior.
             anchor_ok = _full_reveal_has_text_anchor(region)
-            closed_authority = _closed_transparent_container_authority(region.backend)
+            closed_authority = bool(
+                _closed_transparent_container_authority(region.backend)
+                or (str(region.backend or "").strip().lower() == "target_text_contour" and bool(region.container_verified))
+            )
             min_coverage = 0.10 if explicit_full else 0.18
             effect_like = bool((not base_white) and _effect_container_candidate_safe(target, base_mask_u8))
             recovered_rect_like = bool(_mask_bbox_fill_ratio(reveal_mask_u8) >= 0.86)
@@ -4101,6 +4545,7 @@ def execute_transparent_bubble(
             allow_full = bool(
                 closed_authority and anchor_ok and recovered_white and candidate_coverage >= min_coverage
                 and raw_or_recovered_container_ok and not effect_like
+                and (explicit_full or not cross_rendition_guard)
             )
         if allow_full:
             full_region_count += 1
@@ -4113,6 +4558,38 @@ def execute_transparent_bubble(
             total_reveal_pixels += int(np.count_nonzero(reveal_mask))
             continue
 
+        # On grayscale/low-saturation SOURCE -> colour TARGET editions, a Koharu
+        # white bubble is still valid geometry but SOURCE paper/art is never a
+        # valid raster replacement.  Use TARGET-authoritative text transfer for
+        # the whole verified bubble instead.  This also gives every accepted
+        # bubble an explicit commit attempt rather than silently dropping it after
+        # detection.
+        backend_name = str(region.backend or "").strip().lower()
+        raw_region_u8 = region_mask.astype(np.uint8) * 255
+        explicit_full = str(getattr(cfg, "clear_mode", "") or "").strip().lower() == "full_bubble"
+        cross_white_container = bool(
+            cross_rendition_guard
+            and not explicit_full
+            and backend_name == "koharu_layout"
+            and (
+                _bubble_is_white(target, raw_region_u8)
+                or _neutral_white_full_reveal_safe(target, raw_region_u8)
+                or _flat_white_full_reveal_safe(target, raw_region_u8)
+            )
+        )
+        if cross_white_container:
+            text_region_count += 1
+            diag, write_mask, cleared_pixels, cn_ink_pixels = _apply_cross_rendition_white_container_region(
+                final, target, aligned, alpha, region, cfg
+            )
+            diag["fallback_reason"] = "cross_rendition_target_authoritative_white_container"
+            if cv2.countNonZero(write_mask) > 0:
+                page_clear[write_mask > 0] = 255
+            total_jp_clear_pixels += int(cleared_pixels)
+            total_cn_ink_pixels += int(cn_ink_pixels)
+            text_region_diags.append(diag)
+            continue
+
         # Any non-white / effect / burst container is forced through the safe
         # text-only renderer, even if a previous stage or manual setting marked
         # the region as full_bubble. This protects coloured starbursts and other
@@ -4121,11 +4598,50 @@ def execute_transparent_bubble(
         local_region = region
         fallback_reason = None
         if mode == "full_bubble" and not allow_full:
-            fallback_reason = "full_bubble_demoted_to_text_only_nonwhite_or_effect"
+            cross_demote = bool(
+                cross_rendition_guard
+                and str(getattr(cfg, "clear_mode", "") or "").strip().lower() != "full_bubble"
+            )
+            fallback_reason = (
+                "full_bubble_demoted_to_text_only_cross_rendition"
+                if cross_demote
+                else "full_bubble_demoted_to_text_only_nonwhite_or_effect"
+            )
+            fallback_mask = region.clear_mask
+            if cross_demote:
+                # Critical contract: once a whole-bubble reveal is demoted, the
+                # old full-bubble mask is no longer destructive authority.  Seed
+                # the text-only renderer with TARGET glyph ink only; it may widen
+                # SOURCE discovery over verified neutral paper, but it may never
+                # pre-clear the whole bubble.  This is the exact failure that
+                # produced black/white punched-out balloons in cross-rendition
+                # pages despite a correct Koharu bubble detection.
+                support = _region_text_bbox_support(region, target.shape[:2], pad=6)
+                if cv2.countNonZero(support) <= 0:
+                    support = rasterize_polygon(region.polygon, target.shape[:2])
+                tight = _tight_verified_text_ink_mask(target, support)
+                if cv2.countNonZero(tight) <= 0:
+                    _sm, tight, _td = changed_text_masks(aligned, target, support, tolerance_px=2)
+                if cv2.countNonZero(tight) > 0:
+                    fallback_mask = tight
+                else:
+                    # Fail closed: no verified target glyph seed means this region
+                    # must remain untouched rather than reverting to whole-bubble
+                    # destructive geometry.
+                    fallback_mask = np.zeros(target.shape[:2], np.uint8)
+            elif str(region.backend or "").strip().lower() == "target_text_contour" and region.text_bbox is not None:
+                # Demotion must also demote *geometry authority*. Passing the old
+                # whole-container mask into text-only would let the paper-like
+                # completion logic clear most of an open/effect frame. Restrict
+                # it to the detector's tight text corridor before rendering.
+                bbox_support = _region_text_bbox_support(region, target.shape[:2], pad=6)
+                tight = cv2.bitwise_and(region.clear_mask, bbox_support)
+                fallback_mask = tight if cv2.countNonZero(tight) > 0 else bbox_support
             local_region = TransparentBubbleRegion(
-                id=region.id, target_bbox=region.target_bbox, polygon=region.polygon, clear_mask=region.clear_mask,
+                id=region.id, target_bbox=region.target_bbox, polygon=region.polygon, clear_mask=fallback_mask,
                 confidence=region.confidence, backend=region.backend, triage=region.triage, reason=region.reason,
                 applied=region.applied, clear_mode="text_only", text_bbox=region.text_bbox,
+                container_verified=bool(region.container_verified),
             )
         diag, write_mask, cleared_pixels, cn_ink_pixels = _apply_text_only_region(
             final, target, aligned, alpha, local_region, cfg
@@ -4154,6 +4670,7 @@ def execute_transparent_bubble(
         "full_bubble_region_count": int(full_region_count),
         "text_only_region_count": int(text_region_count),
         "text_only_regions": text_region_diags,
+        "cross_rendition_full_reveal_guard": cross_rendition_diag,
         "flattened": False,
         "pixel_contract": "target_authority_plus_true_full_bubble_reveal",
         "color_preserve_outside_holes": True,

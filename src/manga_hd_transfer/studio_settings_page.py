@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .gui_toast import notify
 from .app_logging import runtime_log_dir
 from .gui_components import Card, StableComboBox
 from .gui_dialogs import confirm_action
@@ -291,11 +292,11 @@ class SettingsPage(QWidget):
         if self.is_updating:
             return
         if self.window._busy_running():
-            QMessageBox.information(self, "任务进行中", "请先等待当前页面处理/模型任务结束，再更新程序代码。")
+            notify(self, "请先等待当前页面处理/模型任务结束，再更新程序代码。", "warning")
             return
         info = self._update_info
         if info is None:
-            QMessageBox.information(self, "请先检查更新", "请先点击“检查 Git 更新”，确认远端版本后再执行升级。")
+            notify(self, "请先点击“检查 Git 更新”，确认远端版本后再执行升级。", "warning")
             return
         if not info.available:
             QMessageBox.information(self, "无需更新", info.reason)

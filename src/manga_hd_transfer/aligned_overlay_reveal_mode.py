@@ -227,7 +227,12 @@ def _registered_translation_evidence(
     sd=cv2.dilate(s,k); td=cv2.dilate(t,k)
     smatch=float(np.count_nonzero((s>0)&(td>0))/max(1,sc)) if sc else 0.0
     tmatch=float(np.count_nonzero((t>0)&(sd>0))/max(1,tc)) if tc else 0.0
-    identity=float(np.clip(0.5*(smatch+tmatch),0.0,1.0))
+    # Use the weaker directional overlap as the identity score.  Averaging the
+    # two directions can hide a real translation when one short glyph set is
+    # almost contained by the other after tolerance dilation (notably with
+    # OpenCV 5 rasterisation).  The weaker direction still stays at 1.0 for
+    # genuinely unchanged ink, while preserving asymmetric CN/JP differences.
+    identity=float(np.clip(min(smatch,tmatch),0.0,1.0))
     change=float(np.clip(1.0-identity,0.0,1.0))
     min_sd=float(getattr(cfg,"supplemental_min_source_ink_density",0.012))
     min_td=float(getattr(cfg,"supplemental_min_target_ink_density",0.008))

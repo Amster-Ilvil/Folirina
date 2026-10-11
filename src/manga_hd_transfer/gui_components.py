@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 from .gui_theme import MUTED
+from .graphics_zoom import GraphicsZoomController
 
 
 class StableSpinBox(QSpinBox):
@@ -492,7 +493,9 @@ class ImageView(QGraphicsView):
         # manga PNG/JPEG every time. Keep a tiny LRU of decoded QPixmaps; QPixmap is
         # implicitly shared by Qt, so reuse is cheap while the cache remains bounded.
         self._pixmap_cache: OrderedDict[tuple[str, int, int, int], QPixmap] = OrderedDict()
-        self._pixmap_cache_limit = 5
+        # The workbench has 10 view tabs. Five cached views churn on normal
+        # compare cycles; with a bounded ~2K overview allow eight cached tabs.
+        self._pixmap_cache_limit = 8 if self._max_decode_side else 5
         # Auto-fit previews must not let transient scrollbars change the viewport
         # size while a new page is being installed.  Qt's AsNeeded policy can
         # otherwise create a resize -> fitInView -> scrollbar -> resize feedback
@@ -687,8 +690,15 @@ class ZoomPreviewView(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.setMinimumSize(360, 420)
+        self._zoom_controller = GraphicsZoomController(
+            self,
+            minimum_scale=0.05,
+            maximum_scale=12.0,
+            on_manual_zoom=lambda: setattr(self, "_auto_fit", False),
+        )
 
     def set_image(self, path: str | Path | None):
+        self._zoom_controller.cancel_pending()
         self._scene.clear(); self._item = None; self._zoom = 1.0; self.resetTransform()
         if not path:
             self._show_message("无图片")
@@ -716,6 +726,7 @@ class ZoomPreviewView(QGraphicsView):
         self._fit_pending = False
         if self._item is None or not self._auto_fit or self.viewport().width() < 8 or self.viewport().height() < 8:
             return
+        self._zoom_controller.cancel_pending()
         self.resetTransform()
         self.fitInView(_fit_scene_rect(self._scene), Qt.AspectRatioMode.KeepAspectRatio)
         self._zoom = max(0.01, float(self.transform().m11()))
@@ -731,23 +742,28 @@ class ZoomPreviewView(QGraphicsView):
 
     def actual_size(self):
         if self._item is not None:
+            self._zoom_controller.cancel_pending()
             self._auto_fit = False; self.resetTransform(); self._zoom = 1.0
 
     def zoom_by(self, factor: float):
         if self._item is None:
             return
-        current = float(self.transform().m11())
-        target = current * float(factor)
-        if target < 0.05 or target > 12.0:
-            return
-        self._auto_fit = False
-        self.scale(float(factor), float(factor)); self._zoom = target
+        if self._zoom_controller.zoom_now(float(factor)):
+            self._zoom = float(self.transform().m11())
 
     def wheelEvent(self, event):
         if self._item is None:
             super().wheelEvent(event); return
-        self.zoom_by(1.16 if event.angleDelta().y() > 0 else (1.0 / 1.16))
-        event.accept()
+        if not self._zoom_controller.handle_wheel(event):
+            event.accept()
+        self._zoom = float(self._zoom_controller._requested_scale)
+
+    def event(self, event):
+        controller = getattr(self, "_zoom_controller", None)
+        if controller is not None and controller.handle_native_event(event):
+            self._zoom = float(controller._requested_scale)
+            return True
+        return super().event(event)
 
     def mouseDoubleClickEvent(self, event):
         self.fit_to_window(); event.accept()

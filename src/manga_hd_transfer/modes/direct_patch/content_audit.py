@@ -27,6 +27,7 @@ def _evaluate_content_completeness(
     tolerance_px: int | None = None,
     min_source_coverage: float | None = None,
     max_target_residual: float | None = None,
+    target_invalidation_mask: np.ndarray | None = None,
 ) -> None:
     """Verify content independently from the fact that a raster write occurred.
 
@@ -56,6 +57,9 @@ def _evaluate_content_completeness(
     coverage = float(np.count_nonzero((src > 0) & (final_near > 0)) / max(1, src_count))
 
     residual = 0.0
+    visual_dark_proxy = 0.0
+    invalidated_ratio = 0.0
+    residual_basis = "final_raster_proxy"
     tgt_count = 0
     if target_ink is not None and target_ink.shape == src.shape:
         tgt = (target_ink > 0).astype(np.uint8) * 255
@@ -65,9 +69,28 @@ def _evaluate_content_completeness(
             target_only = (tgt > 0) & (src_near == 0)
             target_only_count = int(np.count_nonzero(target_only))
             if target_only_count >= max(4, min_ink // 3):
-                # A slightly stricter darkness threshold catches real leftover
-                # glyph cores while ignoring mild inpaint/halftone texture.
-                residual = float(np.count_nonzero(target_only & (fgray <= 205)) / target_only_count)
+                # ``final`` may contain dark SOURCE glyphs or structural ink on
+                # the same coordinates as the old TARGET text.  Darkness alone
+                # therefore cannot prove that the original TARGET glyph survived.
+                # Keep the old visual metric for diagnostics, but when the
+                # renderer supplies an exact write/clear authority mask, judge
+                # residual TARGET ink only outside pixels whose original target
+                # raster was explicitly invalidated by this transfer.
+                dark_target_only = target_only & (fgray <= 205)
+                visual_dark_proxy = float(np.count_nonzero(dark_target_only) / target_only_count)
+                if (target_invalidation_mask is not None
+                        and target_invalidation_mask.shape == src.shape):
+                    invalid = (target_invalidation_mask > 0).astype(np.uint8) * 255
+                    # Match the same spatial tolerance used for SOURCE coverage:
+                    # antialias/registration edges within a few pixels of an
+                    # authoritative write are no longer the original TARGET ink.
+                    invalid_near = cv2.dilate(invalid, k) > 0
+                    invalidated_ratio = float(np.count_nonzero(target_only & invalid_near) / target_only_count)
+                    live_target_only = target_only & (~invalid_near)
+                    residual = float(np.count_nonzero(live_target_only & (fgray <= 205)) / target_only_count)
+                    residual_basis = "target_invalidation_mask"
+                else:
+                    residual = visual_dark_proxy
             else:
                 residual = 0.0
 
@@ -76,7 +99,56 @@ def _evaluate_content_completeness(
     rec.content_check = "checked" if tgt_count >= min_ink else "checked_source_only"
     min_cov = float(min_source_coverage if min_source_coverage is not None else getattr(cfg, "content_completeness_min_source_coverage", 0.90))
     max_res = float(max_target_residual if max_target_residual is not None else getattr(cfg, "content_completeness_max_target_residual", 0.10))
-    rec.content_complete = bool(coverage >= min_cov and residual <= max_res)
+
+    # Raster-faithful Direct paths can score lower pixel coverage simply because
+    # SOURCE antialias/scan thickness is wider than the final dark-pixel proxy.
+    # Do not lower the global coverage threshold.  Instead, allow a second proof
+    # that every material SOURCE ink component survived locally.  A genuinely
+    # missing glyph/component still has ~0 overlap and therefore cannot pass.
+    component_survival = False
+    component_diag: dict[str, float | int | bool] = {}
+    fallback_floor = float(getattr(cfg, "content_completeness_component_fallback_min_total_coverage", 0.80))
+    if coverage < min_cov and coverage >= fallback_floor and residual <= max_res:
+        bridge_px = max(0, int(getattr(cfg, "content_completeness_component_bridge_px", 1)))
+        grouped = src.copy()
+        if bridge_px > 0:
+            grouped = cv2.dilate(
+                grouped, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (bridge_px * 2 + 1, bridge_px * 2 + 1))
+            )
+        n, labels = cv2.connectedComponents((grouped > 0).astype(np.uint8), 8)
+        min_area = max(3, int(getattr(cfg, "content_completeness_component_min_area", 5)))
+        min_component_cov = float(getattr(cfg, "content_completeness_component_min_coverage", 0.50))
+        significant = 0
+        survived = 0
+        worst = 1.0
+        for comp_id in range(1, n):
+            original = (labels == comp_id) & (src > 0)
+            area = int(np.count_nonzero(original))
+            if area < min_area:
+                continue
+            significant += 1
+            comp_cov = float(np.count_nonzero(original & (final_near > 0)) / max(1, area))
+            worst = min(worst, comp_cov)
+            if comp_cov >= min_component_cov:
+                survived += 1
+        min_survival_ratio = float(getattr(cfg, "content_completeness_component_min_survival_ratio", 0.98))
+        survival_ratio = float(survived / max(1, significant)) if significant else 0.0
+        component_survival = bool(significant > 0 and survival_ratio >= min_survival_ratio and worst >= min_component_cov)
+        component_diag = {
+            "component_survival_used": bool(component_survival),
+            "component_significant": int(significant),
+            "component_survived": int(survived),
+            "component_survival_ratio": float(survival_ratio),
+            "component_worst_coverage": float(worst if significant else 0.0),
+            "component_total_coverage_floor": float(fallback_floor),
+        }
+
+    if hasattr(rec, "meta") and isinstance(rec.meta, dict):
+        rec.meta["content_residual_basis"] = residual_basis
+        rec.meta["target_visual_dark_proxy"] = float(visual_dark_proxy)
+        rec.meta["target_original_invalidated_ratio"] = float(invalidated_ratio)
+        rec.meta.update(component_diag)
+    rec.content_complete = bool((coverage >= min_cov or component_survival) and residual <= max_res)
 
 
 def _repair_content_region(
@@ -143,6 +215,7 @@ def _repair_content_region(
         tolerance_px=tolerance_px,
         min_source_coverage=min_source_coverage,
         max_target_residual=max_target_residual,
+        target_invalidation_mask=repair_mask,
     )
     if cv2.countNonZero(residual_clear) > 0:
         repair_mask = np.maximum(repair_mask, residual_clear)

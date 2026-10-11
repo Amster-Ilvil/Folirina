@@ -87,6 +87,12 @@ PAGE_TYPE_INFO: dict[str, dict[str, Any]] = {
         "color": "#C68A2D",
         "description": "后记、版权、广告等整页资产不做漫画气泡迁移。",
     },
+    "target_only": {
+        "label": "TARGET 独有页 / 原样保留",
+        "process": False,
+        "color": "#B07A45",
+        "description": "高清 TARGET 中存在但中文版 SOURCE 没有对应页；保留 TARGET 原页并在整本摘要中继续标记为 unmatched。",
+    },
     "skip": {
         "label": "手动跳过",
         "process": False,

@@ -61,15 +61,26 @@ def emit_passthrough_page(
             source_size=source_size, target_size=target_size,
             diagnostics={"page_management": mark.to_dict()},
         )
-    final = Path(final_path) if final_path is not None else page_root / "final.png"
-    final.parent.mkdir(parents=True, exist_ok=True)
-    write_image(final, target)
+    # Page-local ``final.png`` is the canonical workspace artifact.  Whole-book
+    # processing also publishes a mirror under ``output/final``.  Passthrough
+    # used to write only the book mirror when ``final_path`` was supplied, which
+    # made workspace integrity fail for manual chapter-title skips even though
+    # the target page itself had been preserved correctly.
+    page_final = page_root / "final.png"
+    book_final = Path(final_path) if final_path is not None else page_final
+    page_final.parent.mkdir(parents=True, exist_ok=True)
+    book_final.parent.mkdir(parents=True, exist_ok=True)
+    write_image(page_final, target)
+    if book_final != page_final:
+        cloned = publish_independent_png(page_final, book_final)
+        if cloned is None:
+            write_image(book_final, target)
     # A passthrough content page can still need manual omission repair later.
     # Preserve the pair inside the page workspace when SOURCE pixels are
     # available so Codex/CLI results can be restored in the GUI without
     # rerunning registration/OCR. Keep the authority alias lossless and
     # non-duplicating on the common primary-source path.
-    passthrough_artifacts = {"final": str(final), "book_final": str(final)}
+    passthrough_artifacts = {"final": str(page_final), "book_final": str(book_final)}
     if source is not None:
         source_original = page_root / "source_original.png"
         source_authority_original = page_root / "source_authority_original.png"

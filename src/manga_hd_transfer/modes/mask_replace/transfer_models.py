@@ -67,6 +67,10 @@ class MaskTransferResult:
     matches: list[BubblePatchMatch]
     records: list[MaskTransferRecord]
     clear_mask: np.ndarray | None = None
+    # Explicit semantic ALLOW is intentionally sparse. It is used only when a
+    # strict two-image/changed-glyph path proves text authority outside Koharu's
+    # narrow polygon (for example a large undersegmented slanted letter raw box).
+    authority_allow_mask: np.ndarray | None = None
 
     @property
     def applied_count(self) -> int:

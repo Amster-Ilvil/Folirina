@@ -22,6 +22,7 @@ from .mask_transfer_audit import manual_reletter_required_rows, transfer_records
 from .storage_clone import publish_independent_png
 from .transfer_policy import (
     _replace_translation_regions,
+    _replace_translation_groups,
     _review_candidate_overlay,
     _write_replace_translation_bundle,
 )
@@ -110,8 +111,12 @@ def export_page_artifacts(
     page_root = Path(page_root)
 
     # Artifacts are intentionally explicit and lossless.
-    active_mode = "direct_patch" if direct_container_fast else str(project.meta.get("transfer_mode", "mask_replace") or "mask_replace").strip().lower()
-    active_mask_cfg = config.hybrid.mask if active_mode == "hybrid" else config.mask_replace
+    active_mode = str(project.meta.get("transfer_mode", "mask_replace") or "mask_replace").strip().lower()
+    active_mask_cfg = (
+        config.direct_patch if active_mode == "direct_patch"
+        else config.hybrid.mask if active_mode == "hybrid"
+        else config.mask_replace
+    )
     source_original_path = page_root / "source_original.png"
     authority_source_path_artifact = page_root / "source_authority_original.png"
     original_path = page_root / "target_original.png"
@@ -237,8 +242,9 @@ def export_page_artifacts(
             write_rgba(reletter_text_layer_path, text_rgba, params=sparse_png)
     chinese_rgba = np.zeros_like(text_rgba)
     if mask_transfer is not None:
-        if direct_container_fast:
-            # Direct has its own artifacts. Do not also write Mask/Hybrid aliases.
+        if active_mode == "direct_patch":
+            # Direct has its own artifacts even when only bounded Koharu semantic
+            # completion ran after the whole-container plan was rejected.
             write_rgba(direct_layer_path, transfer_rgba, params=sparse_png)
             write_image(direct_region_path, mask_transfer.composite_mask, params=sparse_png)
         elif active_mode == "hybrid":
@@ -258,7 +264,7 @@ def export_page_artifacts(
         export_openraster(ora_path, target, inpaint_result.image, text_rgba, transfer_rgba if mask_transfer is not None else None)
         psd_path = page_root / "editable.psd"
         active_transfer_layer_path = (
-            direct_layer_path if direct_container_fast
+            direct_layer_path if active_mode == "direct_patch"
             else hybrid_transfer_layer_path if active_mode == "hybrid"
             else transfer_layer_path
         )
@@ -283,7 +289,7 @@ def export_page_artifacts(
         write_image(page_root / "debug_clear_mask.png", mask_overlay(target, mask_result.mask))
         if mask_transfer is not None:
             debug_name = (
-                "debug_direct_patch.png" if direct_container_fast
+                "debug_direct_patch.png" if active_mode == "direct_patch"
                 else "debug_hybrid.png" if active_mode == "hybrid"
                 else "debug_mask_replace.png"
             )
@@ -296,7 +302,7 @@ def export_page_artifacts(
         for stale in page_root.glob("debug_*.png"):
             stale.unlink(missing_ok=True)
 
-    if mask_transfer is not None and not direct_container_fast and bool(getattr(active_mask_cfg, "save_patch_artifacts", True)):
+    if mask_transfer is not None and active_mode in {"mask_replace", "hybrid"} and bool(getattr(active_mask_cfg, "save_patch_artifacts", True)):
         transfer_json_path = hybrid_transfer_json_path if active_mode == "hybrid" else (page_root / "mask_transfer.json")
         save_json(
             transfer_json_path,
@@ -320,7 +326,7 @@ def export_page_artifacts(
             },
         )
 
-    if direct_container_fast and mask_transfer is not None:
+    if active_mode == "direct_patch" and mask_transfer is not None:
         save_json(
             page_root / "direct_patch.json",
             {
@@ -409,6 +415,7 @@ def export_page_artifacts(
             source_units, target_units, matches,
             overlap_threshold=float(getattr(config.matching, "replace_translation_overlap_gate", 0.30)),
         ),
+        "match_groups": _replace_translation_groups(source_units, target_units, matches),
         "unmatched_source": list(match_result.unmatched_source),
         "unmatched_target": list(match_result.unmatched_target),
         "ambiguous_source": list(match_result.ambiguous_source),

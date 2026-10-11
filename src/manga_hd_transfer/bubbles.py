@@ -15,6 +15,7 @@ from .geometry import bbox_polygon, mask_to_largest_polygon, polygon_bbox, polyg
 from .models import BubbleInstance, TextBlock, TextUnit
 from .mask_selection import _rigid_source_text_support
 from .runtime import accelerator_lock, select_device
+from .m6_runtime_plan import choose_detector_size
 
 _YOLO_MODEL_CACHE: dict[tuple[str, int, int], object] = {}
 _YOLO_MODEL_LOCK = threading.RLock()
@@ -627,7 +628,7 @@ def detect_mangalens_bubbles(
     from .vision_runtime import run_mangalens
     payload = run_mangalens(
         image, model_path=str(resolved), confidence=float(cfg.mangalens_confidence),
-        imgsz=int(cfg.mangalens_imgsz), device=str(cfg.device),
+        imgsz=choose_detector_size("mangalens", int(cfg.mangalens_imgsz), image.shape[:2], config=cfg), device=str(cfg.device),
     )
     h, w = image.shape[:2]; device = str(payload.get("device") or "isolated")
     bubbles: list[BubbleInstance] = []
@@ -688,7 +689,7 @@ def detect_koharu_layout_bubbles(
         sfx_threshold=float(cfg.koharu_layout_sfx_threshold),
         bubble_threshold=float(cfg.koharu_layout_bubble_threshold),
         panel_threshold=float(cfg.koharu_layout_panel_threshold),
-        shape=int(cfg.koharu_layout_shape),
+        shape=choose_detector_size("koharu_layout", int(cfg.koharu_layout_shape), image.shape[:2], config=cfg),
     )
     h, w = image.shape[:2]
     bubbles: list[BubbleInstance] = []

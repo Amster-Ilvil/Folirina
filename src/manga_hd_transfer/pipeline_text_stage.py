@@ -240,6 +240,27 @@ def run_text_stage(
             direct_container_plan.target_bubbles,
         )
 
+    # Explicit Direct never owns an OCR fallback. Historically this branch was
+    # hidden by an earlier passthrough return when the whole-container plan was
+    # rejected. Once Direct is allowed to continue into bounded Koharu semantic
+    # completion, keep the mode contract intact by using detector-only geometry
+    # and never instantiating SOURCE/TARGET OCR backends.
+    if mode == "direct_patch":
+        stats["ocr_source"] = "skipped_explicit_direct_semantic_only"
+        stats["ocr_target"] = "skipped_explicit_direct_semantic_only"
+        source_layout_blocks, source_layout_bubbles = _layout_only_blocks_and_bubbles(
+            "source", source, source_path, config=config, cache=cache, stats=stats
+        )
+        target_layout_blocks, target_layout_bubbles = _layout_only_blocks_and_bubbles(
+            "target", target, target_path, config=config, cache=cache, stats=stats
+        )
+        stats["bubbles_source"] = f"{primary_detector(config.bubbles)}_direct_semantic_only"
+        stats["bubbles_target"] = f"{primary_detector(config.bubbles)}_direct_semantic_only"
+        return TextStageResult(
+            None, source_layout_blocks, target_layout_blocks,
+            source_layout_bubbles, target_layout_bubbles,
+        )
+
     # v2.0.83 mode hard-isolation: explicit Precise Mask is a visual/pixel
     # transfer route.  It must never instantiate an OCR backend, even when
     # paired-diff is uncertain.  Use whatever OCR-free geometry is available;

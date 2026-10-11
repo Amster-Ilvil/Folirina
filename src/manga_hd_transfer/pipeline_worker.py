@@ -15,6 +15,7 @@ from .config import PipelineConfig
 from .models import PagePair
 from .page_management import PageMark
 from .pipeline import TransferPipeline, PipelineCancelled
+from .macos_processing_activity import processing_activity
 from .workspace import page_id_for_pair
 from .page_review_state import has_reapplicable_review_state, clear_reprocess_generated_artifacts
 from .review_apply import apply_review_page
@@ -39,6 +40,10 @@ class PipelineWorker(QThread):
         reapply_review_after_process: bool = False,
     ):
         super().__init__()
+        # Explicit user-initiated compute, not inherited background/UI QoS.
+        # Qt maps High to performance-oriented scheduling on Apple Silicon.
+        if hasattr(QThread, "QualityOfService"):
+            self.setServiceLevel(QThread.QualityOfService.High)
         self.config = config
         self.pair = pair
         self.source_dir = source_dir
@@ -68,6 +73,17 @@ class PipelineWorker(QThread):
         self.progress.emit(int(percent), 100, label, text, False)
 
     def run(self):
+        import time
+        started = time.perf_counter()
+        with processing_activity() as activity:
+            logger.info("GUI processing started mode=%s activity=%s", self.config.transfer.mode, activity)
+            try:
+                self._run_pipeline()
+            finally:
+                logger.info("GUI processing finished elapsed_seconds=%.3f activity=%s",
+                            time.perf_counter() - started, activity)
+
+    def _run_pipeline(self):
         try:
             pipeline = TransferPipeline(self.config)
             out = Path(self.output_dir)

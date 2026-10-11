@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import QWidget, QLabel, QPushButton, QHBoxLayout, QVBoxLayout, QCheckBox, QMessageBox
 
+from .gui_toast import notify
 from .gui_components import Card, PathRow
 from .gui_dialogs import confirm_action
 from .workspace_cleanup import cleanup_output_workspace
@@ -44,11 +45,11 @@ class ExportPage(QWidget):
 
     def _cleanup_pages(self):
         if self.window._busy_running():
-            QMessageBox.information(self, "任务进行中", "请等待当前处理、复核、模型维护或程序更新任务结束后再清理工作区。")
+            notify(self, "请等待当前处理、复核、模型维护或程序更新任务结束后再清理工作区。", "warning")
             return
         out=str(self.window.state.output_dir or "").strip()
         if not out:
-            QMessageBox.information(self,"没有输出目录","请先选择已有输出目录。")
+            notify(self, "请先选择已有输出目录。", "warning")
             return
         if not confirm_action(
             self, "清理冗余文件",

@@ -2066,6 +2066,7 @@ def build_source_direct_container_plan(
             tolerance_px=max(2, int(getattr(cfg, "content_completeness_tolerance_px", 2))),
             min_source_coverage=audit_min_source_coverage,
             max_target_residual=min(0.06, float(getattr(cfg, "content_completeness_max_target_residual", 0.10))),
+            target_invalidation_mask=local_write_mask,
         )
         rec.meta["content_audit_min_source_coverage"] = float(audit_min_source_coverage)
         rec.meta["source_raster_fidelity_audit"] = bool(source_fidelity_audit)

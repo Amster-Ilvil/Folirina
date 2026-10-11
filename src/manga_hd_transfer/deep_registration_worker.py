@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import traceback
+import gc
 from typing import Any
 
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
@@ -14,7 +15,38 @@ import cv2
 import numpy as np
 import torch
 
+try:
+    from .accelerator_policy import apply_torch_worker_policy, autocast_context, env_precision, resolve_precision
+except ImportError:  # executed directly by the isolated worker process
+    from accelerator_policy import apply_torch_worker_policy, autocast_context, env_precision, resolve_precision
+
+apply_torch_worker_policy(torch)
+
 _MODEL_CACHE: dict[tuple[Any, ...], Any] = {}
+
+
+def _trim_runtime_cache(*, unload_models: bool = False) -> dict[str, Any]:
+    before = len(_MODEL_CACHE)
+    if unload_models:
+        _MODEL_CACHE.clear()
+    gc.collect()
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    try:
+        mps = getattr(torch, "mps", None)
+        if mps is not None and hasattr(mps, "empty_cache"):
+            mps.empty_cache()
+    except Exception:
+        pass
+    return {
+        "trimmed": True,
+        "models_unloaded": bool(unload_models),
+        "model_cache_entries_before": int(before),
+        "model_cache_entries_released": int(before if unload_models else 0),
+    }
 
 
 def _gray_for_features(image: np.ndarray) -> np.ndarray:
@@ -58,6 +90,7 @@ def _lightglue(source: np.ndarray, target: np.ndarray, req: dict[str, Any], devi
     max_features = int(req.get("max_features", 4096))
     max_side = int(req.get("deep_max_side", 1800))
     device = torch.device(device_name)
+    precision = resolve_precision(device_name, req.get("precision", env_precision()))
     key = ("lightglue", feature, max_features, device_name)
     pair = _MODEL_CACHE.get(key)
     if pair is None:
@@ -80,8 +113,9 @@ def _lightglue(source: np.ndarray, target: np.ndarray, req: dict[str, Any], devi
 
     i0, s0 = to_tensor(source); i1, s1 = to_tensor(target)
     with torch.inference_mode():
-        f0, f1 = extractor.extract(i0), extractor.extract(i1)
-        m01 = matcher({"image0": f0, "image1": f1})
+        with autocast_context(torch, device_name, precision):
+            f0, f1 = extractor.extract(i0), extractor.extract(i1)
+            m01 = matcher({"image0": f0, "image1": f1})
         f0, f1, m01 = [rbd(x) for x in (f0, f1, m01)]
         matches = m01["matches"].detach().cpu().numpy()
         k0 = f0["keypoints"].detach().cpu().numpy(); k1 = f1["keypoints"].detach().cpu().numpy()
@@ -90,12 +124,13 @@ def _lightglue(source: np.ndarray, target: np.ndarray, req: dict[str, Any], devi
     else:
         sp = k0[matches[:, 0]].astype(np.float32) / max(s0, 1e-9)
         tp = k1[matches[:, 1]].astype(np.float32) / max(s1, 1e-9)
-    return sp, tp, f"lightglue-{feature}", {"device": device_name, "matches": int(len(matches)), "model_cache": True, "source_scale": float(s0), "target_scale": float(s1), "isolated_runtime": True}
+    return sp, tp, f"lightglue-{feature}", {"device": device_name, "precision": precision, "matches": int(len(matches)), "model_cache": True, "source_scale": float(s0), "target_scale": float(s1), "isolated_runtime": True}
 
 
 def _loftr(source: np.ndarray, target: np.ndarray, req: dict[str, Any], device_name: str):
     import kornia.feature as KF
     device = torch.device(device_name)
+    precision = resolve_precision(device_name, req.get("precision", env_precision()))
     key = ("loftr", "outdoor", device_name)
     matcher = _MODEL_CACHE.get(key)
     if matcher is None:
@@ -111,14 +146,15 @@ def _loftr(source: np.ndarray, target: np.ndarray, req: dict[str, Any], device_n
 
     a, sa = prep(source); b, sb = prep(target)
     with torch.inference_mode():
-        pred = matcher({"image0": a, "image1": b})
+        with autocast_context(torch, device_name, precision):
+            pred = matcher({"image0": a, "image1": b})
     sp = pred["keypoints0"].detach().cpu().numpy().astype(np.float32) / max(sa, 1e-9)
     tp = pred["keypoints1"].detach().cpu().numpy().astype(np.float32) / max(sb, 1e-9)
     conf = pred.get("confidence")
     if conf is not None and len(sp):
         conf_np = conf.detach().cpu().numpy(); keep = conf_np >= 0.25
         sp, tp = sp[keep], tp[keep]
-    return sp, tp, "loftr", {"device": device_name, "matches": int(len(sp)), "model_cache": True, "source_scale": float(sa), "target_scale": float(sb), "isolated_runtime": True}
+    return sp, tp, "loftr", {"device": device_name, "precision": precision, "matches": int(len(sp)), "model_cache": True, "source_scale": float(sa), "target_scale": float(sb), "isolated_runtime": True}
 
 
 def _match(req: dict[str, Any]) -> dict[str, Any]:
@@ -133,8 +169,20 @@ def _match(req: dict[str, Any]) -> dict[str, Any]:
     except Exception as first:
         if device == "cpu":
             raise
+        precision = resolve_precision(device, req.get("precision", env_precision()))
+        if device == "mps" and precision != "fp32":
+            # Precision failure is retried on the same MPS device first. This
+            # preserves acceleration without changing numerical behaviour of
+            # the stable FP32 path.
+            retry_req = dict(req); retry_req["precision"] = "fp32"
+            try:
+                sp, tp, method, diag = fn(source, target, retry_req, device)
+                diag["precision_fallback"] = f"{precision}->fp32:{type(first).__name__}"
+                return {"source_points": sp.tolist(), "target_points": tp.tolist(), "method": method, "diagnostics": diag}
+            except Exception as second:
+                first = second
         # MPS/CUDA kernels in third-party matchers may occasionally hit an
-        # unsupported op.  Retry in this isolated process on CPU; the GUI never
+        # unsupported op. Retry in this isolated process on CPU; the GUI never
         # sees a partial Torch import or corrupted module state.
         sp, tp, method, diag = fn(source, target, req, "cpu")
         diag["device_fallback"] = f"{device}->cpu:{type(first).__name__}"
@@ -151,6 +199,11 @@ def main() -> int:
             req = json.loads(raw); request_id = int(req.get("request_id", -1))
             if req.get("op") == "shutdown":
                 return 0
+            if req.get("op") == "trim_cache":
+                payload = _trim_runtime_cache(unload_models=bool(req.get("unload_models", False)))
+                row = {"ok": True, "request_id": request_id, **payload}
+                print(json.dumps(row, ensure_ascii=False), flush=True)
+                continue
             if req.get("op") != "match":
                 raise ValueError("unsupported op")
             payload = _match(req)

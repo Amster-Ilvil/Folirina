@@ -17,4 +17,11 @@ def bind_mode_runtime_config(config):
     elif mode == "reletter":
         runtime.mask_replace = runtime.reletter.candidates.model_copy(deep=True)
         runtime.lettering = runtime.reletter.lettering.model_copy(deep=True)
+        # Reletter is OCR-authoritative: silently substituting a different OCR
+        # engine changes the text that gets re-typeset while still presenting
+        # the result as the user's selected backend.  The mode specification
+        # explicitly declares fallback_policy="none", so enforce that on the
+        # runtime copy only.  Direct/Mask/Hybrid retain the global optional
+        # backend soft-fallback policy.
+        runtime.ocr.soft_fail_fallback_backend = "none"
     return runtime

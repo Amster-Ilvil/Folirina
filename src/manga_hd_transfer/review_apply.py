@@ -371,7 +371,18 @@ def _apply_mask_replace_review(page_dir: Path, project: dict, cfg: PipelineConfi
     target = read_image(page_dir / "target_original.png")
     overrides_probe = normalize_overrides(load_json(page_dir / "review_overrides.json") if (page_dir / "review_overrides.json").exists() else {})
     manual_force_present = (page_dir / "manual_force_transfer_mask.png").exists()
-    if manual_force_present:
+    # Clear-mask editing must also freeze the original automatic pixels BEFORE
+    # the first review commit mirrors them into mutable final.png.  Otherwise
+    # "恢复自动蒙版" cannot reconstruct the pre-edit result.
+    manual_clear_active = (page_dir / "manual_clear_mask.png").exists()
+    previous_review = (page_dir / "review_applied.json")
+    previous_had_clear = False
+    if previous_review.exists():
+        try:
+            previous_had_clear = bool(load_json(previous_review).get("manual_clear_mask", False))
+        except (OSError, ValueError, TypeError, AttributeError):
+            previous_had_clear = False
+    if manual_force_present or manual_clear_active:
         ensure_manual_baseline(page_dir)
     meta = _dict_or_empty(project.get("meta"))
     project_mode = str(meta.get("transfer_mode", "") or "").strip().lower()
@@ -404,7 +415,11 @@ def _apply_mask_replace_review(page_dir: Path, project: dict, cfg: PipelineConfi
     elif _dict_rows(overrides_probe.get("manual_effect_regions")) or manual_force_present:
         automatic_path = _manual_effect_overlay_base_path(page_dir)
     else:
-        automatic_path = page_dir / "final.png"
+        # A reset happens after the explicit mask has been removed, but the
+        # previous reviewed result is still mirrored in final.png at this point.
+        # Prefer the immutable automatic baseline for that single replay.
+        frozen = page_dir / "final_auto.png"
+        automatic_path = frozen if (manual_clear_active or previous_had_clear) and frozen.exists() else page_dir / "final.png"
     automatic = read_image(automatic_path) if automatic_path.exists() else None
     if automatic is not None and automatic.shape != target.shape:
         automatic = None

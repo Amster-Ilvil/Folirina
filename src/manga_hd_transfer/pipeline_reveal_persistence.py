@@ -25,7 +25,7 @@ from .page_management import PageMark
 from .page_pairing import PagePairingCheck
 from .result_state import commit_automatic_result
 from .detector_policy import auxiliary_detectors, detector_strategy, primary_detector
-from .cache import page_job_fingerprint
+from .cache import PageStageCache, page_job_fingerprint
 from .runtime import runtime_summary
 from .qa import qa_summary
 from .mode_contracts import get_mode_contract, mode_artifact_violations, mode_execution_violations
@@ -77,8 +77,20 @@ def _collect_text_only_erase_mask(result: TransparentBubbleResult) -> np.ndarray
     return out
 
 
-def _write_transparent_reveal_debug_artifacts(page_root: Path, target: np.ndarray, result: TransparentBubbleResult, bubble_cfg) -> dict[str, str]:
-    layout = collect_koharu_layout_evidence_cached(target, bubble_cfg, role='transparent_debug_target', allow_missing=True)
+def _write_transparent_reveal_debug_artifacts(
+    page_root: Path, target: np.ndarray, result: TransparentBubbleResult, bubble_cfg,
+    *, target_path: str | Path | None = None,
+) -> dict[str, str]:
+    # The page-flow has already paid for TARGET Koharu before this persistence
+    # boundary. Reuse that exact page cache instead of launching a second RF-DETR
+    # inference merely to draw diagnostics. Besides wasting CPU, the duplicate
+    # inference can dominate/timeout an otherwise completed transparent run.
+    stage_cache = PageStageCache(page_root, enabled=True)
+    layout = collect_koharu_layout_evidence_cached(
+        target, bubble_cfg, role='target',
+        image_path=str(target_path) if target_path is not None else None,
+        cache=stage_cache, cache_enabled=True, allow_missing=True,
+    )
     shape = target.shape[:2]
     if bool(getattr(layout, 'available', False)):
         bubble_mask = layout.combined_mask(('bubble',), dilate_px=0)
@@ -395,7 +407,7 @@ def emit_transparent_bubble_page(
     if not _replace_with_hardlink(target_clear_mask, clear_mask):
         write_image(target_clear_mask, result.clear_mask, params=sparse_png)
     write_image(review_preview, mask_overlay(target, result.clear_mask) if cv2.countNonZero(result.clear_mask) else target)
-    debug_artifacts = _write_transparent_reveal_debug_artifacts(page_root, target, result, config.bubbles)
+    debug_artifacts = _write_transparent_reveal_debug_artifacts(page_root, target, result, config.bubbles, target_path=pair.target_path)
     semantic_artifacts = _write_semantic_artifacts(page_root, target, result, config.semantic)
 
     regions = [r.to_dict() for r in result.plan.regions]

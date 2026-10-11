@@ -6,6 +6,7 @@ import inspect
 
 import cv2
 import numpy as np
+from .performance_receipt import sample_process, performance_delta
 
 from .config import PipelineConfig
 from .cache import RESUME_SCHEMA
@@ -22,6 +23,7 @@ from .run_receipt import write_run_receipt
 from .workspace_guard import PageRunGuard, cleanup_orphan_temp_files
 from .workspace_integrity import validate_page_workspace
 from .run_status import status_from_project
+from .selective_replay import write_selective_replay_plan
 
 
 def _selected_strategy(project: PageProject) -> str:
@@ -53,13 +55,28 @@ def _mode_effect_summary(project: PageProject, mode: str, selected_strategy: str
             owner = probe
             break
     applied = None
-    for key in ("applied_count", "successful_regions", "accepted_count", "region_count"):
+    # Mode-owned publication counters use slightly different names.  Normalize
+    # them here so first-time runs do not become NOOP merely because there is no
+    # previous final.png available for a pixel comparison.
+    for key in (
+        "applied_count", "applied_region_count", "mask_stage_applied_count",
+        "successful_regions", "accepted_count", "region_count",
+    ):
         if key in owner:
             try:
                 applied = int(owner.get(key) or 0)
                 break
             except (TypeError, ValueError):
                 pass
+    diagnostics = owner.get("diagnostics") if isinstance(owner, dict) else None
+    if applied is None and isinstance(diagnostics, dict):
+        for key in ("applied_region_count", "applied_count", "successful_regions", "accepted_count", "region_count"):
+            if key in diagnostics:
+                try:
+                    applied = int(diagnostics.get(key) or 0)
+                    break
+                except (TypeError, ValueError):
+                    pass
     records = owner.get("records") if isinstance(owner, dict) else None
     if applied is None and isinstance(records, list):
         applied = sum(1 for row in records if isinstance(row, dict) and bool(row.get("applied", True)))
@@ -167,6 +184,7 @@ def run_page_lifecycle(
     previous_trace = get_trace()
     set_trace(trace)
     snapshot = None
+    performance_start = sample_process()
     try:
         # The lock must precede the snapshot.  Otherwise a second request can
         # copy a page while the active writer is midway through publication and
@@ -266,6 +284,8 @@ def run_page_lifecycle(
                         "applied_regions": int(publish_effect.get("applied_regions") or 0),
                     }
                 project.meta["resume_contract"] = RESUME_SCHEMA
+                project.meta["host_performance"] = performance_delta(performance_start, sample_process())
+                trace.event("host_performance", **project.meta["host_performance"])
                 project.meta["run_receipt"] = write_run_receipt(
                     root, project, requested_mode=mode, selected_strategy=selected_strategy, run_id=trace.run_id,
                 )
@@ -280,6 +300,9 @@ def run_page_lifecycle(
                             meta={"issues": list(integrity.get("issues") or []), "mode": mode},
                         ))
                 project.meta["qa_summary"] = qa_summary(project.qa)
+                replay_path, replay_plan = write_selective_replay_plan(root, project)
+                project.meta["selective_replay"] = replay_plan
+                project.artifacts["selective_replay_plan"] = str(replay_path)
                 terminal_status = status_from_project(project, integrity, publish_effect)
                 project.meta["run_status"] = str(terminal_status)
                 save_json(root / "qa.json", {"summary": qa_summary(project.qa), "issues": [x.to_dict() for x in project.qa]})

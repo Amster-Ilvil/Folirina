@@ -19,6 +19,7 @@ from ...qa import run_direct_patch_qa, run_mask_replace_qa, run_page_qa
 from .pixel_stage import run_pixel_transfer_stage, _merge_mask_transfer
 from ...pipeline_transfer_authority import (
     collect_transfer_layout_authority,
+    apply_target_koharu_page_furniture_guard,
     _filter_completion_pairs_by_koharu_authority,
 )
 from ...pipeline_transfer_qa import (
@@ -106,7 +107,7 @@ def run_transfer_execution_stage(
     # Auxiliary detectors never gain destructive ownership.
     authority = collect_transfer_layout_authority(
         config=config, source=source, target=target, stage_cache=stage_cache,
-        cache_stats=cache_stats, source_path=source_path, target_path=target_path,
+        cache_stats=cache_stats, source_path=source_path, target_path=target_path, registration=registration,
     )
     source_layout_authority = authority.source
     target_layout_authority = authority.target
@@ -124,6 +125,11 @@ def run_transfer_execution_stage(
         cache_stats=cache_stats, target_path=target_path,
     )
     mask_transfer = pixel_state.mask_transfer
+    koharu_page_furniture_diag = apply_target_koharu_page_furniture_guard(
+        mask_transfer, target, target_layout_authority,
+    ) if mask_transfer is not None else {"enabled": False, "protected_items": 0, "restored_pixels": 0}
+    if cache_stats is not None:
+        cache_stats["koharu_page_furniture_guard"] = dict(koharu_page_furniture_diag)
     unseeded_white_pair_count = pixel_state.unseeded_white_pair_count
     completion_display_source = pixel_state.completion_display_source
     completion_display_target = pixel_state.completion_display_target

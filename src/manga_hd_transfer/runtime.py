@@ -18,6 +18,17 @@ from typing import Any
 
 import cv2
 
+from .m6_runtime_plan import build_m6_runtime_plan
+
+from .accelerator_policy import (
+    apply_torch_worker_policy,
+    detect_apple_hardware,
+    recommended_cpu_threads,
+    recommended_mps_memory_fraction,
+    resolve_precision,
+    runtime_env_updates,
+)
+
 
 _ACCELERATOR_LOCK = threading.RLock()
 _CONFIGURED = False
@@ -39,6 +50,11 @@ class DeviceInfo:
     allocated_gb: float | None = None
     driver_allocated_gb: float | None = None
     recommended_max_gb: float | None = None
+    chip: str = ""
+    architecture: str = ""
+    memory_gb: float | None = None
+    hardware_profile: str = "generic"
+    precision: str = "fp32"
     note: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -53,38 +69,24 @@ class DeviceInfo:
             "allocated_gb": self.allocated_gb,
             "driver_allocated_gb": self.driver_allocated_gb,
             "recommended_max_gb": self.recommended_max_gb,
+            "chip": self.chip,
+            "architecture": self.architecture,
+            "memory_gb": self.memory_gb,
+            "hardware_profile": self.hardware_profile,
+            "precision": self.precision,
             "note": self.note,
         }
 
 
 def _apply_torch_policy(torch) -> None:
-    """Apply the already-computed runtime policy to a lazily imported Torch.
-
-    OpenCV-only Direct/Mask runs should not pay Torch's multi-second import cost.
-    When a Torch-backed detector/registration model is actually requested, this
-    helper applies the same thread and MPS-memory limits immediately after import.
-    """
+    """Apply the shared live hardware policy after Torch is imported."""
     global _TORCH_POLICY_APPLIED
     if _TORCH_POLICY_APPLIED:
         return
     try:
-        torch.set_num_threads(max(1, int(_LAST_THREADS)))
-    except Exception:
-        pass
-    try:
-        torch.set_num_interop_threads(max(1, min(2, int(_LAST_THREADS))))
-    except RuntimeError:
-        pass
-    except Exception:
-        pass
-    if _mps_available(torch):
-        fraction = float(_LAST_MPS_MEMORY_FRACTION)
-        if 0.10 <= fraction <= 1.0 and hasattr(torch.mps, "set_per_process_memory_fraction"):
-            try:
-                torch.mps.set_per_process_memory_fraction(fraction)
-            except Exception:
-                pass
-    _TORCH_POLICY_APPLIED = True
+        apply_torch_worker_policy(torch)
+    finally:
+        _TORCH_POLICY_APPLIED = True
 
 
 def _import_torch():
@@ -113,7 +115,15 @@ def configure_runtime(config=None) -> dict[str, Any]:
     min_threads = int(getattr(config, "min_cpu_threads", 1) if config is not None else 1)
     max_threads = int(getattr(config, "max_cpu_threads", 8) if config is not None else 8)
     cores = max(1, os.cpu_count() or 4)
-    threads = max(min_threads, min(max_threads, int(round(cores * ratio))))
+    hw = detect_apple_hardware()
+    m6_auto = bool(getattr(config, "m6_auto", True) if config is not None else True)
+    thread_auto = bool(getattr(config, "cpu_thread_auto", True) if config is not None else True)
+    auto_hw = bool(m6_auto and (hw.is_apple_silicon or hw.accelerator_backend != "cpu"))
+    if thread_auto and auto_hw:
+        threads = recommended_cpu_threads(hw, default=max(1, int(round(cores * ratio))))
+        threads = max(min_threads, min(max_threads, int(threads)))
+    else:
+        threads = max(min_threads, min(max_threads, int(round(cores * ratio))))
 
     # Must be set before importing torch for unsupported MPS op fallback to work.
     if platform.system() == "Darwin" and bool(getattr(config, "mps_fallback", True) if config is not None else True):
@@ -127,9 +137,14 @@ def configure_runtime(config=None) -> dict[str, Any]:
         cv2.setNumThreads(threads)
     except Exception:
         pass
+    actual_opencv_threads = int(cv2.getNumThreads())
 
     _LAST_THREADS = int(threads)
-    _LAST_MPS_MEMORY_FRACTION = float(getattr(config, "mps_memory_fraction", 0.82) if config is not None else 0.82)
+    memory_auto = bool(getattr(config, "mps_memory_auto", True) if config is not None else True)
+    configured_fraction = float(getattr(config, "mps_memory_fraction", 0.82) if config is not None else 0.82)
+    _LAST_MPS_MEMORY_FRACTION = (
+        recommended_mps_memory_fraction(hw) if memory_auto and hw.mps_available and m6_auto else configured_fraction
+    )
     # Do not import Torch just to configure a run that may stay entirely on
     # OpenCV/CPU. If Torch was already loaded by a requested model, refresh its
     # limits; otherwise _import_torch() applies them lazily on first real use.
@@ -138,11 +153,35 @@ def configure_runtime(config=None) -> dict[str, Any]:
         _TORCH_POLICY_APPLIED = False
         _apply_torch_policy(loaded_torch)
 
+    # Propagate the selected policy to isolated Torch/vision workers.
+    try:
+        requested_precision = str(getattr(config, "mps_precision", "auto") if config is not None else "auto")
+        effective_precision = requested_precision
+        if requested_precision == "auto" and hw.is_apple_silicon and not m6_auto:
+            effective_precision = "fp32"
+        for key, value in runtime_env_updates(
+            precision=effective_precision,
+            memory_fraction=_LAST_MPS_MEMORY_FRACTION,
+        ).items():
+            os.environ[key] = str(value)
+        os.environ["MHD_CPU_THREADS"] = str(threads)
+    except Exception:
+        pass
+
     _CONFIGURED = True
     _LAST_POLICY = {
         "cpu_cores": cores,
         "cpu_threads": threads,
+        "opencv_effective_threads": actual_opencv_threads,
+        "opencv_thread_limit_honored": actual_opencv_threads <= threads,
         "mps_fallback": os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK", "0"),
+        "mps_memory_fraction": _LAST_MPS_MEMORY_FRACTION,
+        "mps_memory_auto": memory_auto,
+        "mps_precision": effective_precision,
+        "m6_auto": m6_auto,
+        "hardware_profile": hw.profile,
+        "chip": hw.chip,
+        "memory_gb": hw.memory_gb,
         "platform": platform.platform(),
     }
     return dict(_LAST_POLICY)
@@ -184,18 +223,27 @@ def torch_device(preferred: str = "auto"):
 
 def device_info(preferred: str = "auto", *, probe_torch: bool = True) -> DeviceInfo:
     preferred = (preferred or "auto").lower().strip()
+    hw = detect_apple_hardware()
     if preferred == "cpu":
         installed = importlib.util.find_spec("torch") is not None
-        return DeviceInfo(preferred, "cpu", True, "CPU", installed, note="CPU 模式。")
+        return DeviceInfo(
+            preferred, "cpu", True, "CPU", installed, chip=hw.chip, architecture=hw.architecture,
+            memory_gb=hw.memory_gb, hardware_profile=hw.profile, precision="fp32", note="CPU 模式。"
+        )
     if not probe_torch and "torch" not in sys.modules:
         installed = importlib.util.find_spec("torch") is not None
         return DeviceInfo(
-            preferred, "cpu", True, "CPU", installed,
+            preferred, "cpu", True, "CPU", installed, chip=hw.chip, architecture=hw.architecture,
+            memory_gb=hw.memory_gb, hardware_profile=hw.profile, precision="fp32",
             note="Torch 未加载；本次当前路径保持 OpenCV/CPU，未为设备探测额外加载 Torch。",
         )
     torch = _import_torch()
     if torch is None:
-        return DeviceInfo(preferred, "cpu", True, "CPU", False, note="PyTorch 未安装；仅使用 OpenCV/CPU。")
+        return DeviceInfo(
+            preferred, "cpu", True, "CPU", False, chip=hw.chip, architecture=hw.architecture,
+            memory_gb=hw.memory_gb, hardware_profile=hw.profile, precision="fp32",
+            note="PyTorch 未安装；仅使用 OpenCV/CPU。"
+        )
 
     selected = select_device(preferred)
     mps_built = False
@@ -218,27 +266,38 @@ def device_info(preferred: str = "auto", *, probe_torch: bool = True) -> DeviceI
                 return round(float(fn()) / 1024**3, 3)
             except Exception:
                 return None
+        precision = resolve_precision("mps", os.environ.get("MHD_MPS_PRECISION", "auto"), hw)
         return DeviceInfo(
             preferred, selected, True, name, True,
             mps_built=mps_built, mps_available=mps_available,
             allocated_gb=gb(getattr(torch.mps, "current_allocated_memory", lambda: 0)),
             driver_allocated_gb=gb(getattr(torch.mps, "driver_allocated_memory", lambda: 0)),
             recommended_max_gb=gb(getattr(torch.mps, "recommended_max_memory", lambda: 0)),
-            note="LightGlue / LoFTR / MangaLens / 可选 Torch 超分可走 MPS；OpenCV/SIFT 继续走 CPU。",
+            chip=hw.chip, architecture=hw.architecture, memory_gb=hw.memory_gb,
+            hardware_profile=hw.profile, precision=precision,
+            note="MPS 深度模型可使用硬件感知精度；失败时同设备回退 FP32，再回退 CPU。OpenCV/SIFT 继续走 CPU。",
         )
     if selected == "cuda":
         try:
             name = torch.cuda.get_device_name(0)
         except Exception:
             name = "CUDA"
-        return DeviceInfo(preferred, selected, True, name, True, mps_built=mps_built, mps_available=mps_available)
+        return DeviceInfo(
+            preferred, selected, True, name, True, mps_built=mps_built, mps_available=mps_available,
+            chip=hw.chip, architecture=hw.architecture, memory_gb=hw.memory_gb,
+            hardware_profile=hw.profile, precision="fp32",
+        )
     if preferred == "mps":
         note = "MPS 不可用，已回退 CPU。"
     elif preferred == "cuda":
         note = "CUDA 不可用，已回退 CPU。"
     else:
         note = "未检测到可用 CUDA/MPS，使用 CPU。"
-    return DeviceInfo(preferred, "cpu", True, "CPU", True, mps_built=mps_built, mps_available=mps_available, note=note)
+    return DeviceInfo(
+        preferred, "cpu", True, "CPU", True, mps_built=mps_built, mps_available=mps_available,
+        chip=hw.chip, architecture=hw.architecture, memory_gb=hw.memory_gb,
+        hardware_profile=hw.profile, precision="fp32", note=note
+    )
 
 
 def accelerator_lock():
@@ -293,4 +352,37 @@ def empty_accelerator_cache(preferred: str = "auto") -> None:
 def runtime_summary(preferred: str = "auto", *, probe_torch: bool = False) -> dict[str, Any]:
     if not _CONFIGURED:
         configure_runtime(None)
-    return {"policy": dict(_LAST_POLICY), "device": device_info(preferred, probe_torch=probe_torch).to_dict()}
+    hw = detect_apple_hardware()
+    from .accelerator_policy import hardware_fingerprint, memory_budget_gb, current_available_memory_gb
+    hardware = hw.to_dict()
+    hardware.update({
+        "hardware_fingerprint": hardware_fingerprint(hw),
+        "available_memory_gb": current_available_memory_gb(),
+        "memory_budget_gb": round(memory_budget_gb(hw), 2),
+    })
+    summary = {
+        "policy": dict(_LAST_POLICY),
+        "hardware": hardware,
+        "device": device_info(preferred, probe_torch=probe_torch).to_dict(),
+        "m6_runtime_plan": build_m6_runtime_plan(None, hw=hw).to_dict(),
+    }
+    try:
+        from .m6_runtime_plan import m6_ocr_backend_order
+        summary["m6_japanese_ocr"] = {
+            "order": list(m6_ocr_backend_order(config=None, japanese_vertical=True, hw=hw)),
+            "policy": "whole-page NDL → crop Hayai → crop 48px",
+        }
+    except Exception as exc:
+        summary["m6_japanese_ocr"] = {"order": [], "error": f"{type(exc).__name__}: {exc}"}
+    try:
+        from .mlx_runtime import status as mlx_status
+        summary["mlx"] = mlx_status()
+    except Exception as exc:
+        summary["mlx"] = {"available": False, "error": f"{type(exc).__name__}: {exc}"}
+    try:
+        import onnxruntime as ort
+        from .onnx_coreml import probe_coreml
+        summary["coreml"] = {"version": getattr(ort, "__version__", ""), **probe_coreml(ort)}
+    except Exception as exc:
+        summary["coreml"] = {"available": False, "error": f"{type(exc).__name__}: {exc}"}
+    return summary

@@ -16,12 +16,13 @@ from .mode_contracts import (
     mode_artifact_violations,
     mode_execution_violations,
     mode_ocr_execution_violations,
-    ocr_route_executed,
+    ocr_execution_summary,
 )
 from .models import PageProject, QAItem
 from .qa import qa_summary
 from .runtime import runtime_summary
-from .transfer_policy import _replace_translation_regions
+from .selective_replay import write_selective_replay_plan
+from .transfer_policy import _replace_translation_groups, _replace_translation_regions
 from .workspace_cleanup import cleanup_page_workspace
 
 
@@ -144,14 +145,15 @@ def assemble_page_project(
             "runtime": runtime_summary(config.runtime.device),
             "registration_route": registration.diagnostics.get("route", registration.method),
             "direct_patch": {
-                "used": bool(direct_container_fast),
+                "used": bool(mode == "direct_patch" and mask_transfer is not None),
                 "requested": bool(mode == "direct_patch"),
                 "diagnostics": dict(direct_container_plan.diagnostics) if direct_container_plan is not None else {},
                 "contract": "borderless_source_overlay_target_underlay",
-                "applied_count": mask_transfer.applied_count if (direct_container_fast and mask_transfer is not None) else 0,
-                "records": transfer_records_to_dict(active_records) if direct_container_fast else [],
-                "bubble_matches": [m.to_dict() for m in active_matches] if direct_container_fast else [],
-                "review_regions": active_review_regions if direct_container_fast else [],
+                "semantic_only": bool(mode == "direct_patch" and mask_transfer is not None and not direct_container_fast),
+                "applied_count": mask_transfer.applied_count if (mode == "direct_patch" and mask_transfer is not None) else 0,
+                "records": transfer_records_to_dict(active_records) if (mode == "direct_patch" and mask_transfer is not None) else [],
+                "bubble_matches": [m.to_dict() for m in active_matches] if (mode == "direct_patch" and mask_transfer is not None) else [],
+                "review_regions": active_review_regions if (mode == "direct_patch" and mask_transfer is not None) else [],
                 # Keep Direct safety-review candidates even when Auto falls through
                 # to Mask so manual effect omissions remain actionable in the GUI.
                 "manual_effect_candidates": direct_manual_effect_candidates,
@@ -191,6 +193,7 @@ def assemble_page_project(
                     source_units, target_units, matches,
                     overlap_threshold=float(getattr(config.matching, "replace_translation_overlap_gate", 0.30)),
                 ),
+                "match_groups": _replace_translation_groups(source_units, target_units, matches),
                 "unmatched_source": list(match_result.unmatched_source),
                 "unmatched_target": list(match_result.unmatched_target),
                 "ambiguous_source": list(match_result.ambiguous_source),
@@ -266,27 +269,43 @@ def finalize_page_project(
     qa = project.qa
     execution_violations = mode_execution_violations(
         mode,
-        direct_used=bool(direct_container_fast),
-        mask_used=bool(mask_transfer is not None and not direct_container_fast),
+        direct_used=bool(mode == "direct_patch" and mask_transfer is not None),
+        mask_used=bool(mask_transfer is not None and not direct_container_fast and mode in {"auto", "mask_replace", "hybrid"}),
         reletter_used=bool(lettering),
     )
     cache_meta = (project.meta.get("cache") or {}) if isinstance(project.meta, dict) else {}
     ocr_execution_violations = mode_ocr_execution_violations(mode, cache_meta)
     all_execution_violations = list(execution_violations) + list(ocr_execution_violations)
     isolation_violations = mode_artifact_violations(mode, page_root, selected_strategy=decision.strategy)
+    ocr_execution = ocr_execution_summary(cache_meta)
+    direct_used = bool(mode == "direct_patch" and mask_transfer is not None)
+    mask_used = bool(mask_transfer is not None and not direct_container_fast and mode in {"auto", "mask_replace", "hybrid"})
     project.meta["mode_execution"] = {
         "pass": not bool(all_execution_violations),
         "violations": all_execution_violations,
-        "direct_used": bool(direct_container_fast),
-        "mask_used": bool(mask_transfer is not None and not direct_container_fast),
+        "direct_used": direct_used,
+        "mask_used": mask_used,
         "reletter_used": bool(lettering),
-        "ocr_used": bool(
-            ocr_route_executed(cache_meta.get("ocr_source"))
-            or ocr_route_executed(cache_meta.get("ocr_target"))
-        ),
+        # Legacy field now means OCR evidence was actually consumed/produced,
+        # not merely that a NullOCR decision route was entered.
+        "ocr_used": bool(ocr_execution["evidence_available"]),
+        "ocr_route_entered": bool(ocr_execution["route_entered"]),
+        "ocr_backend_available": bool(ocr_execution["backend_available"]),
+        "ocr_model_invoked": bool(ocr_execution["model_invoked"]),
+        "ocr_evidence_available": bool(ocr_execution["evidence_available"]),
         "ocr_source_route": str(cache_meta.get("ocr_source", "")),
         "ocr_target_route": str(cache_meta.get("ocr_target", "")),
+        "ocr": ocr_execution,
     }
+    if mode == "hybrid" and mask_used and bool(ocr_execution["route_entered"]) and not bool(ocr_execution["evidence_available"]):
+        project.meta["degraded"] = {
+            "enabled": True,
+            "reason": "hybrid_ocr_unavailable_mask_fallback",
+            "fallback": "mask_replace",
+            "ocr": ocr_execution,
+        }
+    else:
+        project.meta.pop("degraded", None)
     project.meta["mode_isolation"] = {
         "pass": not bool(isolation_violations),
         "violations": list(isolation_violations),
@@ -307,6 +326,9 @@ def finalize_page_project(
         ))
     project.qa = qa
     project.meta["qa_summary"] = qa_summary(qa)
+    replay_path, replay_plan = write_selective_replay_plan(page_root, project)
+    project.meta["selective_replay"] = replay_plan
+    project.artifacts["selective_replay_plan"] = str(replay_path)
     save_json(page_root / "qa.json", {"summary": qa_summary(qa), "issues": [x.to_dict() for x in qa]})
     save_json(page_root / "project.json", project.to_dict())
 

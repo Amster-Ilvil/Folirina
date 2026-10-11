@@ -16,15 +16,50 @@ from typing import Any
 
 _GUI_FILES = (
     "gui_qt.py",
+    "studio_workbench_page.py",
+    "studio_workbench_actions.py",
+    "studio_review_views.py",
+    "studio_ocr_editor.py",
+    "studio_region_editor.py",
     "studio_project_page.py",
     "studio_model_page.py",
     "studio_export_page.py",
     "studio_settings_page.py",
+    "studio_project_controller.py",
+    "studio_workspace_page.py",
 )
 
 
 def _read(package_root: Path, name: str) -> str:
     return (package_root / name).read_text(encoding="utf-8")
+
+
+
+
+def read_studio_ui_source(package_root: str | Path | None = None) -> str:
+    """Return the modular Studio UI as one stable source-contract stream.
+
+    Several regression tests intentionally inspect GUI source without importing
+    Qt.  After the Phase-3 split, editor code no longer lives physically in
+    ``gui_qt.py``; this helper preserves those source-level contracts without
+    forcing the implementation back into a monolith.
+    """
+    root = Path(package_root) if package_root is not None else Path(__file__).resolve().parent
+    ordered = (
+        "studio_review_views.py",
+        "studio_ocr_editor.py",
+        "studio_region_editor.py",
+        "studio_workbench_actions.py",
+        "studio_workbench_page.py",
+        "gui_qt.py",
+        "studio_project_page.py",
+        "studio_model_page.py",
+        "studio_export_page.py",
+        "studio_settings_page.py",
+        "studio_project_controller.py",
+        "studio_workspace_page.py",
+    )
+    return "\n".join(_read(root, name) for name in ordered)
 
 
 def _self_button_wiring_issues(path: Path) -> list[str]:
@@ -69,7 +104,8 @@ def run_gui_interaction_audit(package_root: str | Path | None = None) -> dict[st
     models = sources["studio_model_page.py"]
     export = sources["studio_export_page.py"]
     page_prep = _read(root, "pipeline_page_prep.py")
-    restore_block = gui.split("def restore_existing_results(self):", 1)[1].split("def _pair_now", 1)[0]
+    project_controller = sources["studio_project_controller.py"]
+    restore_block = project_controller.split("def restore_existing_results(self):", 1)[1].split("def _pair_now", 1)[0]
     batch_block = gui.split("def _run_book_explicit(self, *, resume: bool):", 1)[1].split("def run_book", 1)[0]
 
     checks = {
@@ -88,7 +124,7 @@ def run_gui_interaction_audit(package_root: str | Path | None = None) -> dict[st
             'persist_font_expression(self.manual_font.text().strip(), strict=True)',
             'persist_font_expression(raw, strict=True)',
         ]),
-        "global_stop_becomes_visible_off_project_page": "self.stop_button.setVisible(visible)" in gui and "self.stack.currentIndex() != 0" in gui,
+        "global_stop_becomes_visible_off_project_page": "self.stop_button.setVisible(visible)" in gui and "self.stack.currentIndex() != self.page_index(\"project\")" in gui,
         "global_stop_is_attached_to_rail_layout": "rail_tools.addWidget(self.stop_button,2,0,1,2)" in gui,
         "pipeline_worker_released_after_finish": "worker = self.worker" in gui and "self.worker = None" in gui and "worker.deleteLater()" in gui,
         "model_write_participates_in_global_busy": "model_write_running=hasattr(self, \"models\") and self.models.has_write_task_running()" in gui,
@@ -101,7 +137,7 @@ def run_gui_interaction_audit(package_root: str | Path | None = None) -> dict[st
         "export_cleanup_matches_component_mask_copy": "cleanup_output_workspace(out, aggressive_component_masks=True)" in export,
         "fresh_page_run_uses_strict_mode_cleanup": "clear_stale_mode_outputs(root, strict=True)" in page_prep,
         "shared_application_confirmation_dialog": "from .gui_dialogs import confirm_action" in all_source,
-        "restore_reads_processed_results_only": "scan_existing_results(path, processed_only=True)" in restore_block,
+        "restore_reads_processed_results_only": "scan_existing_results(scan_path, processed_only=True)" in restore_block,
         "restore_never_pairs_implicitly": "pair_directories" not in restore_block and "expand_restored_session_pairs" not in restore_block,
         "whole_book_never_pairs_implicitly": "self._pair_now()" not in batch_block and "book_pairing_ready" in batch_block,
     }

@@ -222,8 +222,12 @@ class ReletterExecutor:
                 if bool(getattr(backend, "supports_crop_recognition", True)) and not bool(
                     getattr(backend, "supports_region_query", False)
                 ):
-                    raw = backend.recognize(crop, image_path=None)
-                    ocr_route = "masked_crop"
+                    if hasattr(backend, "recognize_manga_region"):
+                        raw = backend.recognize_manga_region(crop, orientation=region.orientation)
+                        ocr_route = "masked_crop_manga_orientation"
+                    else:
+                        raw = backend.recognize(crop, image_path=None)
+                        ocr_route = "masked_crop"
                     query_diag = {
                         "route": "masked_crop",
                         "input_blocks": len(raw),
@@ -257,7 +261,79 @@ class ReletterExecutor:
                     continue
 
                 confs = [float(x.confidence) for x in raw if str(x.text).strip()]
-                conf = float(np.mean(confs)) if confs else 0.88
+                raw_backend = str((raw[0].meta or {}).get("backend", "") if raw else "").lower()
+                # Tesseract vertical manga OCR is column-based. One difficult
+                # glyph column should not drag an otherwise stable transcript
+                # below the global acceptance threshold, so use the robust
+                # median for this fallback only. Other OCR engines keep their
+                # historical mean-confidence semantics.
+                conf = (
+                    float(np.median(confs)) if confs and raw_backend == "tesseract"
+                    else float(np.mean(confs)) if confs
+                    else 0.88
+                )
+                if raw_backend == "tesseract":
+                    cjk_count = sum(
+                        1 for ch in str(text_value)
+                        if "\u3040" <= ch <= "\u30ff" or "\u3400" <= ch <= "\u9fff"
+                    )
+                    # Do not let a median region confidence hide one structurally
+                    # unreliable CJK column.  Tesseract is a cloud/runtime fallback,
+                    # so incomplete consensus or a near-zero glyph column must be
+                    # review-only instead of silently entering publication pixels.
+                    cjk_child_confidences = []
+                    consensus_coverages = []
+                    consensus_agreements = []
+                    for child in raw:
+                        child_text = str(getattr(child, "text", "") or "")
+                        child_cjk = sum(
+                            1 for ch in child_text
+                            if "\u3040" <= ch <= "\u30ff" or "\u3400" <= ch <= "\u9fff"
+                        )
+                        if child_cjk > 0:
+                            cjk_child_confidences.append(float(getattr(child, "confidence", 0.0) or 0.0))
+                        child_meta = dict(getattr(child, "meta", {}) or {})
+                        if bool(child_meta.get("column_consensus")):
+                            consensus_coverages.append(float(child_meta.get("consensus_char_coverage", 0.0) or 0.0))
+                            consensus_agreements.append(float(child_meta.get("consensus_pairwise_agreement", 0.0) or 0.0))
+                    min_child = min(cjk_child_confidences) if cjk_child_confidences else 1.0
+                    min_consensus_coverage = min(consensus_coverages) if consensus_coverages else 1.0
+                    min_consensus_agreement = min(consensus_agreements) if consensus_agreements else 1.0
+                    review_reasons = []
+                    if min_child < float(getattr(self.config.ocr, "tesseract_region_review_min_child_confidence", 0.35)):
+                        review_reasons.append("weak_cjk_column")
+                    if min_consensus_coverage < float(getattr(self.config.ocr, "tesseract_region_review_min_consensus_coverage", 0.90)):
+                        review_reasons.append("incomplete_column_consensus")
+                    if min_consensus_agreement < float(getattr(self.config.ocr, "tesseract_region_review_min_consensus_agreement", 0.55)):
+                        review_reasons.append("low_column_consensus_agreement")
+                    if review_reasons:
+                        conf = min(
+                            conf,
+                            float(getattr(self.config.ocr, "tesseract_region_review_confidence_cap", 0.64)),
+                        )
+                        ocr_norm_diag["fallback_review_reasons"] = list(review_reasons)
+                        ocr_norm_diag["fallback_min_child_confidence"] = float(min_child)
+                        ocr_norm_diag["fallback_min_consensus_coverage"] = float(min_consensus_coverage)
+                        ocr_norm_diag["fallback_min_consensus_agreement"] = float(min_consensus_agreement)
+                    reject_fallback = (
+                        cjk_count <= 0
+                        or (cjk_count == 1 and conf < 0.82)
+                        or (2 <= cjk_count <= 5 and conf < 0.35)
+                        or (cjk_count >= 6 and conf < 0.25)
+                    )
+                    if reject_fallback:
+                        stats["ocr_source_fallback_quality_rejected"] = int(
+                            stats.get("ocr_source_fallback_quality_rejected", 0) or 0
+                        ) + 1
+                        region_rows.append({
+                            "region_id": region.id,
+                            "target_bubble_id": tb.id,
+                            "source_bbox": [sx0, sy0, sx1, sy1],
+                            "status": "fallback_ocr_quality_rejected",
+                            "confidence": float(conf),
+                            "cjk_count": int(cjk_count),
+                        })
+                        continue
                 orientation = region.orientation
                 layout_profile = source_layout_profile(crop, text_value, orientation)
                 region_id = str(region.id)
@@ -404,6 +480,7 @@ class ReletterExecutor:
                 "lang": self.config.ocr.source_lang,
                 "regions": region_rows,
                 "orientation_policy": "source_ink_v1",
+                "recognition_policy": "manga_vertical_region_v3",
             },
         )
         if self.config.cache.ocr:
@@ -481,26 +558,51 @@ class ReletterExecutor:
                 )
                 layout_crop[inner == 0] = 255
 
-            raw = backend.recognize(crop, image_path=None)
-            text = "\n".join(
-                str(b.text).strip() for b in raw if str(b.text).strip()
-            ).strip()
+            # Infer manga direction from the isolated source ink before OCR so
+            # fallback engines can select their vertical/horizontal recognizer.
+            orientation_hint, orientation_meta = infer_region_orientation(
+                layout_crop, "中文", bubble.kind
+            )
+            if hasattr(backend, "recognize_manga_region"):
+                raw = backend.recognize_manga_region(crop, orientation=orientation_hint)
+            else:
+                raw = backend.recognize(crop, image_path=None)
+            text, norm_diag = normalize_region_ocr_text(raw, orientation_hint)
             if not text:
                 bubble.block_ids = []
                 continue
-
-            orientation_hint, orientation_meta = infer_region_orientation(
-                crop, text, bubble.kind
-            )
             layout_profile = source_layout_profile(layout_crop, text, orientation_hint)
             confs = [float(b.confidence) for b in raw if str(b.text).strip()]
+            raw_backend = str((raw[0].meta or {}).get("backend", "") if raw else "").lower()
             conf = (
-                float(np.mean(confs))
-                if confs
+                float(np.median(confs)) if confs and raw_backend == "tesseract"
+                else float(np.mean(confs)) if confs
                 else float(
                     getattr(self.config.ocr, "apple_live_text_assumed_confidence", 0.88)
                 )
             )
+            # Cloud/headless Tesseract is a safety fallback, not semantic
+            # authority. Large artwork fragments occasionally look like one or
+            # two CJK glyphs. Reject those low-information transcripts before
+            # they can create a huge Hybrid/Reletter clear region. Real short
+            # dialogue remains allowed when recognition confidence is strong.
+            if raw_backend == "tesseract":
+                cjk_count = sum(
+                    1 for ch in str(text)
+                    if "\u3040" <= ch <= "\u30ff" or "\u3400" <= ch <= "\u9fff"
+                )
+                reject_fallback = (
+                    cjk_count <= 0
+                    or (cjk_count == 1 and conf < 0.82)
+                    or (2 <= cjk_count <= 5 and conf < 0.35)
+                    or (cjk_count >= 6 and conf < 0.25)
+                )
+                if reject_fallback:
+                    bubble.block_ids = []
+                    stats["ocr_source_fallback_quality_rejected"] = int(
+                        stats.get("ocr_source_fallback_quality_rejected", 0) or 0
+                    ) + 1
+                    continue
             block_id = f"apple-region-{i:04d}"
             meta = {
                 "backend": str(raw[0].meta.get("backend") if raw else "apple_live_text"),
@@ -514,6 +616,7 @@ class ReletterExecutor:
                 "orientation_hint": orientation_hint,
                 "orientation_evidence": orientation_meta,
                 "source_layout_profile": layout_profile,
+                "ocr_normalization": dict(norm_diag),
             }
             if raw:
                 for key in (

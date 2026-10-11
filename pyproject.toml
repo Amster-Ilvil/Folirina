@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "folirina"
-version = "2.3.78"
+version = "3.0.0"
 description = "Folirina is a cross-platform manga replacement and translation-transfer studio with registration, safe inpainting, lettering, and QA."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -17,12 +17,13 @@ dependencies = [
   "scipy>=1.13",
   "pydantic>=2.8",
   "typer>=0.12",
+  "psutil>=5.9",
 ]
 
 [project.optional-dependencies]
 ocr = ["paddleocr>=3.7,<4", "paddlepaddle>=3.0,<4"]
 semantic = ["paddlex>=3.3,<4"]
-apple = []
+apple = ["torch>=2.14,<2.15", "onnxruntime>=1.26,<1.31"]
 lightglue = ["torch>=2.2", "kornia>=0.8", "lightglue @ git+https://github.com/cvg/LightGlue.git"]
 bubbles = ["ultralytics>=8.3"]
 rtdetr = ["torch>=2.2", "transformers>=4.48"]

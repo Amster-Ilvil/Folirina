@@ -20,6 +20,7 @@ from .external_command import run_external_command
 from .geometry import bbox_polygon
 from .io_utils import write_image
 from .model_downloads import discovered_model_path
+from .m6_runtime_plan import build_m6_runtime_plan, choose_detector_size, choose_ocr_batch_size
 from .models import TextBlock
 from .ocr_base import OCRBackend
 
@@ -28,7 +29,7 @@ class KoharuCropOCRBackend(OCRBackend):
     retry_crops = False
 
     def __init__(self, backend: str, lang: str, config: OCRConfig) -> None:
-        self.backend = str(backend)
+        self.backend = str(backend).lower().replace("-", "_")
         self.lang = str(lang)
         self.config = config
         if self.backend == "manga_ocr":
@@ -37,9 +38,11 @@ class KoharuCropOCRBackend(OCRBackend):
             self.model_path = discovered_model_path("baberu_ocr", config.baberu_ocr_model_path)
         elif self.backend == "ocr48px":
             self.model_path = discovered_model_path("ocr48px", config.ocr48px_model_path)
+        elif self.backend == "hayai_ocr":
+            self.model_path = discovered_model_path("hayai_ocr", getattr(config, "hayai_ocr_model_cache_dir", None))
         else:
             raise ValueError(self.backend)
-        if self.backend != "ocr48px" and self.model_path is None:
+        if self.backend not in {"ocr48px", "hayai_ocr"} and self.model_path is None:
             raise RuntimeError(f"{self.backend} 模型未就绪；请在模型中心下载/离线导入。")
         if self.backend == "ocr48px" and self.model_path is None and not config.ocr48px_command:
             raise RuntimeError("48px AR OCR 已选择，但原生模型尚未下载/导入，也没有配置外部 ocr48px_command。")
@@ -47,6 +50,19 @@ class KoharuCropOCRBackend(OCRBackend):
     def _recognize_crop_text(self, crop: np.ndarray) -> tuple[str, float, dict]:
         if crop.size == 0:
             return "", 0.0, {"reason":"empty_crop"}
+        if self.backend == "hayai_ocr":
+            from .vision_runtime import run_hayai_ocr
+            row = run_hayai_ocr(
+                crop, model_cache_dir=str(self.model_path) if self.model_path else None,
+                quantize=str(getattr(self.config, "hayai_ocr_quantize", "none")),
+                use_v2=bool(getattr(self.config, "hayai_ocr_use_v2", False)),
+                backend=str(getattr(self.config, "hayai_ocr_backend", "auto")),
+                max_num_patches=int(getattr(self.config, "hayai_ocr_max_num_patches", 384)),
+            )
+            return str(row.get("text") or "").strip(), float(row.get("confidence", getattr(self.config, "hayai_ocr_assumed_confidence", 0.74))), {
+                "backend":"hayai_ocr", "device":row.get("device"), "isolated_runtime":True,
+                "confidence_source":row.get("confidence_source"), "assumed_confidence":row.get("assumed_confidence"),
+            }
         if self.backend == "manga_ocr":
             from .vision_runtime import run_manga_ocr
             row = run_manga_ocr(
@@ -61,6 +77,9 @@ class KoharuCropOCRBackend(OCRBackend):
             row = run_baberu_ocr(
                 crop, model_dir=str(self.model_path),
                 max_new_tokens=int(self.config.koharu_ocr_max_new_tokens),
+                backend=str(self.config.coreml_onnx_backend),
+                coreml_cache_dir=self.config.coreml_model_cache_dir,
+                coreml_profile=bool(self.config.coreml_profile_compute_plan),
             )
             return str(row.get("text") or "").strip(), float(row.get("confidence",1.0)), {
                 "backend":"baberu_ocr", "device":row.get("device"), "isolated_runtime":True,
@@ -123,7 +142,11 @@ class KoharuCropOCRBackend(OCRBackend):
             text_threshold=float(self.config.koharu_layout_text_threshold),
             sfx_threshold=float(self.config.koharu_layout_sfx_threshold),
             bubble_threshold=1.0, panel_threshold=1.0,
-            shape=int(self.config.koharu_layout_shape),
+            shape=choose_detector_size(
+                "koharu_layout", int(self.config.koharu_layout_shape), image.shape[:2], config=self.config
+            ),
+            postprocess_max_side=int(getattr(self.config, "koharu_layout_postprocess_max_side", 1152)),
+            postprocess_downscale_trigger_side=int(getattr(self.config, "koharu_layout_postprocess_downscale_trigger_side", 2048)),
         )
         h,w=image.shape[:2]; pad_ratio=float(self.config.koharu_crop_padding_ratio)
         regions=[]
@@ -141,6 +164,66 @@ class KoharuCropOCRBackend(OCRBackend):
         # Manga pages are commonly vertical: right-most candidates first, then top.
         regions.sort(key=lambda r:(-r[0],r[1]))
         blocks=[]
+        plan = build_m6_runtime_plan(self.config)
+        batch_enabled = bool(getattr(self.config, "ocr_batch_auto", True)) and len(regions) > 1
+        batch_size = choose_ocr_batch_size(self.backend, int(getattr(self.config, "ocr_batch_size", plan.ocr_batch_size) or plan.ocr_batch_size), self.config)
+        batch_size = max(1, batch_size)
+
+        if batch_enabled and self.backend in {"manga_ocr", "ocr48px", "hayai_ocr"}:
+            from . import vision_runtime
+            runner = {
+                "manga_ocr": lambda imgs: vision_runtime.run_manga_ocr_batch(
+                    imgs, model_dir=str(self.model_path), device="auto",
+                    max_new_tokens=int(self.config.koharu_ocr_max_new_tokens)),
+                "hayai_ocr": lambda imgs: vision_runtime.run_hayai_ocr_batch(
+                    imgs, model_cache_dir=str(self.model_path) if self.model_path else None,
+                    quantize=str(getattr(self.config, "hayai_ocr_quantize", "none")),
+                    use_v2=bool(getattr(self.config, "hayai_ocr_use_v2", False)),
+                    backend=str(getattr(self.config, "hayai_ocr_backend", "auto")),
+                    max_num_patches=int(getattr(self.config, "hayai_ocr_max_num_patches", 384))),
+                "ocr48px": lambda imgs: vision_runtime.run_ocr48px_batch(
+                    imgs, model_dir=str(self.model_path), device="auto", beams_k=5, max_seq_length=255),
+            }[self.backend]
+            for start in range(0, len(regions), batch_size):
+                chunk = regions[start:start+batch_size]
+                batch_failed_reason = ""
+                try:
+                    payload = runner([image[y0:y1,x0:x1] for x0,y0,x1,y1,_ in chunk])
+                    results = list(payload.get("results") or [])
+                    if len(results) != len(chunk):
+                        raise RuntimeError(f"{self.backend} OCR batch 返回数量异常：{len(results)} != {len(chunk)}")
+                except Exception as exc:
+                    if not bool(getattr(self.config, "ocr_batch_serial_fallback", True)):
+                        raise
+                    batch_failed_reason = f"{type(exc).__name__}: {exc}"[-800:]
+                    results = []
+                    for x0,y0,x1,y1,_ in chunk:
+                        text, conf, meta = self._recognize_crop_text(image[y0:y1,x0:x1])
+                        results.append({
+                            "text": text, "confidence": conf, **(meta or {}),
+                            "batched": False,
+                        })
+                for (x0,y0,x1,y1,row), result in zip(chunk, results):
+                    text=str(result.get("text") or "").strip(); conf=float(result.get("confidence",1.0))
+                    if not text: continue
+                    was_batched = bool(result.get("batched", not batch_failed_reason))
+                    meta={"backend":self.backend,"device":result.get("device"),"precision":result.get("precision"),"batched":was_batched,
+                          "layout_backend":"koharu_layout","layout_label":row.get("label"),"layout_confidence":float(row.get("confidence",0.0))}
+                    if batch_failed_reason:
+                        meta.update({"batch_fallback":"serial","batch_fallback_reason":batch_failed_reason})
+                    if self.backend == "baberu_ocr":
+                        meta.update({"coreml":bool(result.get("coreml",False)),"coreml_providers":result.get("coreml_providers",[])})
+                    if self.backend == "hayai_ocr":
+                        meta.update({"confidence_source":result.get("confidence_source"),"assumed_confidence":result.get("assumed_confidence"),"engine_backend":result.get("engine_backend")})
+                    if self.backend == "ocr48px":
+                        meta.update({"input_width":result.get("input_width"),"orientation":result.get("orientation"),"native":True})
+                    blocks.append(TextBlock(
+                        id=f"{self.backend}-{len(blocks):04d}", polygon=bbox_polygon((x0,y0,x1,y1)), text=text,
+                        confidence=min(conf,float(row.get("confidence",1.0))), kind="sfx" if row.get("label")=="onomatopoeia" else "unknown",
+                        reading_order=len(blocks), meta=meta,
+                    ))
+            return blocks
+
         for i,(x0,y0,x1,y1,row) in enumerate(regions):
             text,conf,meta=self._recognize_crop_text(image[y0:y1,x0:x1])
             if not text: continue

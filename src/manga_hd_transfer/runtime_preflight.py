@@ -144,6 +144,14 @@ def plan_runtime_requirements(config: PipelineConfig) -> RuntimePreflightPlan:
                 add("manga_ocr", "Manga OCR", reason=f"{role.upper()} OCR 明确选择 Manga OCR", runtime_key="manga_ocr")
             elif normalized == "baberu_ocr":
                 add("baberu_ocr", "Baberu OCR", reason=f"{role.upper()} OCR 明确选择 Baberu OCR", runtime_key="baberu_ocr")
+            elif normalized in {"paddle_onnx_coreml", "paddle_coreml", "paddle_onnx"}:
+                add("paddle", profile_label(_paddle_profile_for_backend(config, "paddle") or "ppocr_v6_medium"), reason=f"{role.upper()} OCR 显式选择 Paddle ONNX/CoreML 实验路径", runtime_key="paddle")
+            elif normalized == "hayai_ocr":
+                add("hayai_ocr", "Hayai OCR 2.3 · v2.5-nova", reason=f"{role.upper()} OCR 明确选择 Hayai OCR", runtime_key="hayai_ocr")
+            elif normalized in {"ndlocr_lite", "ndl"}:
+                add("ndlocr_lite", "NDLOCR-Lite 1.2.3", reason=f"{role.upper()} OCR 明确选择 NDLOCR-Lite", runtime_key="ndlocr_lite")
+            elif normalized in {"m6_japanese_auto", "japanese_auto", "m6_ja_auto"}:
+                add("m6_japanese_auto", "M6 Japanese Auto", reason=f"{role.upper()} OCR 使用日文竖排自动路由", runtime_key="m6_japanese_auto")
             elif normalized in {"ocr48px","48px"}:
                 from .model_downloads import discovered_model_path
                 native = discovered_model_path("ocr48px", getattr(config.ocr,"ocr48px_model_path",None))
@@ -193,9 +201,8 @@ def model_artifact_ready(config: PipelineConfig, requirement: RuntimeRequirement
         path = Path(str(configured)).expanduser() if configured else local["mangalens"]
         return path.is_file()
     if key == "ysg_obb":
-        configured = getattr(config.bubbles, "ysg_obb_model_path", None)
-        path = Path(str(configured)).expanduser() if configured else local["ysg_obb"]
-        return path.is_file()
+        from .model_downloads import discovered_model_path
+        return discovered_model_path("ysg_obb", getattr(config.bubbles, "ysg_obb_model_path", None)) is not None
     if key == "rtdetr_v2":
         configured = getattr(config.bubbles, "rtdetr_model_path", None)
         path = Path(str(configured)).expanduser() if configured else local["rtdetr_v2"]
@@ -214,6 +221,48 @@ def model_artifact_ready(config: PipelineConfig, requirement: RuntimeRequirement
     if key == "baberu_ocr":
         configured=getattr(config.ocr,"baberu_ocr_model_path",None); path=Path(str(configured)).expanduser() if configured else local["baberu_ocr"]
         return path.is_dir() and all((path/name).is_file() for name in ("onnx_infer.py","onnx/vision_int4.onnx","onnx/decoder_prefill_int8.onnx","onnx/decoder_step_int8.onnx","tokenizer/vocab.json"))
+    if key == "hayai_ocr":
+        from .hayai_support import hayai_ready_marker_matches
+        from .model_downloads import discovered_model_path
+        path = discovered_model_path("hayai_ocr", getattr(config.ocr, "hayai_ocr_model_cache_dir", None))
+        if path is None:
+            return False
+        ready, _ = hayai_ready_marker_matches(
+            path, quantize=getattr(config.ocr, "hayai_ocr_quantize", "none"),
+            use_v2=bool(getattr(config.ocr, "hayai_ocr_use_v2", False)),
+            backend=getattr(config.ocr, "hayai_ocr_backend", "auto"),
+            max_num_patches=getattr(config.ocr, "hayai_ocr_max_num_patches", 384),
+        )
+        return bool(ready)
+    if key == "ndlocr_lite":
+        try:
+            from .ndlocr_lite_runtime import runtime_status
+            return bool(runtime_status().ready)
+        except Exception:
+            return False
+    if key == "m6_japanese_auto":
+        # Auto routing only needs one viable engine. Prefer NDL whole-page, then
+        # Hayai/48px crop routes. The router itself performs runtime fallback.
+        from .hayai_support import hayai_ready_marker_matches
+        from .model_downloads import discovered_model_path
+        hayai_path = discovered_model_path("hayai_ocr", getattr(config.ocr, "hayai_ocr_model_cache_dir", None))
+        hayai_ready = False
+        if hayai_path is not None:
+            hayai_ready, _ = hayai_ready_marker_matches(
+                hayai_path, quantize=getattr(config.ocr, "hayai_ocr_quantize", "none"),
+                use_v2=bool(getattr(config.ocr, "hayai_ocr_use_v2", False)),
+                backend=getattr(config.ocr, "hayai_ocr_backend", "auto"),
+                max_num_patches=getattr(config.ocr, "hayai_ocr_max_num_patches", 384),
+            )
+        try:
+            from .ndlocr_lite_runtime import runtime_status
+            ndl_ready = bool(runtime_status().ready)
+        except Exception:
+            ndl_ready = False
+        cfg_48 = getattr(config.ocr, "ocr48px_model_path", None)
+        path_48 = Path(str(cfg_48)).expanduser() if cfg_48 else local["ocr48px"]
+        files_48 = path_48.is_dir() and all((path_48 / n).is_file() for n in ("ocr_ar_48px.ckpt", "alphabet-all-v7.txt", "upstream-source/manga_48px_core.py", "upstream-source/manga_48px_xpos.py"))
+        return bool(ndl_ready or hayai_ready or files_48 or getattr(config.ocr, "ocr48px_command", None))
     return True
 
 

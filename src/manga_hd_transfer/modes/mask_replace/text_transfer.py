@@ -443,21 +443,10 @@ def clear_broad_neutral_paper_components(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     """Handle broad OCR clear regions whose TARGET background is proven paper.
 
-    OCR/reletter clear masks can be *whole text-box rectangles* rather than only
-    Japanese glyph strokes. Passing those rectangles to Telea/AI inpainting lets
-    nearby panel lines and halftone leak into an otherwise white box, producing
-    the grey triangular shadows seen on p-005.  For a connected clear component
-    that is already mostly bright/neutral TARGET paper, the background does not
-    need to be invented at all:
-
-      * mark the whole broad component as handled so no interpolating inpaint sees it;
-      * derive compact TARGET text ink inside that proven paper component;
-      * restore only those ink/fringe pixels to the component's own TARGET paper colour;
-      * preserve all other original TARGET pixels, including scan texture and borders.
-
-    This helper is intentionally generic but callers gate it to OCR modes only.
-    ``handled`` is the broad area removed from later inpaint; ``changed`` is the
-    much smaller set of pixels that were actually rewritten to paper colour.
+    Connected components are processed inside their own bounding ROIs.  The
+    previous implementation built ``labels == lab`` over the entire page for
+    every glyph component, turning a fragmented manga text mask into O(N*page)
+    work and making Reletter/Hybrid appear stuck near the transfer stage.
     """
     if rendered.shape != target.shape or clear_mask.shape != target.shape[:2]:
         raise ValueError("paper-clear inputs must share one TARGET canvas")
@@ -467,10 +456,8 @@ def clear_broad_neutral_paper_components(
     work = (np.asarray(clear_mask) > 0).astype(np.uint8)
     if int(np.count_nonzero(work)) == 0:
         return out, handled, changed, {
-            "broad_paper_components": 0,
-            "broad_paper_handled_pixels": 0,
-            "broad_paper_changed_pixels": 0,
-            "broad_paper_rejected_components": 0,
+            "broad_paper_components": 0, "broad_paper_handled_pixels": 0,
+            "broad_paper_changed_pixels": 0, "broad_paper_rejected_components": 0,
             "broad_paper_min_ratio": float(min_paper_ratio),
         }
 
@@ -480,48 +467,44 @@ def clear_broad_neutral_paper_components(
     accepted_rows: list[dict[str, Any]] = []
     rejected = 0
     for lab in range(1, count):
-        comp = labels == lab
-        area = int(stats[lab, cv2.CC_STAT_AREA])
-        if area < 12:
+        x, y, bw, bh, area = [int(v) for v in stats[lab, :5]]
+        if area < 12 or bw <= 0 or bh <= 0:
             rejected += 1
             continue
-        paper_sel = comp & (gray >= 205) & (hsv[..., 1] <= 55)
+        label_roi = labels[y:y+bh, x:x+bw]
+        comp = label_roi == lab
+        gray_roi = gray[y:y+bh, x:x+bw]
+        hsv_roi = hsv[y:y+bh, x:x+bw]
+        target_roi = target[y:y+bh, x:x+bw]
+        paper_sel = comp & (gray_roi >= 205) & (hsv_roi[..., 1] <= 55)
         paper_pixels = int(np.count_nonzero(paper_sel))
         paper_ratio = float(paper_pixels / max(1, area))
         if paper_pixels < 20 or paper_ratio < float(min_paper_ratio):
             rejected += 1
             continue
-        paper_gray = gray[paper_sel]
+        paper_gray = gray_roi[paper_sel]
         if paper_gray.size == 0 or float(np.median(paper_gray)) < 220.0:
             rejected += 1
             continue
 
         comp_u8 = comp.astype(np.uint8) * 255
-        # Reuse the existing compact-ink selector: unlike a rectangular clear
-        # mask, it rejects long panel/bubble outlines and keeps the actual JP
-        # lettering. A one-pixel expansion absorbs antialias fringes.
-        glyph = target_text_mask_in_container(target, comp_u8)
+        glyph = target_text_mask_in_container(target_roi, comp_u8)
         if cv2.countNonZero(glyph) > 0:
-            glyph = cv2.dilate(
-                glyph,
-                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
-                iterations=1,
-            )
+            glyph = cv2.dilate(glyph, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
             glyph = cv2.bitwise_and(glyph, comp_u8)
 
-        paper = np.median(target[paper_sel], axis=0).astype(np.uint8)
+        paper = np.median(target_roi[paper_sel], axis=0).astype(np.uint8)
+        out_roi = out[y:y+bh, x:x+bw]
+        changed_roi = changed[y:y+bh, x:x+bw]
+        handled_roi = handled[y:y+bh, x:x+bw]
         if cv2.countNonZero(glyph) > 0:
-            out[glyph > 0] = paper
-            changed[glyph > 0] = 255
-        # Crucial: even unchanged white pixels in the broad rectangle are
-        # removed from downstream inpainting. They are already valid TARGET.
-        handled[comp] = 255
-        x, y, bw, bh = [int(v) for v in stats[lab, :4]]
+            out_roi[glyph > 0] = paper
+            changed_roi[glyph > 0] = 255
+        handled_roi[comp] = 255
         accepted_rows.append({
-            "bbox": [x, y, x + bw, y + bh],
-            "area": area,
+            "bbox": [x, y, x + bw, y + bh], "area": area,
             "paper_ratio": round(paper_ratio, 4),
-            "paper_bgr": [int(x) for x in paper.tolist()],
+            "paper_bgr": [int(v) for v in paper.tolist()],
             "glyph_clear_pixels": int(cv2.countNonZero(glyph)),
         })
 
@@ -562,32 +545,53 @@ def clear_text_components_to_local_paper(
     clear_mask: np.ndarray,
     region_mask: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
-    """Clear only components surrounded by neutral bright TARGET paper.
+    """Clear components proven to sit on local neutral paper, ROI-bounded.
 
-    Used for large/localized white candidates that may include人物/artwork.  A
-    component is cleared only when its own local ring proves that it actually
-    sits on white/neutral paper.  This prevents a broad candidate from bleaching
-    skin, purple effects, halftone or hair while avoiding Telea speck artifacts.
+    Each component is evaluated only in its bounding box plus the 6px ring
+    needed for paper evidence.  This preserves the old safety semantics while
+    avoiding a full-canvas allocation and dilation for every glyph component.
     """
-    out=rendered.copy(); accepted=np.zeros_like(clear_mask)
-    binary=((clear_mask>0)&(region_mask>0)).astype(np.uint8)
-    if int(np.count_nonzero(binary))==0:
-        return out,accepted,{"local_paper_components":0,"local_paper_clear_pixels":0,"local_paper_rejected_components":0}
-    gray=cv2.cvtColor(target,cv2.COLOR_BGR2GRAY); hsv=cv2.cvtColor(target,cv2.COLOR_BGR2HSV)
-    count,labels,stats,_=cv2.connectedComponentsWithStats(binary,8)
-    kept=rejected=0
-    k=cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(13,13))
-    for lab in range(1,count):
-        comp=labels==lab; area=int(stats[lab,cv2.CC_STAT_AREA])
-        if area<=0: continue
+    out = rendered.copy()
+    accepted = np.zeros_like(clear_mask)
+    binary = ((clear_mask > 0) & (region_mask > 0)).astype(np.uint8)
+    if int(np.count_nonzero(binary)) == 0:
+        return out, accepted, {"local_paper_components": 0, "local_paper_clear_pixels": 0, "local_paper_rejected_components": 0}
+    gray = cv2.cvtColor(target, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(target, cv2.COLOR_BGR2HSV)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+    kept = rejected = 0
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
+    H, W = binary.shape[:2]
+    for lab in range(1, count):
+        x, y, bw, bh, area = [int(v) for v in stats[lab, :5]]
+        if area <= 0 or bw <= 0 or bh <= 0:
+            continue
+        pad = 7
+        x0=max(0,x-pad); y0=max(0,y-pad); x1=min(W,x+bw+pad); y1=min(H,y+bh+pad)
+        label_roi=labels[y0:y1,x0:x1]
+        comp=(label_roi==lab)
         ring=cv2.dilate(comp.astype(np.uint8),k,iterations=1)>0
-        ring &= ~comp; ring &= (region_mask>0)
-        good=ring & (gray>=205) & (hsv[...,1]<=55)
+        ring &= ~comp
+        region_roi=(region_mask[y0:y1,x0:x1]>0)
+        ring &= region_roi
+        gray_roi=gray[y0:y1,x0:x1]
+        hsv_roi=hsv[y0:y1,x0:x1]
+        good=ring & (gray_roi>=205) & (hsv_roi[...,1]<=55)
         if int(np.count_nonzero(good)) < max(10,min(80,int(round(area*0.22)))):
-            rejected+=1; continue
-        paper=np.median(target[good],axis=0).astype(np.uint8)
-        out[comp]=paper; accepted[comp]=255; kept+=1
-    return out,accepted,{"local_paper_components":int(kept),"local_paper_clear_pixels":int(cv2.countNonZero(accepted)),"local_paper_rejected_components":int(rejected)}
+            rejected+=1
+            continue
+        target_roi=target[y0:y1,x0:x1]
+        paper=np.median(target_roi[good],axis=0).astype(np.uint8)
+        out_roi=out[y0:y1,x0:x1]
+        accepted_roi=accepted[y0:y1,x0:x1]
+        out_roi[comp]=paper
+        accepted_roi[comp]=255
+        kept+=1
+    return out,accepted,{
+        "local_paper_components":int(kept),
+        "local_paper_clear_pixels":int(cv2.countNonZero(accepted)),
+        "local_paper_rejected_components":int(rejected),
+    }
 
 def cleanup_target_residual_specks(
     image: np.ndarray,

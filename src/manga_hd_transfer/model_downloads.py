@@ -46,13 +46,15 @@ MODEL_LABELS = {
     "lightglue": "LightGlue · SIFT",
     "loftr": "LoFTR · outdoor",
     "mangalens": "MangaLens · YOLO11n Bubble",
-    "ysg_obb": "YSG YOLO OBB · Open/Rotated Text",
+    "ysg_obb": "YSG YOLO · OBB/HBB Compatible (Bundled OBB)",
     "rtdetr_v2": "Comic Translate RT-DETR-v2",
     "sam2": "SAM 2.1 · Hiera Tiny",
     "koharu_layout": "Koharu Layout RF-DETR Seg 2XL",
     "manga_ocr": "Manga OCR",
     "baberu_ocr": "Baberu OCR · ONNX",
     "ocr48px": "48px AR OCR",
+    "hayai_ocr": "Hayai OCR 2.3 · v2.5-nova",
+    "ndlocr_lite": "NDLOCR-Lite 1.2.3",
     "lama_manga": "LaMa Manga",
     "aot_inpainting": "AOT Inpainting",
     "flux2_klein": "FLUX.2 Klein",
@@ -92,7 +94,9 @@ def model_local_paths() -> dict[str, Path]:
         "lightglue": torch_checkpoint_dir() / "sift_lightglue_v0-1_arxiv.pth",
         "loftr": torch_checkpoint_dir() / "loftr_outdoor.ckpt",
         "mangalens": root / "mangalens" / "best.pt",
-        "ysg_obb": root / "ysg_obb" / "ysgyolo_yolo26_2.0.pt",
+        # Built-in default is the explicit OBB checkpoint. Legacy HBB checkpoints
+        # remain accepted by the worker and are auto-normalized at inference.
+        "ysg_obb": root / "ysg_obb" / "ysgyolo_yolo26OBB_2.0.pt",
         "rtdetr_v2": root / "rtdetr_v2" / "comic-text-and-bubble-detector",
         "sam2": root / "sam2" / "sam2.1_hiera_tiny.pt",
         "paddle": root / "paddle" / "PP-OCRv5.ready.json",
@@ -100,6 +104,8 @@ def model_local_paths() -> dict[str, Path]:
         "manga_ocr": root / "manga_ocr" / "mayocream-manga-ocr",
         "baberu_ocr": root / "baberu_ocr",
         "ocr48px": root / "ocr48px" / "manga-image-translator-48px-ar",
+        "hayai_ocr": root / "hayai_ocr",
+        "ndlocr_lite": root / "ndlocr_lite",
         "lama_manga": root / "inpainting" / "lama-manga.safetensors",
         "aot_inpainting": root / "inpainting" / "aot-inpainting",
         "flux2_klein": root / "inpainting" / "FLUX.2-klein-base-4B",
@@ -393,7 +399,20 @@ def import_builtin_model(key: str, source: str | Path, config: PipelineConfig | 
 
     if not src.is_file():
         raise ValueError(f"{MODEL_LABELS[key]} 离线导入需要选择模型文件。")
-    dst = paths[key]
+    if key == "ysg_obb":
+        # Preserve the real variant in the filename. Renaming an HBB checkpoint
+        # to an OBB-looking filename was the root cause of the old silent mismatch.
+        digest = _sha256(src).lower()
+        known_hbb = "889347d65c8636dd188a8ed4f312b29658543faaa69016b5958ddf0559980e22"
+        known_obb = "a9c03afb069285fc9e0d3fffc3c9ead440b687570952a945391ba22cd843dc3f"
+        if digest == known_hbb:
+            dst = paths[key].parent / "ysgyolo_yolo26_2.0.pt"
+        elif digest == known_obb:
+            dst = paths[key]
+        else:
+            dst = paths[key].parent / src.name
+    else:
+        dst = paths[key]
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)
     updates: dict[str, Any] = {}
@@ -622,14 +641,19 @@ def download_builtin_model(key: str, config: PipelineConfig, progress: ProgressF
         )
 
     if key == "ysg_obb":
+        # The old manga-translator-ui master URL has changed over time and the
+        # generic ysgyolo_yolo26_2.0.pt checkpoint is HBB-compatible. Folirina's
+        # built-in OBB slot now downloads the explicitly named OBB artifact from
+        # the stable mit_models mirror used by BallonsTranslator.
         path = _download_file(
-            ["https://www.modelscope.cn/models/hgmzhn/manga-translator-ui/resolve/master/ysgyolo_yolo26_2.0.pt"],
+            _hf_urls("dreMaz/mit_models", "ysgyolo_yolo26OBB_2.0.pt"),
             paths[key],
-            sha256="889347d65c8636dd188a8ed4f312b29658543faaa69016b5958ddf0559980e22",
+            sha256="a9c03afb069285fc9e0d3fffc3c9ead440b687570952a945391ba22cd843dc3f",
             progress=progress, label=label, timeout=180.0,
         )
         return ModelDownloadResult(
-            key, label, str(path), "YSG YOLO OBB 已下载并校验；仅作为开放/框外/倾斜文字辅助检测器。",
+            key, label, str(path),
+            "YSG OBB 专用权重已从稳定镜像下载并校验。旧 HBB 2.0 权重仍兼容，但会按 HBB 明确解析，不再伪装成 OBB。",
             {"bubbles.ysg_obb_model_path": str(path)},
         )
 
@@ -663,6 +687,41 @@ def download_builtin_model(key: str, config: PipelineConfig, progress: ProgressF
             key, label, str(path), "SAM 2.1 Hiera Tiny checkpoint 已下载并自动配置。",
             {"bubbles.sam2_checkpoint": str(path), "bubbles.sam2_allow_model_downloads": False},
         )
+
+    if key == "hayai_ocr":
+        from .hayai_support import hayai_marker_path, hayai_marker_payload, normalize_hayai_patch_budget
+        from .vision_runtime import ensure_runtime as ensure_vision_runtime, run_hayai_ocr
+        root = paths[key]; root.mkdir(parents=True, exist_ok=True)
+        status = ensure_vision_runtime("hayai_ocr", progress=lambda msg: progress(0, None, msg) if progress else None)
+        backend = str(getattr(config.ocr, "hayai_ocr_backend", "auto") or "auto")
+        quantize = str(getattr(config.ocr, "hayai_ocr_quantize", "none") or "none")
+        use_v2 = bool(getattr(config.ocr, "hayai_ocr_use_v2", False))
+        patches = normalize_hayai_patch_budget(getattr(config.ocr, "hayai_ocr_max_num_patches", 384), backend=backend)
+        # Model Center is the only path allowed to populate the HF cache. Normal
+        # OCR requests run offline against this marker/cache afterwards.
+        dummy = __import__("numpy").full((64, 64, 3), 255, dtype="uint8")
+        run_hayai_ocr(
+            dummy, model_cache_dir=str(root), quantize=quantize, use_v2=use_v2,
+            backend=backend, max_num_patches=patches, allow_download=True,
+        )
+        marker = hayai_marker_path(root)
+        marker.write_text(json.dumps(hayai_marker_payload(
+            cache_dir=root, runtime_python=status.python, quantize=quantize, use_v2=use_v2,
+            backend=backend, max_num_patches=patches,
+        ), ensure_ascii=False, indent=2), encoding="utf-8")
+        return ModelDownloadResult(
+            key, label, str(root),
+            f"Hayai OCR 2.3 / {'v2' if use_v2 else 'v2.5-nova'} 已安装并预热；patch={patches}，M6 使用共享 Torch/MPS 运行时。",
+            {"ocr.hayai_ocr_model_cache_dir": str(root)},
+        )
+
+    if key == "ndlocr_lite":
+        from .ndlocr_lite_runtime import ensure_runtime
+        status = ensure_runtime(progress=lambda msg: progress(0, None, msg) if progress else None)
+        root = paths[key]; root.mkdir(parents=True, exist_ok=True)
+        marker = root / "folirina.ndl.ready.json"
+        marker.write_text(json.dumps({"engine":"ndlocr-lite","version":"1.2.3","runtime_python":status.python,"source_path":status.source_path,"coreml_available":status.coreml_available}, ensure_ascii=False, indent=2), encoding="utf-8")
+        return ModelDownloadResult(key, label, str(root), "NDLOCR-Lite 1.2.3 独立运行环境已安装并验证；整页 OCR 默认 CPU，Apple Silicon 可按探测结果尝试 CoreML 后端并自动回退。", {"ocr.ndlocr_lite_runtime_path": str(root), "ocr.ndlocr_lite_source_path": str(status.source_path or "")})
 
     if key == "ocr48px":
         from .ocr48px_runtime import prepare_runtime_files
@@ -804,6 +863,26 @@ def discovered_model_path(key: str, configured: str | Path | None = None) -> Pat
         "aot_inpainting": ("config.json", "model.safetensors"),
         "rorem_mixed": ("rorem-mixed-unet-q4_K.gguf", "sdxl-version-marker.safetensors"),
     }
+    if key == "hayai_ocr":
+        p = Path(configured).expanduser() if configured else model_local_paths().get("hayai_ocr")
+        if p and p.is_dir() and (p / "folirina.hayai.ready.json").is_file():
+            return p.resolve()
+        return None
+    if key == "ysg_obb":
+        # Configured checkpoints win, including legacy HBB. If an old config
+        # points at a now-missing 2.0 file, transparently fall back to the new
+        # explicit OBB cache and then the old local HBB cache if present.
+        if configured:
+            p = Path(configured).expanduser()
+            if p.is_file():
+                return p.resolve()
+        local_obb = model_local_paths()["ysg_obb"]
+        if local_obb.is_file():
+            return local_obb.resolve()
+        legacy_hbb = local_obb.parent / "ysgyolo_yolo26_2.0.pt"
+        return legacy_hbb.resolve() if legacy_hbb.is_file() else None
+    if key == "ndlocr_lite":
+        return None
     if configured:
         p = Path(configured).expanduser()
         if key in directory_requirements:

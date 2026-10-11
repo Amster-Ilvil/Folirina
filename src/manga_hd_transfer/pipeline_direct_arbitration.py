@@ -21,10 +21,11 @@ from .pipeline_registration_service import register_page, verify_same_page_stric
 from .plugins import REGISTRY as PROVIDER_REGISTRY
 from .source_detectors import run_source_detector_chain
 from .detector_policy import (
-    detector_strategy, source_auxiliary_providers, expensive_provider,
+    detector_strategy, source_auxiliary_providers, expensive_provider, koharu_is_primary,
     STRATEGY_PRIMARY_ONLY, STRATEGY_ALWAYS,
 )
 from .transfer_policy import _blocking_direct_invariant_issues
+from .layout_evidence import collect_koharu_layout_evidence_cached, koharu_semantic_text_ink_mask
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,7 @@ def arbitrate_direct_source(
     source: np.ndarray,
     source_path_local: str,
     target: np.ndarray,
+    target_path_local: str | None,
     registration,
     pair_check,
     replace_source_specs: list[dict],
@@ -89,6 +91,45 @@ def arbitrate_direct_source(
     selected_secondary_source = False
     arbitration_rows: list[dict] = []
 
+    koharu_primary = bool(koharu_is_primary(config.bubbles))
+    layout_cache_enabled = bool(getattr(config.cache, "bubbles", True)) and bool(
+        getattr(config.bubbles, "koharu_layout_cache_enabled", True)
+    )
+    target_semantic_text_mask = None
+    if koharu_primary:
+        try:
+            tev = collect_koharu_layout_evidence_cached(
+                target, config.bubbles, role="direct_target_text", image_path=target_path_local,
+                cache=stage_cache, cache_enabled=layout_cache_enabled, stats=cache_stats, allow_missing=True,
+            )
+            if tev.available:
+                target_semantic_text_mask = koharu_semantic_text_ink_mask(
+                    target, tev, labels=("text",), min_confidence=0.50, pad_px=3, dilate_px=1,
+                )
+        except Exception:
+            target_semantic_text_mask = None
+
+    def _build_plan(src_img, src_path, reg, hints):
+        source_semantic_text_mask = None
+        if koharu_primary:
+            try:
+                sev = collect_koharu_layout_evidence_cached(
+                    src_img, config.bubbles, role="direct_source_text", image_path=src_path,
+                    cache=stage_cache, cache_enabled=layout_cache_enabled, stats=cache_stats, allow_missing=True,
+                )
+                if sev.available:
+                    source_semantic_text_mask = koharu_semantic_text_ink_mask(
+                        src_img, sev, labels=("text",), min_confidence=0.50, pad_px=3, dilate_px=1,
+                    )
+            except Exception:
+                source_semantic_text_mask = None
+        return build_source_direct_container_plan(
+            src_img, target, reg, config.direct_patch,
+            source_hint_bubbles=hints,
+            source_semantic_text_mask=source_semantic_text_mask,
+            target_semantic_text_mask=target_semantic_text_mask,
+        )
+
     if direct_requested and (
         bool(pair_check.same_page)
         or not bool(getattr(config.direct_patch, "require_same_page_precheck", True))
@@ -107,10 +148,7 @@ def arbitrate_direct_source(
                 cache=stage_cache, cache_enabled=cache_enabled, stats=cache_stats,
             )
             all_source_hints = list(source_hints)
-            direct_container_plan = build_source_direct_container_plan(
-                source, target, registration, config.direct_patch,
-                source_hint_bubbles=all_source_hints,
-            )
+            direct_container_plan = _build_plan(source, source_path_local, registration, all_source_hints)
             direct_plan_safe = bool(
                 direct_container_plan is not None
                 and direct_container_plan.safe_to_skip_other_paths
@@ -127,10 +165,7 @@ def arbitrate_direct_source(
                 provider_audit.extend(fallback_audit)
                 if fallback_hints:
                     all_source_hints.extend(fallback_hints)
-                    direct_container_plan = build_source_direct_container_plan(
-                        source, target, registration, config.direct_patch,
-                        source_hint_bubbles=all_source_hints,
-                    )
+                    direct_container_plan = _build_plan(source, source_path_local, registration, all_source_hints)
                     direct_plan_safe = bool(
                         direct_container_plan is not None
                         and direct_container_plan.safe_to_skip_other_paths
@@ -150,10 +185,7 @@ def arbitrate_direct_source(
                 provider_audit.extend(expensive_audit)
                 if expensive_hints:
                     all_source_hints.extend(expensive_hints)
-                    direct_container_plan = build_source_direct_container_plan(
-                        source, target, registration, config.direct_patch,
-                        source_hint_bubbles=all_source_hints,
-                    )
+                    direct_container_plan = _build_plan(source, source_path_local, registration, all_source_hints)
                     direct_plan_safe = bool(
                         direct_container_plan is not None
                         and direct_container_plan.safe_to_skip_other_paths
@@ -222,10 +254,7 @@ def arbitrate_direct_source(
                         cache=stage_cache, cache_enabled=cache_enabled, stats=cache_stats,
                     )
                     all_alt_hints = list(alt_hints)
-                    alt_plan = build_source_direct_container_plan(
-                        alt_source, target, alt_registration, config.direct_patch,
-                        source_hint_bubbles=all_alt_hints,
-                    )
+                    alt_plan = _build_plan(alt_source, str(spec["path"]), alt_registration, all_alt_hints)
                     alt_safe = bool(
                         alt_plan is not None and alt_plan.safe_to_skip_other_paths
                         and alt_plan.result.applied_count > 0
@@ -241,10 +270,7 @@ def arbitrate_direct_source(
                         alt_audit.extend(fallback_audit)
                         if fallback_hints:
                             all_alt_hints.extend(fallback_hints)
-                            alt_plan = build_source_direct_container_plan(
-                                alt_source, target, alt_registration, config.direct_patch,
-                                source_hint_bubbles=all_alt_hints,
-                            )
+                            alt_plan = _build_plan(alt_source, str(spec["path"]), alt_registration, all_alt_hints)
                             alt_safe = bool(alt_plan is not None and alt_plan.safe_to_skip_other_paths and alt_plan.result.applied_count > 0)
                     if (
                         detector_mode != STRATEGY_PRIMARY_ONLY
@@ -259,10 +285,7 @@ def arbitrate_direct_source(
                         alt_audit.extend(heavy_audit)
                         if heavy_hints:
                             all_alt_hints.extend(heavy_hints)
-                            alt_plan = build_source_direct_container_plan(
-                                alt_source, target, alt_registration, config.direct_patch,
-                                source_hint_bubbles=all_alt_hints,
-                            )
+                            alt_plan = _build_plan(alt_source, str(spec["path"]), alt_registration, all_alt_hints)
                     if alt_plan is not None:
                         _annotate_plan(alt_plan, alt_audit, source_spec=spec)
                 alt_ev = build_direct_source_evidence(

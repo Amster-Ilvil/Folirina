@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .config import PipelineConfig
+from .ocr import NullOCRBackend
 from .transfer_policy import _has_transferable_source_text
 
 
@@ -18,9 +19,17 @@ def source_has_no_transferable_text(
     configured_source_ocr = str(config.ocr.source_backend or config.ocr.backend or "").strip().lower()
     source_evidence_available = (
         source_backend is not None
+        and not isinstance(source_backend, NullOCRBackend)
         and configured_source_ocr not in {"", "none", "null"}
         and not ocr_route.startswith("skipped")
+        and ocr_route not in {"", "null_backend", "unavailable"}
     )
+    # Cache-aware OCR services expose an explicit evidence bit.  When present,
+    # it is stronger than the legacy route string and prevents a missing OCR
+    # runtime from being misread as a genuine empty-page OCR result.
+    evidence_flag = cache_stats.get("ocr_source_evidence_available", None)
+    if evidence_flag is not None:
+        source_evidence_available = source_evidence_available and bool(evidence_flag)
     real_source_blocks = [b for b in source_blocks if str(getattr(b, "text", "")).strip()]
     region_text_only = bool(source_backend is not None and getattr(source_backend, "region_text_only", False))
     if not source_evidence_available:

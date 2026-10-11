@@ -414,6 +414,26 @@ def normalize_region_ocr_text(blocks: list[TextBlock], orientation: str) -> tupl
         compact = re.sub(r"\s+", "", value)
         if not compact:
             continue
+
+        # Column retries are supplements only. If a retry begins with text that
+        # the authoritative whole-region OCR already emitted, strip that repeated
+        # prefix instead of duplicating it in publication output. This catches
+        # overlap such as "拜託。" + retry "拜託。人" without hard-coding any
+        # phrase; a genuinely new column such as "這樣" remains untouched.
+        meta = dict(getattr(b, "meta", {}) or {})
+        if bool(meta.get("column_retry")) and texts:
+            for prior in sorted((re.sub(r"\s+", "", t) for t in texts), key=len, reverse=True):
+                if len(prior) >= 2 and compact.startswith(prior):
+                    compact = compact[len(prior):]
+                    value = compact
+                    dropped_dup += 1
+                    break
+            cjk_count = sum(1 for ch in compact if "\u3040" <= ch <= "\u30ff" or "\u3400" <= ch <= "\u9fff")
+            if cjk_count <= 1 and float(getattr(b, "confidence", 0.0) or 0.0) < 0.65:
+                dropped_dup += 1
+                continue
+        if not compact:
+            continue
         if compact in seen:
             dropped_dup += 1
             continue

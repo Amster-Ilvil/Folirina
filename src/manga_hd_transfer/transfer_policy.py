@@ -7,6 +7,8 @@ review-only overlays. They do not execute OCR, registration or raster transfer.
 """
 
 from pathlib import Path
+import hashlib
+import json
 
 import cv2
 import numpy as np
@@ -27,8 +29,67 @@ def _reason_metric(match: UnitMatch, key: str, default: float = 0.0) -> float:
     return default
 
 
+
+def _replace_translation_groups(source_units, target_units, matches) -> list[dict]:
+    """Build deterministic bipartite match groups for editor/replay workflows.
+
+    Folirina already discovers one-to-many/many-to-one candidates.  Historically
+    those edges were diagnostics only and the replace-translation sidecar kept
+    just one best target per source.  Preserve every discovered edge as a review
+    group without changing publication auto-acceptance: grouped relations remain
+    review-only unless the existing one-to-one policy accepts them.
+    """
+    source_ids = {str(u.id) for u in source_units}
+    target_ids = {str(u.id) for u in target_units}
+    adjacency: dict[str, set[str]] = {}
+    edge_rows: list[dict] = []
+    for match in matches:
+        sid = str(match.source_unit_id); tid = str(match.target_unit_id)
+        if sid not in source_ids or tid not in target_ids:
+            continue
+        sn, tn = f"s:{sid}", f"t:{tid}"
+        adjacency.setdefault(sn, set()).add(tn)
+        adjacency.setdefault(tn, set()).add(sn)
+        edge_rows.append({
+            "source_unit_id": sid, "target_unit_id": tid,
+            "relation": str(match.relation), "confidence": float(match.confidence),
+            "cost": float(match.cost), "reasons": list(getattr(match, "reasons", []) or []),
+        })
+    by_edge = {(r["source_unit_id"], r["target_unit_id"]): r for r in edge_rows}
+    visited: set[str] = set(); groups: list[dict] = []
+    for node in sorted(adjacency):
+        if node in visited:
+            continue
+        stack=[node]; comp: set[str]=set()
+        while stack:
+            cur=stack.pop()
+            if cur in visited: continue
+            visited.add(cur); comp.add(cur); stack.extend(sorted(adjacency.get(cur, ())))
+        sources=sorted(x[2:] for x in comp if x.startswith("s:"))
+        targets=sorted(x[2:] for x in comp if x.startswith("t:"))
+        if not sources or not targets:
+            continue
+        if len(sources)>1 and len(targets)>1: relation="many_to_many"
+        elif len(sources)>1: relation="many_to_one"
+        elif len(targets)>1: relation="one_to_many"
+        else: relation="one_to_one"
+        edges=[by_edge[(sid,tid)] for sid in sources for tid in targets if (sid,tid) in by_edge]
+        canonical={"sources":sources,"targets":targets,"relation":relation}
+        gid="rtg-"+hashlib.sha256(json.dumps(canonical,sort_keys=True,separators=(",",":")).encode()).hexdigest()[:16]
+        groups.append({
+            "group_id": gid, "relation": relation,
+            "source_unit_ids": sources, "target_unit_ids": targets,
+            "requires_review": relation != "one_to_one",
+            "auto_apply_allowed": relation == "one_to_one",
+            "edges": edges,
+            "reuse_key": hashlib.sha256(json.dumps({**canonical,"edges":[(e["source_unit_id"],e["target_unit_id"],round(e["confidence"],6)) for e in edges]},sort_keys=True,separators=(",",":")).encode()).hexdigest(),
+        })
+    return groups
+
 def _replace_translation_regions(source_units, target_units, matches, overlap_threshold: float = 0.30) -> list[dict]:
     target_by_id = {u.id: u for u in target_units}
+    groups = _replace_translation_groups(source_units, target_units, matches)
+    group_by_source = {sid: group for group in groups for sid in group["source_unit_ids"]}
     match_by_source: dict[str, UnitMatch] = {}
     for match in matches:
         prior = match_by_source.get(match.source_unit_id)
@@ -43,6 +104,7 @@ def _replace_translation_regions(source_units, target_units, matches, overlap_th
             match is not None
             and any(str(reason or "").startswith("route=paired_id_binding") for reason in (getattr(match, "reasons", None) or []))
         )
+        group = group_by_source.get(str(source.id))
         rows.append({
             "source_unit_id": source.id,
             "target_unit_id": target.id if target is not None else None,
@@ -58,6 +120,12 @@ def _replace_translation_regions(source_units, target_units, matches, overlap_th
             "relation": str(match.relation) if match is not None else "unmatched",
             "confidence": float(match.confidence) if match is not None else 0.0,
             "cost": float(match.cost) if match is not None else 1.0,
+            "match_group_id": str(group.get("group_id")) if group else None,
+            "group_relation": str(group.get("relation")) if group else "unmatched",
+            "group_source_unit_ids": list(group.get("source_unit_ids", [])) if group else [source.id],
+            "group_target_unit_ids": list(group.get("target_unit_ids", [])) if group else ([target.id] if target is not None else []),
+            "group_requires_review": bool(group.get("requires_review")) if group else False,
+            "mask_reuse_key": str(group.get("reuse_key")) if group else "",
         })
     return rows
 
@@ -196,4 +264,4 @@ def _review_candidate_overlay(image: np.ndarray, queue: list[dict], *, effective
     return cv2.cvtColor(np.asarray(pil), cv2.COLOR_RGB2BGR)
 
 
-__all__ = ['_reason_metric', '_replace_translation_regions', '_write_replace_translation_bundle', '_blocking_direct_invariant_issues', '_has_transferable_source_text', '_should_preserve_transferred_layout', '_review_candidate_overlay']
+__all__ = ['_reason_metric', '_replace_translation_groups', '_replace_translation_regions', '_write_replace_translation_bundle', '_blocking_direct_invariant_issues', '_has_transferable_source_text', '_should_preserve_transferred_layout', '_review_candidate_overlay']

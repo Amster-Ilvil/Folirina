@@ -1137,11 +1137,27 @@ def render_open_text_box(
     clear_mask=cv2.bitwise_and(clear_mask,region)
     clipped=target.copy()
     clipped[write_mask>0]=rendered[write_mask>0]
+    def json_safe_diagnostics(value):
+        # Renderer diagnostics can carry full-page masks used by the caller.
+        # Keep a compact receipt in JSON; the actual masks are returned in
+        # dedicated binary fields below and must never be expanded into JSON.
+        if isinstance(value, np.ndarray):
+            return {"type": "ndarray", "shape": list(value.shape), "dtype": str(value.dtype)}
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, dict):
+            return {str(k): json_safe_diagnostics(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [json_safe_diagnostics(v) for v in value]
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        return str(value)
+
     return {
         "aligned_source": aligned,
         "rendered": clipped,
         "write_mask": write_mask,
         "source_mask": source_mask,
         "target_clear_mask": clear_mask,
-        "diagnostics": {**dict(diag or {}), "manual_open_text_box": True, "identity_pixel_lock": bool(identity), "bbox":[x0,y0,x1,y1], "ocr_used": False},
+        "diagnostics": json_safe_diagnostics({**dict(diag or {}), "manual_open_text_box": True, "identity_pixel_lock": bool(identity), "bbox":[x0,y0,x1,y1], "ocr_used": False}),
     }

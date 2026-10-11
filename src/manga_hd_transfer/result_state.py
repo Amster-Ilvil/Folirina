@@ -137,6 +137,21 @@ def create_run_snapshot(page_dir: str | Path, run_id: str) -> Path:
                         method = "copy"
                 archive_files.append({"name": rel.as_posix(), "method": method})
 
+        # Keep the inverse snapshot of TARGET restore in the same transaction
+        # as its destructive edits to manual clear/force masks. Otherwise a
+        # failed automatic rerun can restore the masks but leave a newer inverse
+        # snapshot that undoes the *wrong* edits when the reviewer resets it.
+        inverse_name = ".target_restore_mask_backup"
+        inverse_live = page_dir / inverse_name
+        if inverse_live.is_symlink() or (inverse_live.exists() and not inverse_live.is_dir()):
+            raise RuntimeError("unsafe TARGET restore inverse backup")
+        inverse_existed = inverse_live.is_dir()
+        if inverse_existed:
+            for entry in inverse_live.rglob("*"):
+                if entry.is_symlink() or not entry.is_file():
+                    raise RuntimeError("unsafe TARGET restore inverse backup contents")
+            shutil.copytree(inverse_live, backup / inverse_name)
+
         save_json(backup / "manifest.json", {
             "schema": "manga_hd_translation_transfer.run_snapshot.v3",
             "files": manifest,
@@ -144,6 +159,7 @@ def create_run_snapshot(page_dir: str | Path, run_id: str) -> Path:
                 "existed": bool(archive_existed),
                 "files": archive_files,
             },
+            "target_restore_inverse": {"existed": bool(inverse_existed)},
         })
         return backup
     except Exception:
@@ -201,6 +217,29 @@ def restore_run_snapshot(page_dir: str | Path, backup: str | Path | None) -> dic
 
     restored = 0
     removed_new = 0
+
+    # Old snapshot manifests do not include this key; never delete a current
+    # user's inverse backup on rollback from an older snapshot format.
+    inverse_contract = payload.get("target_restore_inverse") if isinstance(payload, dict) else None
+    if isinstance(inverse_contract, dict):
+        name = ".target_restore_mask_backup"
+        inverse_dst = page_dir / name
+        inverse_src = backup / name
+        inverse_existed = bool(inverse_contract.get("existed", False))
+        try:
+            if inverse_dst.is_symlink() or (inverse_dst.exists() and not inverse_dst.is_dir()):
+                raise RuntimeError("unsafe live TARGET inverse backup")
+            if inverse_existed:
+                if not inverse_src.is_dir() or inverse_src.is_symlink():
+                    raise FileNotFoundError(inverse_src)
+                if any(x.is_symlink() or not x.is_file() for x in inverse_src.rglob("*")):
+                    raise RuntimeError("unsafe stored TARGET inverse backup")
+            if inverse_dst.exists():
+                shutil.rmtree(inverse_dst)
+            if inverse_existed:
+                shutil.copytree(inverse_src, inverse_dst)
+        except (OSError, RuntimeError) as exc:
+            failed.append({"name": name, "operation": "restore_tree", "error": f"{type(exc).__name__}: {exc}"})
 
     # v3 snapshots also cover the recovery archive itself. A failed mode switch
     # must not leave a newly-created or partially-overwritten review_archive
@@ -462,11 +501,20 @@ def invalidate_manual_review_state(page_dir: str | Path) -> None:
         "target_layer_erase.json",
         "target_layer_restore_base.png", "target_layer_restore_effective_mask.png",
         "target_layer_restore_preview.png", "target_layer_restore.json",
+        "target_layer_edit_order.json",
     ):
         try:
             (page_dir / name).unlink(missing_ok=True)
         except OSError:
             pass
+    inverse = page_dir / ".target_restore_mask_backup"
+    try:
+        if inverse.is_symlink():
+            inverse.unlink()
+        elif inverse.is_dir():
+            shutil.rmtree(inverse)
+    except OSError:
+        pass
     # OCR editor blocks are durable user data, but their cached base/render state
     # belongs to the previous automatic result. Keep blocks.json and invalidate
     # only derived images/metadata so a fresh OCR run cannot inherit old shadows.

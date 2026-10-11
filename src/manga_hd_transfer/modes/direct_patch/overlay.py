@@ -12,6 +12,8 @@ from .text_transfer import (
     clear_uniform_white_container_interior,
     source_text_render,
     target_text_mask_in_container,
+    target_white_container_text_mask,
+    target_container_border_mask,
     white_container_paper_mask,
     white_container_write_envelope,
     transfer_text_only,
@@ -82,6 +84,7 @@ def restore_target_structural_damage(
     min_area_px: int = 10,
     fringe_px: int = 1,
     fringe_gray_max: int = 238,
+    text_exclusion_dilate_px: int = 2,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     """Restore TARGET bubble/rule segments actually damaged by a white clear.
 
@@ -134,7 +137,28 @@ def restore_target_structural_damage(
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1)),
         iterations=1,
     ) > 0
-    core_candidates = lost_dark & edge_strip & band
+    # A dark glyph close to the paper edge can satisfy the same long/thin
+    # geometry test as a broken bubble/rule segment. Build TARGET text exclusion
+    # from two independent compact-text selectors, then let independently
+    # detected long container borders override that exclusion. This prevents a
+    # full-clear from "healing" Japanese back into the final image while still
+    # preserving a genuine TARGET outline.
+    compact_text = target_text_mask_in_container(target_before, geom * 255)
+    white_text = target_white_container_text_mask(target_before, geom * 255)
+    text_exclusion = cv2.bitwise_or(compact_text, white_text)
+    text_dilate = max(0, int(text_exclusion_dilate_px))
+    if text_dilate > 0 and cv2.countNonZero(text_exclusion) > 0:
+        text_exclusion = cv2.dilate(
+            text_exclusion, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * text_dilate + 1, 2 * text_dilate + 1))
+        )
+    structural_authority = target_container_border_mask(
+        target_before, geom * 255, band_px=max(3, radius)
+    ) > 0
+    blocked_text = (text_exclusion > 0) & ~structural_authority
+    diag["target_text_exclusion_pixels"] = int(cv2.countNonZero(text_exclusion))
+    diag["structural_authority_pixels"] = int(np.count_nonzero(structural_authority))
+    diag["blocked_text_lost_pixels"] = int(np.count_nonzero(lost_dark & blocked_text))
+    core_candidates = lost_dark & edge_strip & band & ~blocked_text
     n, labels, stats, _ = cv2.connectedComponentsWithStats(core_candidates.astype(np.uint8), 8)
     restore_core = np.zeros(geom.shape, np.uint8)
     for lab in range(1, n):
@@ -161,7 +185,7 @@ def restore_target_structural_damage(
     if int(fringe_px) > 0:
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * int(fringe_px) + 1, 2 * int(fringe_px) + 1))
         halo = cv2.dilate(restore_core, k, iterations=1) > 0
-        restore |= halo & changed & (tg <= int(fringe_gray_max))
+        restore |= halo & changed & (tg <= int(fringe_gray_max)) & ~blocked_text
     out = candidate.copy(); out[restore] = target_before[restore]
     restore_u8 = restore.astype(np.uint8) * 255
     diag["restored_pixels"] = int(cv2.countNonZero(restore_u8))
@@ -177,6 +201,8 @@ def build_white_source_overlay(
     clear_target_text: bool = True,
     clear_dilate_px: int = 1,
     target_clear_region_mask: np.ndarray | None = None,
+    forced_target_clear_mask: np.ndarray | None = None,
+    forced_source_text_mask: np.ndarray | None = None,
     white_full_clear_enabled: bool = True,
     white_full_clear_min_paper_ratio: float = 0.68,
     white_full_clear_max_robust_spread: float = 14.0,
@@ -194,6 +220,7 @@ def build_white_source_overlay(
     post_structural_restore_min_area_px: int = 10,
     post_structural_restore_fringe_px: int = 1,
     post_structural_restore_fringe_gray_max: int = 238,
+    post_structural_restore_text_exclusion_dilate_px: int = 2,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     """Borderless SOURCE overlay with independent TARGET clearing authority.
 
@@ -230,6 +257,9 @@ def build_white_source_overlay(
     # strokes and punctuation cannot disappear merely because one selector missed
     # them.  The shared clarity helper still rejects long container boundary rules.
     source_text = cv2.bitwise_or(source_text_strict, src_changed)
+    if isinstance(forced_source_text_mask, np.ndarray) and forced_source_text_mask.shape == region_u8.shape:
+        forced_src = cv2.bitwise_and((forced_source_text_mask > 0).astype(np.uint8) * 255, region_u8)
+        source_text = cv2.bitwise_or(source_text, forced_src)
     diff_diag = dict(diff_diag)
     diff_diag["source_text_strict_pixels"] = int(cv2.countNonZero(source_text_strict))
     diff_diag["source_text_merged_pixels"] = int(cv2.countNonZero(source_text))
@@ -278,6 +308,9 @@ def build_white_source_overlay(
     # conservative component clear.  This preserves coloured/halftone safety.
     if clear_target_text and not bool(full_clear_diag.get("white_full_clear_applied", False)):
         tgt_text = tgt_changed.copy()
+        if isinstance(forced_target_clear_mask, np.ndarray) and forced_target_clear_mask.shape == region_u8.shape:
+            forced_tgt = cv2.bitwise_and((forced_target_clear_mask > 0).astype(np.uint8) * 255, clear_region)
+            tgt_text = cv2.bitwise_or(tgt_text, forced_tgt)
         if cv2.countNonZero(tgt_text) > 0:
             if int(clear_dilate_px) > 0:
                 k = cv2.getStructuringElement(
@@ -307,6 +340,7 @@ def build_white_source_overlay(
             min_area_px=int(post_structural_restore_min_area_px),
             fringe_px=int(post_structural_restore_fringe_px),
             fringe_gray_max=int(post_structural_restore_fringe_gray_max),
+            text_exclusion_dilate_px=int(post_structural_restore_text_exclusion_dilate_px),
         )
         if cv2.countNonZero(restored_structural) > 0:
             source_text[restored_structural > 0] = 0
@@ -345,6 +379,8 @@ def build_colored_text_overlay(
     region_mask: np.ndarray,
     *,
     target_clear_region_mask: np.ndarray | None = None,
+    forced_target_clear_mask: np.ndarray | None = None,
+    forced_source_text_mask: np.ndarray | None = None,
     clear_dilate_px: int = 1,
     inpaint_radius: float = 2.5,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
@@ -363,6 +399,8 @@ def build_colored_text_overlay(
         localized_white_text=False,
         white_full_clear_enabled=False,
         target_clear_region_mask=target_clear_region_mask,
+        forced_target_clear_mask=forced_target_clear_mask,
+        forced_source_text_mask=forced_source_text_mask,
     )
     cleaned, residual_mask, residual_diag = cleanup_target_residual_specks(
         candidate, target_region, (region_mask > 0).astype(np.uint8) * 255, source_text_mask, write_mask,
@@ -453,6 +491,8 @@ def compose_direct_overlay(
     clear_dilate_px: int = 1,
     inpaint_radius: float = 2.5,
     target_clear_region_mask: np.ndarray | None = None,
+    forced_target_clear_mask: np.ndarray | None = None,
+    forced_source_text_mask: np.ndarray | None = None,
     white_source_clarity_enabled: bool = True,
     white_source_clarity_alpha_gamma: float = 1.0,
     white_source_clarity_black_boost: int = 0,
@@ -467,6 +507,7 @@ def compose_direct_overlay(
     post_structural_restore_min_area_px: int = 10,
     post_structural_restore_fringe_px: int = 1,
     post_structural_restore_fringe_gray_max: int = 238,
+    post_structural_restore_text_exclusion_dilate_px: int = 2,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     requested_mask = (region_mask > 0).astype(np.uint8) * 255
     effective_mask, guard_diag = _refine_region_mask_with_support(
@@ -479,6 +520,8 @@ def compose_direct_overlay(
             clear_target_text=clear_target_text,
             clear_dilate_px=clear_dilate_px,
             target_clear_region_mask=target_clear_region_mask,
+            forced_target_clear_mask=forced_target_clear_mask,
+            forced_source_text_mask=forced_source_text_mask,
             white_full_clear_enabled=True,
             white_source_clarity_enabled=white_source_clarity_enabled,
             white_source_clarity_alpha_gamma=white_source_clarity_alpha_gamma,
@@ -494,11 +537,14 @@ def compose_direct_overlay(
             post_structural_restore_min_area_px=post_structural_restore_min_area_px,
             post_structural_restore_fringe_px=post_structural_restore_fringe_px,
             post_structural_restore_fringe_gray_max=post_structural_restore_fringe_gray_max,
+            post_structural_restore_text_exclusion_dilate_px=post_structural_restore_text_exclusion_dilate_px,
         )
     else:
         candidate, write_mask, source_payload, diag = build_colored_text_overlay(
             target_region, source_region, effective_mask,
             target_clear_region_mask=target_clear_region_mask,
+            forced_target_clear_mask=forced_target_clear_mask,
+            forced_source_text_mask=forced_source_text_mask,
             clear_dilate_px=clear_dilate_px,
             inpaint_radius=inpaint_radius,
         )

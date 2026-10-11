@@ -24,6 +24,7 @@ from .modes.hybrid import transfer_ops as hybrid_transfer_ops
 from .modes.hybrid.lettering_ops import fit_text, composite_text
 from .review_artifacts import safe_page_artifact_path
 from .text_only_transfer import target_text_mask_in_container
+from .region_alignment import aligned_source_roi as _aligned_source_roi
 
 REGION_MODES = {
     "region_direct_patch",
@@ -109,30 +110,6 @@ def _roi_bounds(mask: np.ndarray, *, halo: int = 0) -> tuple[int, int, int, int]
     return max(0, x0 - pad), max(0, y0 - pad), min(w, x1 + pad), min(h, y1 + pad)
 
 
-def _aligned_source_roi(source: np.ndarray, target_shape: tuple[int, int], project: dict[str, Any],
-                        roi: tuple[int, int, int, int], *, source_offset_x: int = 0,
-                        source_offset_y: int = 0) -> tuple[np.ndarray, bool]:
-    """Warp SOURCE directly into a TARGET-space ROI instead of a full page."""
-    th, tw = map(int, target_shape)
-    xa, ya, xb, yb = [int(v) for v in roi]
-    rw, rh = max(1, xb - xa), max(1, yb - ya)
-    H = mask_ops.registration_homography(project).copy()
-    dx, dy = int(source_offset_x), int(source_offset_y)
-    identity = bool(
-        source.shape[:2] == (th, tw) and not dx and not dy
-        and np.max(np.abs(np.asarray(H, np.float64) - np.eye(3))) <= 1e-7
-    )
-    if identity:
-        return source[ya:yb, xa:xb].copy(), True
-    if dx or dy:
-        T = np.asarray([[1.0, 0.0, float(dx)], [0.0, 1.0, float(dy)], [0.0, 0.0, 1.0]], np.float64)
-        H = T @ H
-    C = np.asarray([[1.0, 0.0, -float(xa)], [0.0, 1.0, -float(ya)], [0.0, 0.0, 1.0]], np.float64)
-    crop = cv2.warpPerspective(
-        source, C @ H, (rw, rh), flags=cv2.INTER_LANCZOS4,
-        borderMode=cv2.BORDER_REPLICATE,
-    )
-    return crop, False
 
 
 def _manual_precise_relaxed_cfg(cfg_obj: Any) -> Any:

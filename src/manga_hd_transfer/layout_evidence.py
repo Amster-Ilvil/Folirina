@@ -16,6 +16,8 @@ Nothing in this module performs OCR or relettering.
 
 from collections import OrderedDict
 import logging
+import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +28,7 @@ from .cache import PageStageCache, image_stage_signature
 from .config import BubbleConfig
 from .geometry import polygon_bbox, polygon_centroid, rasterize_polygon
 from .model_downloads import discovered_model_path
+from .m6_runtime_plan import choose_detector_size, m6_cache_token, m6_layout_cache_token
 from .models import BubbleInstance, TextBlock
 
 
@@ -55,6 +58,25 @@ def _canonical_cache_role(role: str) -> str:
     return "page"
 
 
+def _koharu_requested_shape(cfg: BubbleConfig) -> int:
+    """Resolve the explicit cloud/test Koharu shape without changing product defaults.
+
+    Folirina's product default remains ``cfg.koharu_layout_shape`` (1152).  The
+    cloud acceptance harness historically exports ``KOHARU_SHAPE=624``; honoring
+    that explicit environment override keeps GUI runs on the same detector scale
+    as the verified headless Koharu acceptance path.
+    """
+    base = int(getattr(cfg, "koharu_layout_shape", 1152) or 1152)
+    raw = str(os.environ.get("KOHARU_SHAPE", "") or "").strip()
+    if not raw:
+        return base
+    try:
+        value = int(raw)
+    except ValueError:
+        return base
+    return max(512, min(2048, value))
+
+
 def _model_revision_token(cfg: BubbleConfig) -> str:
     try:
         resolved = discovered_model_path("koharu_layout", getattr(cfg, "koharu_layout_model_path", None))
@@ -81,22 +103,31 @@ def _layout_signature(
     *,
     role: str,
     image_path: str | Path | None = None,
+    legacy: bool = False,
 ) -> str:
     cfg = bubble_cfg or BubbleConfig()
+    cache_role = _canonical_cache_role(role)
     payload = {
         'backend': 'koharu_layout',
-        'page_role': _canonical_cache_role(role),
+        # New v5 layout signatures are intentionally role-neutral: SOURCE/TARGET
+        # are cache-file scopes, not model-output semantics. This also lets the
+        # in-process memo reuse identical image content across cooperating stages.
+        'page_role': cache_role if legacy else 'shared',
         'thresholds': {
             'text': float(getattr(cfg, 'koharu_layout_text_threshold', 0.25)),
             'sfx': float(getattr(cfg, 'koharu_layout_sfx_threshold', 0.20)),
             'bubble': float(getattr(cfg, 'koharu_layout_bubble_threshold', 0.50)),
             'panel': float(getattr(cfg, 'koharu_layout_panel_threshold', 0.50)),
-            'shape': int(getattr(cfg, 'koharu_layout_shape', 1152)),
+            'shape': _koharu_requested_shape(cfg),
+            'effective_shape': int(choose_detector_size('koharu_layout', _koharu_requested_shape(cfg), image.shape[:2], config=cfg)),
             'postprocess_max_side': int(getattr(cfg, 'koharu_layout_postprocess_max_side', 1152)),
             'postprocess_downscale_trigger_side': int(getattr(cfg, 'koharu_layout_postprocess_downscale_trigger_side', 2048)),
             'device': str(getattr(cfg, 'device', 'auto')),
             'model_path': str(getattr(cfg, 'koharu_layout_model_path', '') or ''),
-            'model_revision': _model_revision_token(cfg),
+            'm6_koharu_weight_fp16_auto': bool(getattr(cfg, 'm6_koharu_weight_fp16_auto', True)),
+            # v5 only binds the Koharu-relevant part of the M6 policy. The broad
+            # token remains available for unrelated pipeline stages.
+            'm6_policy': m6_cache_token(cfg) if legacy else m6_layout_cache_token(cfg),
         },
     }
     if image_path is not None:
@@ -105,8 +136,12 @@ def _layout_signature(
                 return image_stage_signature(image_path, payload)
         except OSError:
             pass
-    cache_role = _canonical_cache_role(role)
-    return f"array:{cache_role}:{_array_signature(image)}:{payload['thresholds']['shape']}:{payload['thresholds']['postprocess_max_side']}:{payload['thresholds']['postprocess_downscale_trigger_side']}:{payload['thresholds']['text']}:{payload['thresholds']['bubble']}"
+    return (
+        f"array:{cache_role if legacy else 'shared'}:{_array_signature(image)}:"
+        f"{payload['thresholds']['shape']}:{payload['thresholds']['postprocess_max_side']}:"
+        f"{payload['thresholds']['postprocess_downscale_trigger_side']}:"
+        f"{payload['thresholds']['text']}:{payload['thresholds']['bubble']}:{payload['thresholds']['m6_policy']}"
+    )
 
 
 def collect_koharu_layout_evidence_cached(
@@ -122,48 +157,76 @@ def collect_koharu_layout_evidence_cached(
 ) -> LayoutEvidence:
     cache_role = _canonical_cache_role(role)
     signature = _layout_signature(image, bubble_cfg, role=cache_role, image_path=image_path)
-    if cache is not None and cache_enabled and image_path is not None and hasattr(cache, "load_layout_evidence"):
+    legacy_signature = _layout_signature(image, bubble_cfg, role=cache_role, image_path=image_path, legacy=True)
+
+    def _mark_stats(state: str, *, origin: str, migrated: bool = False) -> None:
+        if stats is None:
+            return
+        stats[f'layout_{role}'] = state
+        # Later consumers can report hit_disk after the prefetch actually ran
+        # the model. Preserve the first lookup for honest cold/warm timings.
+        stats.setdefault(f'layout_{cache_role}_first_cache', state)
+        stats.setdefault(f'layout_{cache_role}_first_cache_origin', origin)
+        stats[f'layout_{cache_role}_cache'] = state
+        stats[f'layout_{cache_role}_cache_origin'] = origin
+        stats[f'layout_{cache_role}_cache_lookup'] = 'hit' if state.startswith('hit') else 'miss'
+        if migrated:
+            stats[f'layout_{cache_role}_cache_migrated'] = True
+
+    if cache is not None and cache_enabled and image_path is not None and hasattr(cache, 'load_layout_evidence'):
         cached = cache.load_layout_evidence(cache_role, signature)
         if cached is not None:
-            if stats is not None:
-                stats[f'layout_{role}'] = 'hit_disk'
-                stats[f'layout_{cache_role}_cache'] = 'hit_disk'
+            _mark_stats('hit_disk', origin='disk')
             return cached
+        # One-time compatibility bridge for v4/M6 caches. The old signature
+        # mixed unrelated pipeline parameters into the layout key, so v5 first
+        # tries the exact old key and then rewrites the cache under the narrower
+        # stage-specific key after a successful load.
+        if legacy_signature != signature:
+            cached = cache.load_layout_evidence(cache_role, legacy_signature)
+            if cached is not None:
+                _mark_stats('hit_disk_migrated', origin='disk_legacy', migrated=True)
+                if hasattr(cache, 'save_layout_evidence'):
+                    try:
+                        cache.save_layout_evidence(cache_role, signature, cached)
+                    except Exception:
+                        logger.debug('Koharu cache migration write failed role=%s', role, exc_info=True)
+                return cached
+
     memo = _LAYOUT_EVIDENCE_MEMO.get(signature)
     if memo is not None:
         _LAYOUT_EVIDENCE_MEMO.move_to_end(signature)
-        if stats is not None:
-            token = 'hit_memory' if memo.available else 'hit_memory_unavailable'
-            stats[f'layout_{role}'] = token
-            stats[f'layout_{cache_role}_cache'] = token
-            if not memo.available:
-                reason = str((memo.diagnostics or {}).get("reason") or "unavailable")
-                error = str((memo.diagnostics or {}).get("error") or "")
-                stats[f'layout_{role}_reason'] = reason
-                if error:
-                    stats[f'layout_{role}_error'] = error[:800]
+        token = 'hit_memory' if memo.available else 'hit_memory_unavailable'
+        _mark_stats(token, origin='memory')
+        if stats is not None and not memo.available:
+            reason = str((memo.diagnostics or {}).get('reason') or 'unavailable')
+            error = str((memo.diagnostics or {}).get('error') or '')
+            stats[f'layout_{role}_reason'] = reason
+            if error:
+                stats[f'layout_{role}_error'] = error[:800]
         return memo
 
+    started = time.perf_counter()
     evidence = collect_koharu_layout_evidence(image, bubble_cfg, role=role, allow_missing=allow_missing)
-    # Successful evidence is always memoized. Deterministic *runtime* failures
-    # (for example RF-DETR postprocess OOM) are also memoized for this process so
-    # bubble/Direct/transfer/QA consumers do not repeat the same multi-second crash
-    # on one page. Missing-model state remains non-sticky because the user may
-    # install/download a model while the GUI process is still open.
-    memo_reason = str((evidence.diagnostics or {}).get("reason") or "")
-    if evidence.available or memo_reason == "runtime_error":
+    elapsed = time.perf_counter() - started
+    try:
+        evidence.diagnostics['cache_build_seconds'] = round(float(elapsed), 4)
+    except Exception:
+        pass
+    memo_reason = str((evidence.diagnostics or {}).get('reason') or '')
+    if evidence.available or memo_reason == 'runtime_error':
         _LAYOUT_EVIDENCE_MEMO[signature] = evidence
         _LAYOUT_EVIDENCE_MEMO.move_to_end(signature)
         while len(_LAYOUT_EVIDENCE_MEMO) > _LAYOUT_EVIDENCE_MEMO_MAX:
             _LAYOUT_EVIDENCE_MEMO.popitem(last=False)
-    if cache is not None and cache_enabled and image_path is not None and evidence.available and hasattr(cache, "save_layout_evidence"):
+    if cache is not None and cache_enabled and image_path is not None and evidence.available and hasattr(cache, 'save_layout_evidence'):
         cache.save_layout_evidence(cache_role, signature, evidence)
+    _mark_stats('miss_built' if evidence.available else 'miss_unavailable', origin='inference' if evidence.available else 'none')
     if stats is not None:
-        stats[f'layout_{role}'] = 'miss_built' if evidence.available else 'miss_unavailable'
-        stats[f'layout_{cache_role}_cache'] = 'miss_built' if evidence.available else 'miss_unavailable'
+        stats[f'layout_{cache_role}_build_seconds'] = round(float(elapsed), 4)
         if not evidence.available:
-            reason = str((evidence.diagnostics or {}).get("reason") or "unavailable")
-            error = str((evidence.diagnostics or {}).get("error") or "")
+            reason = str((evidence.diagnostics or {}).get('reason') or 'unavailable')
+            error = str((evidence.diagnostics or {}).get('error') or '')
             stats[f'layout_{role}_reason'] = reason
             if error:
                 stats[f'layout_{role}_error'] = error[:800]
@@ -198,14 +261,19 @@ def prepare_page_layout_evidence(
     need_source = True
     need_target = True
     out: dict[str, LayoutEvidence] = {}
-    if need_source:
-        out["source"] = collect_koharu_layout_evidence_cached(
-            source, cfg, role="source", image_path=source_path, cache=cache,
-            cache_enabled=cache_enabled, stats=stats, allow_missing=True,
-        )
+    # Run TARGET before SOURCE. Photographed/translation SOURCE pages are often
+    # 4K--6K while TARGET is the canonical publication-size page. On CPU RF-DETR
+    # a large SOURCE-first segmentation call can leave substantial postprocess
+    # state resident and stall the immediately following request. SOURCE-last is
+    # semantically equivalent, and all later stages consume these cached results.
     if need_target:
         out["target"] = collect_koharu_layout_evidence_cached(
             target, cfg, role="target", image_path=target_path, cache=cache,
+            cache_enabled=cache_enabled, stats=stats, allow_missing=True,
+        )
+    if need_source:
+        out["source"] = collect_koharu_layout_evidence_cached(
+            source, cfg, role="source", image_path=source_path, cache=cache,
             cache_enabled=cache_enabled, stats=stats, allow_missing=True,
         )
     if stats is not None:
@@ -321,6 +389,132 @@ def filter_candidates_by_layout_authority(
     return kept, audit
 
 
+
+def koharu_semantic_text_ink_mask(
+    image: np.ndarray,
+    evidence: LayoutEvidence | None,
+    *,
+    labels: tuple[str, ...] = ("text",),
+    min_confidence: float = 0.50,
+    pad_px: int = 3,
+    dilate_px: int = 1,
+    region_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Recover complete text ink inside Koharu RF-DETR semantic boxes.
+
+    Koharu segmentation polygons are excellent *anchors* but can hug only a
+    subset of a glyph/line.  The RF-DETR ``raw_box`` is a better semantic
+    corridor for recovering the complete raster text.  This helper therefore
+    uses the raw box only as a search window, derives foreground polarity from
+    the trusted segmentation-vs-surrounding contrast, filters structural
+    rules/hatching, and always retains the original segmentation support.
+
+    The result is layout evidence, not OCR.  Callers should still intersect it
+    with an authoritative writable container (bubble/text region) before any
+    destructive operation.
+    """
+    h, w = image.shape[:2]
+    out = np.zeros((h, w), np.uint8)
+    if evidence is None or not evidence.available:
+        return out
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    wanted = {normalize_layout_label(x) for x in labels}
+    restrict = None
+    if isinstance(region_mask, np.ndarray) and tuple(region_mask.shape[:2]) == (h, w):
+        restrict = region_mask > 0
+
+    for row in evidence.items:
+        if row.label not in wanted or float(row.confidence) < float(min_confidence):
+            continue
+        raw_box = list((row.meta or {}).get("raw_box") or row.box or [])
+        if len(raw_box) != 4:
+            continue
+        try:
+            x0, y0, x1, y1 = [int(round(float(v))) for v in raw_box]
+        except Exception:
+            continue
+        pad = max(0, int(pad_px))
+        x0, y0 = max(0, x0 - pad), max(0, y0 - pad)
+        x1, y1 = min(w, x1 + pad), min(h, y1 + pad)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        if restrict is not None and not np.any(restrict[y0:y1, x0:x1]):
+            continue
+
+        roi = gray[y0:y1, x0:x1]
+        seg = np.zeros(roi.shape, np.uint8)
+        pts = np.array(
+            [[int(round(float(x))) - x0, int(round(float(y))) - y0] for x, y in row.polygon],
+            dtype=np.int32,
+        )
+        if len(pts) >= 3:
+            cv2.fillPoly(seg, [pts], 255)
+        if cv2.countNonZero(seg) <= 0:
+            continue
+
+        seed_values = roi[seg > 0]
+        seed_median = float(np.median(seed_values)) if seed_values.size else 128.0
+        ring = cv2.dilate(seg, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)))
+        bg_values = roi[ring == 0]
+        if bg_values.size < 32:
+            bg_values = roi.reshape(-1)
+        bg_median = float(np.median(bg_values)) if bg_values.size else 128.0
+        dark_foreground = seed_median < bg_median
+        if abs(seed_median - bg_median) < 8.0:
+            dark_foreground = seed_median < 128.0
+
+        flat = roi.reshape(-1)
+        if dark_foreground:
+            background = float(np.percentile(flat, 78))
+            spread = float(np.percentile(flat, 90) - np.percentile(flat, 15))
+            contrast = max(14.0, min(50.0, 14.0 + spread * 0.12))
+            threshold = int(np.clip(background - contrast, 45, 210))
+            candidate = (roi <= threshold).astype(np.uint8) * 255
+        else:
+            background = float(np.percentile(flat, 22))
+            spread = float(np.percentile(flat, 85) - np.percentile(flat, 10))
+            contrast = max(14.0, min(50.0, 14.0 + spread * 0.12))
+            threshold = int(np.clip(background + contrast, 45, 245))
+            candidate = (roi >= threshold).astype(np.uint8) * 255
+
+        # Keep glyph-like components but reject long panel rules, hatching and
+        # huge sparse structural blobs.  Exact Koharu segmentation is restored
+        # afterwards so the detector remains the semantic anchor.
+        n, labels_cc, stats_cc, _ = cv2.connectedComponentsWithStats((candidate > 0).astype(np.uint8), 8)
+        use = np.zeros_like(candidate)
+        rh, rw = use.shape
+        crop_area = max(1, rh * rw)
+        for k in range(1, n):
+            cx, cy, cw, ch, area = [int(v) for v in stats_cc[k]]
+            if area < 2:
+                continue
+            fill = area / max(1, cw * ch)
+            aspect = max(cw, ch) / max(1, min(cw, ch))
+            if area / crop_area > 0.30 and fill < 0.30:
+                continue
+            if cw / max(1, rw) > 0.82 and ch < max(5, int(rh * 0.10)) and fill < 0.60:
+                continue
+            if ch / max(1, rh) > 0.92 and cw < max(5, int(rw * 0.06)) and fill < 0.35:
+                continue
+            if aspect > 14.0 and area > 40 and fill < 0.45:
+                continue
+            use[labels_cc == k] = 255
+
+        use = cv2.bitwise_or(use, seg)
+        n, labels_cc, stats_cc, _ = cv2.connectedComponentsWithStats((use > 0).astype(np.uint8), 8)
+        clean = np.zeros_like(use)
+        for k in range(1, n):
+            if int(stats_cc[k, cv2.CC_STAT_AREA]) >= 2:
+                clean[labels_cc == k] = 255
+        radius = max(0, int(dilate_px))
+        if radius > 0 and cv2.countNonZero(clean) > 0:
+            clean = cv2.dilate(clean, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1)))
+        if restrict is not None:
+            local_restrict = restrict[y0:y1, x0:x1]
+            clean[~local_restrict] = 0
+        out[y0:y1, x0:x1] = cv2.bitwise_or(out[y0:y1, x0:x1], clean)
+    return out
+
 def collect_koharu_layout_evidence(
     image: np.ndarray,
     bubble_cfg: BubbleConfig | None = None,
@@ -345,6 +539,11 @@ def collect_koharu_layout_evidence(
     from .vision_runtime import run_koharu_layout
 
     try:
+        requested_shape = _koharu_requested_shape(cfg)
+        dynamic_shape = choose_detector_size(
+            "koharu_layout", requested_shape, shape, config=cfg
+        )
+        post_max = min(int(getattr(cfg, "koharu_layout_postprocess_max_side", 1152)), dynamic_shape)
         payload = run_koharu_layout(
             image,
             model_dir=str(resolved),
@@ -353,9 +552,10 @@ def collect_koharu_layout_evidence(
             sfx_threshold=float(getattr(cfg, "koharu_layout_sfx_threshold", 0.20)),
             bubble_threshold=float(getattr(cfg, "koharu_layout_bubble_threshold", 0.50)),
             panel_threshold=float(getattr(cfg, "koharu_layout_panel_threshold", 0.50)),
-            shape=int(getattr(cfg, "koharu_layout_shape", 1152)),
-            postprocess_max_side=int(getattr(cfg, "koharu_layout_postprocess_max_side", 1152)),
-            postprocess_downscale_trigger_side=int(getattr(cfg, "koharu_layout_postprocess_downscale_trigger_side", 2048)),
+            shape=dynamic_shape,
+            postprocess_max_side=post_max,
+            postprocess_downscale_trigger_side=max(int(getattr(cfg, "koharu_layout_postprocess_downscale_trigger_side", 2048)), dynamic_shape),
+            optimize_weights_fp16=bool(getattr(cfg, "m6_koharu_weight_fp16_auto", True)),
         )
     except Exception as exc:
         detail = {
@@ -412,6 +612,7 @@ def collect_koharu_layout_evidence(
         "role": role,
         "available": True,
         "shape": shape,
+        "requested_inference_shape": _koharu_requested_shape(cfg),
         "counts": counts,
         "device": str(payload.get("device") or "isolated"),
         "item_count": len(items),
@@ -421,6 +622,12 @@ def collect_koharu_layout_evidence(
         "postprocess_max_side": int(payload.get("postprocess_max_side") or getattr(cfg, "koharu_layout_postprocess_max_side", 1152)),
         "postprocess_downscale_trigger_side": int(payload.get("postprocess_downscale_trigger_side") or getattr(cfg, "koharu_layout_postprocess_downscale_trigger_side", 2048)),
         "downscaled_for_postprocess": bool(payload.get("downscaled_for_postprocess", False)),
+        "model_cache_hit": bool(payload.get("model_cache_hit", False)),
+        "model_load_seconds": float(payload.get("model_load_seconds", 0.0) or 0.0),
+        "optimize_seconds": float(payload.get("optimize_seconds", 0.0) or 0.0),
+        "optimized_weights_fp16": bool(payload.get("optimized_weights_fp16", False)),
+        "optimize_weights_fp16_requested": bool(payload.get("optimize_weights_fp16_requested", False)),
+        "predict_seconds": float(payload.get("predict_seconds", 0.0) or 0.0),
     }
     return LayoutEvidence(True, "koharu_layout", items, diagnostics)
 
@@ -458,7 +665,7 @@ def collect_ysg_obb_layout_evidence(
             image, model_path=str(resolved),
             confidence=float(getattr(cfg, "ysg_obb_confidence", .25)),
             iou=float(getattr(cfg, "ysg_obb_iou", .50)),
-            imgsz=int(getattr(cfg, "ysg_obb_imgsz", 1600)),
+            imgsz=choose_detector_size("ysg_obb", max(640, int(getattr(cfg, "ysg_obb_imgsz", 1600))), shape, config=cfg),
             device=str(getattr(cfg, "device", "auto")),
         )
     except Exception as exc:
@@ -504,7 +711,8 @@ def collect_ysg_obb_layout_evidence_cached(
         "backend":"ysg_obb", "role":str(role),
         "confidence":float(getattr(cfg,"ysg_obb_confidence",.25)),
         "iou":float(getattr(cfg,"ysg_obb_iou",.50)),
-        "imgsz":int(getattr(cfg,"ysg_obb_imgsz",1600)),
+        "imgsz":choose_detector_size("ysg_obb", max(640, int(getattr(cfg,"ysg_obb_imgsz",1600))), image.shape[:2], config=cfg),
+        "m6_policy":m6_cache_token(cfg),
         "include_other":bool(getattr(cfg,"ysg_obb_include_other",False)),
         "model_path":str(getattr(cfg,"ysg_obb_model_path","") or ""),
     }
@@ -562,6 +770,7 @@ __all__ = [
     "filter_candidates_by_layout_authority",
     "collect_koharu_layout_evidence",
     "collect_koharu_layout_evidence_cached",
+    "koharu_semantic_text_ink_mask",
     "prepare_page_layout_evidence",
     "collect_ysg_obb_layout_evidence", "collect_ysg_obb_layout_evidence_cached",
     "merge_positive_layout_evidence",

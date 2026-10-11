@@ -46,6 +46,8 @@ DEPENDENCY_LABELS: dict[str, str] = {
     "manga_ocr": "Manga OCR",
     "baberu_ocr": "Baberu OCR",
     "ocr48px": "48px AR OCR",
+    "hayai_ocr": "Hayai OCR 2.3 · v2.5-nova",
+    "ndlocr_lite": "NDLOCR-Lite 1.2.3",
     "torch_sr": "MPS 局部超分",
 }
 
@@ -62,6 +64,8 @@ DEPENDENCY_MODULES: dict[str, tuple[str, ...]] = {
     "manga_ocr": ("torch", "torchvision", "transformers", "safetensors"),
     "baberu_ocr": ("onnxruntime", "numpy", "PIL"),
     "ocr48px": ("torch", "einops", "numpy", "PIL"),
+    "hayai_ocr": ("torch", "hayai_ocr", "numpy", "PIL"),
+    "ndlocr_lite": ("onnxruntime", "numpy", "PIL"),
     "torch_sr": ("torch", "spandrel"),
 }
 
@@ -199,12 +203,18 @@ def missing_dependency_modules(key: str) -> tuple[str, ...]:
             return () if runtime_status().ready else ("deep-registration-isolated-runtime",)
         except Exception:
             return ("deep-registration-isolated-runtime",)
-    if key in {"mangalens", "ysg_obb", "rtdetr_v2", "sam2", "koharu_layout", "manga_ocr", "baberu_ocr", "ocr48px"}:
+    if key in {"mangalens", "ysg_obb", "rtdetr_v2", "sam2", "koharu_layout", "manga_ocr", "baberu_ocr", "ocr48px", "hayai_ocr"}:
         try:
             from .vision_runtime import runtime_status
             return () if runtime_status(key).ready else ("vision-isolated-runtime",)
         except Exception:
             return ("vision-isolated-runtime",)
+    if key == "ndlocr_lite":
+        try:
+            from .ndlocr_lite_runtime import runtime_status
+            return () if runtime_status().ready else ("ndlocr-lite-isolated-runtime",)
+        except Exception:
+            return ("ndlocr-lite-isolated-runtime",)
     modules = DEPENDENCY_MODULES.get(key, ())
     return tuple(name for name in modules if not _has_module(name))
 
@@ -350,6 +360,22 @@ def _install_baberu_ocr(progress: ProgressFn | None) -> DependencyInstallResult:
     return _install_vision_runtime("baberu_ocr", progress)
 
 
+def _install_hayai_ocr(progress: ProgressFn | None) -> DependencyInstallResult:
+    return _install_vision_runtime("hayai_ocr", progress)
+
+
+def _install_ndlocr_lite(progress: ProgressFn | None) -> DependencyInstallResult:
+    from .ndlocr_lite_runtime import ensure_runtime
+    _emit(progress, f"GUI Python：{sys.executable}")
+    status = ensure_runtime(progress)
+    return DependencyInstallResult(
+        "ndlocr_lite",
+        "NDLOCR-Lite 独立运行环境已安装并验证。 " + status.detail,
+        False,
+        ("ndlocr-lite-isolated-runtime",),
+    )
+
+
 def _install_ocr48px(progress: ProgressFn | None) -> DependencyInstallResult:
     return _install_vision_runtime("ocr48px", progress)
 
@@ -379,6 +405,8 @@ def install_model_dependencies(key: str, progress: ProgressFn | None = None) -> 
         "manga_ocr": _install_manga_ocr,
         "baberu_ocr": _install_baberu_ocr,
         "ocr48px": _install_ocr48px,
+        "hayai_ocr": _install_hayai_ocr,
+        "ndlocr_lite": _install_ndlocr_lite,
         "torch_sr": _install_torch_sr,
     }
     fn = dispatch.get(key)
@@ -389,7 +417,7 @@ def install_model_dependencies(key: str, progress: ProgressFn | None = None) -> 
 
 def install_all_model_dependencies(progress: ProgressFn | None = None) -> DependencyInstallResult:
     """Install missing dependencies for all downloadable built-in models."""
-    keys = ("paddle", "lightglue", "loftr", "mangalens", "ysg_obb", "rtdetr_v2", "sam2", "koharu_layout", "manga_ocr", "baberu_ocr", "ocr48px")
+    keys = ("paddle", "lightglue", "loftr", "mangalens", "ysg_obb", "rtdetr_v2", "sam2", "koharu_layout", "manga_ocr", "baberu_ocr", "ocr48px", "hayai_ocr", "ndlocr_lite")
     completed: list[str] = []
     for i, key in enumerate(keys, 1):
         label = DEPENDENCY_LABELS[key]
@@ -411,7 +439,7 @@ def install_all_model_dependencies(progress: ProgressFn | None = None) -> Depend
         raise RuntimeError("PP-OCR 独立运行环境验证失败：" + paddle.detail)
     if not deep.ready:
         raise RuntimeError("LightGlue / LoFTR 独立运行环境验证失败：" + deep.detail)
-    for key in ("mangalens", "ysg_obb", "rtdetr_v2", "sam2", "koharu_layout", "manga_ocr", "baberu_ocr", "ocr48px"):
+    for key in ("mangalens", "ysg_obb", "rtdetr_v2", "sam2", "koharu_layout", "manga_ocr", "baberu_ocr", "ocr48px", "hayai_ocr"):
         status = vision_runtime_status(key)
         if not status.ready:
             raise RuntimeError(f"{DEPENDENCY_LABELS[key]} 独立视觉运行环境验证失败：" + status.detail)

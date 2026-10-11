@@ -202,6 +202,31 @@ MODULE_CONTRACTS: tuple[ModuleContract, ...] = (
         "Text-unit construction, paired identity matching and auto-acceptance policy",
     ),
     ModuleContract(
+        "studio_review_views", "ui-editor-view",
+        ("gui_qt", "pipeline"),
+        "Reusable manual-review image/selection/dialog views independent from the Studio composition root",
+    ),
+    ModuleContract(
+        "studio_ocr_editor", "ui-editor",
+        ("gui_qt", "pipeline"),
+        "Mode-dispatched OCR block editor isolated from StudioWindow and page orchestration",
+    ),
+    ModuleContract(
+        "studio_region_editor", "ui-editor",
+        ("gui_qt", "pipeline"),
+        "Region composite and manual-effect editors isolated from StudioWindow",
+    ),
+    ModuleContract(
+        "studio_workbench_actions", "ui-controller",
+        ("gui_qt", "pipeline"),
+        "Workbench review commands and state transitions separated from widget composition",
+    ),
+    ModuleContract(
+        "studio_workbench_page", "ui-page",
+        ("gui_qt", "pipeline"),
+        "Workbench widget composition over the extracted action/controller mixin",
+    ),
+    ModuleContract(
         "studio_project_page", "ui-page",
         ("gui_qt", "pipeline", "review_apply", "mask_transfer"),
         "Page Manager and side-by-side page preview isolated from StudioWindow",
@@ -220,6 +245,11 @@ MODULE_CONTRACTS: tuple[ModuleContract, ...] = (
         "gui_theme", "ui-theme",
         ("gui_qt", "pipeline", "review_apply", "mask_transfer"),
         "Shared palette and Qt stylesheet without workflow dependencies",
+    ),
+    ModuleContract(
+        "graphics_zoom", "ui-interaction",
+        ("gui_qt", "pipeline", "review_apply", "mask_transfer", "studio_workbench_page", "studio_workbench_actions"),
+        "Frame-coalesced QGraphicsView zoom behavior independent from editor/workflow ownership",
     ),
     ModuleContract(
         "gui_components", "ui-component",

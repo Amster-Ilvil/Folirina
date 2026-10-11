@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import PipelineConfig
-from .model_downloads import model_local_paths, paddle_profile_marker_status
+from .model_downloads import model_local_paths, discovered_model_path, paddle_profile_marker_status
 from .dependency_install import missing_dependency_modules
 
 
@@ -113,8 +113,9 @@ def probe_components(config: PipelineConfig | None = None, *, deep: bool = False
         mangalens_pkg,
         (f"权重：{mangalens_path}" if mangalens_weight else "缺少 best.pt；可在模型中心主动下载。") + " " + mangalens_detail,
     )
-    ysg_path = Path(cfg.bubbles.ysg_obb_model_path).expanduser() if cfg.bubbles.ysg_obb_model_path else local_models["ysg_obb"]
-    ysg_weight = ysg_path.is_file()
+    ysg_resolved = discovered_model_path("ysg_obb", cfg.bubbles.ysg_obb_model_path)
+    ysg_path = ysg_resolved if ysg_resolved is not None else local_models["ysg_obb"]
+    ysg_weight = bool(ysg_resolved and ysg_resolved.is_file())
     try:
         ysg_runtime = _vision_runtime_status("ysg_obb")
         ysg_detail = ysg_runtime.detail
@@ -123,7 +124,7 @@ def probe_components(config: PipelineConfig | None = None, *, deep: bool = False
     ysg_pkg = bool(ysg_runtime and ysg_runtime.ready)
     rows["ysg_obb"] = ComponentStatus(
         "ysg_obb", "YSG YOLO OBB", ysg_pkg and ysg_weight, ysg_pkg,
-        (f"权重：{ysg_path}" if ysg_weight else "缺少 ysgyolo_yolo26_2.0.pt；可在模型中心主动下载。") + " " + ysg_detail,
+        (f"权重：{ysg_path}" if ysg_weight else "缺少 YSG OBB/HBB checkpoint；模型中心会下载显式 OBB 权重。") + " " + ysg_detail,
     )
     rtdetr_path = Path(cfg.bubbles.rtdetr_model_path).expanduser() if cfg.bubbles.rtdetr_model_path else local_models["rtdetr_v2"]
     rtdetr_files = all((rtdetr_path / n).is_file() for n in ("config.json", "preprocessor_config.json", "model.safetensors")) if rtdetr_path.is_dir() else False
@@ -179,6 +180,52 @@ def probe_components(config: PipelineConfig | None = None, *, deep: bool = False
         (f" 原生独立运行时已就绪。 {mit48_detail}" if mit48_native_runtime else "") +
         (" 外部 runner 已配置。" if mit48_runner else ""),
     )
+
+    # M6 Japanese vertical OCR additions.  Hayai owns its HF/model cache, while
+    # NDLOCR-Lite owns a fully isolated venv and does not share Paddle assets.
+    try:
+        hayai_status = _vision_runtime_status("hayai_ocr")
+        hayai_runtime_ready = bool(hayai_status.ready)
+        hayai_detail = hayai_status.detail
+    except Exception as exc:
+        hayai_runtime_ready = False
+        hayai_detail = f"独立运行环境探测失败：{exc}"
+    from .hayai_support import hayai_ready_marker_matches, normalize_hayai_patch_budget
+    hayai_cache = discovered_model_path("hayai_ocr", getattr(cfg.ocr, "hayai_ocr_model_cache_dir", None))
+    hayai_marker = False; hayai_marker_detail = "模型尚未在模型中心预热。"
+    if hayai_cache is not None:
+        hayai_marker, hayai_marker_detail = hayai_ready_marker_matches(
+            hayai_cache, quantize=getattr(cfg.ocr, "hayai_ocr_quantize", "none"),
+            use_v2=bool(getattr(cfg.ocr, "hayai_ocr_use_v2", False)),
+            backend=getattr(cfg.ocr, "hayai_ocr_backend", "auto"),
+            max_num_patches=normalize_hayai_patch_budget(getattr(cfg.ocr, "hayai_ocr_max_num_patches", 384), backend=getattr(cfg.ocr, "hayai_ocr_backend", "auto")),
+        )
+    hayai_ready = bool(hayai_runtime_ready and hayai_marker)
+    rows["hayai_ocr"] = ComponentStatus(
+        "hayai_ocr", "Hayai OCR 2.3 · v2.5-nova", hayai_ready, hayai_runtime_ready,
+        ((f"模型缓存：{hayai_cache}" if hayai_marker else hayai_marker_detail) + " " + hayai_detail),
+    )
+
+    try:
+        from .ndlocr_lite_runtime import runtime_status as ndl_runtime_status
+        ndl = ndl_runtime_status()
+        ndl_ready = bool(ndl.ready)
+        ndl_detail = ndl.detail
+    except Exception as exc:
+        ndl_ready = False
+        ndl_detail = f"NDLOCR-Lite 运行时探测失败：{exc}"
+    ndl_cache = local_models.get("ndlocr_lite")
+    ndl_marker = bool(ndl_cache and (ndl_cache / "folirina.ndl.ready.json").is_file())
+    rows["ndlocr_lite"] = ComponentStatus(
+        "ndlocr_lite", "NDLOCR-Lite 1.2.3", ndl_ready, ndl_ready,
+        ((f"状态标记：{ndl_cache / 'folirina.ndl.ready.json'}" if ndl_marker else "独立运行时已就绪；模型随官方运行时管理。") + " " + ndl_detail),
+    )
+    auto_ready = bool(ndl_ready or hayai_ready or mit48_native_runtime or mit48_runner)
+    rows["m6_japanese_auto"] = ComponentStatus(
+        "m6_japanese_auto", "M6 Japanese Auto", auto_ready, auto_ready,
+        "整页优先 NDLOCR-Lite；局部优先 Hayai OCR；48px AR 作为安全 fallback。"
+        + (" 当前至少有一条后端可用。" if auto_ready else " 当前三条后端均未就绪。"),
+    )
     for key,label,path_value,command in (
         ("lama_manga","LaMa Manga",cfg.inpainting.lama_model_path,cfg.inpainting.lama_manga_command or cfg.inpainting.lama_command),
         ("aot_inpainting","AOT Inpainting",cfg.inpainting.aot_model_path,cfg.inpainting.aot_command),
@@ -231,15 +278,19 @@ def probe_components(config: PipelineConfig | None = None, *, deep: bool = False
         ((f"当前模型已预热：{active_profile_label}。" if selected_profile_ready else f"当前模型尚未预热：{active_profile_label}。已缓存档位：{warmed_text}。"))
         + (" " + paddle_detail if paddle_detail else ""),
     )
-    helper_source = Path(__file__).resolve().parents[2] / "tools" / "apple_live_text_helper" / "AppleLiveTextOCRHelper.swift"
+    helper_root = Path(__file__).resolve().parents[2] / "tools" / "apple_live_text_helper"
+    helper_sources = (
+        helper_root / "AppleLiveTextOCRHelper.m",
+        helper_root / "AppleLiveTextOCRHelper.swift",
+    )
     helper_binary = Path(__file__).resolve().parents[2] / "tools" / "apple_live_text_helper" / "bin" / "apple_live_text_helper"
     xcrun_ok = bool(shutil.which("xcrun")) if is_mac else False
     shortcuts_ok = bool(shutil.which("shortcuts")) if is_mac else False
-    live_ready = bool(is_mac and helper_source.exists() and (helper_binary.exists() or xcrun_ok))
+    live_ready = bool(is_mac and any(path.exists() for path in helper_sources) and (helper_binary.exists() or xcrun_ok))
     rows["apple_live_text"] = ComponentStatus(
         "apple_live_text", "Apple Live Text", live_ready, helper_binary.exists(),
-        ("Swift VisionKit Helper 已就绪。" if helper_binary.exists() else
-         "首次 OCR 时可用 xcrun 编译 Swift VisionKit Helper。" if live_ready else
+        ("Apple Vision OCR Helper 已就绪。" if helper_binary.exists() else
+         "首次 OCR 时可用 xcrun 编译 Apple Vision OCR Helper。" if live_ready else
          "需要 macOS + Xcode Command Line Tools；仍可使用 ExtractText 快捷指令回退。"),
         "system",
     )

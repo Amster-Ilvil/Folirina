@@ -11,13 +11,17 @@ being imported into the GUI process.
 """
 
 from dataclasses import dataclass
+import functools
 import atexit
 import json
 import os
+import platform
 from pathlib import Path
 import queue
 import subprocess
+import sys
 import tempfile
+import time
 import threading
 from typing import Any, Callable
 
@@ -26,10 +30,12 @@ import numpy as np
 from .deep_registration_runtime import (
     ensure_runtime as ensure_deep_runtime,
     require_runtime_python,
+    venv_python as deep_venv_python,
     runtime_root as deep_runtime_root,
     _install_env as deep_install_env,
     _pip_install as deep_pip_install,
     _run as deep_run,
+    shared_torch_specs,
 )
 
 ProgressFn = Callable[[str], None]
@@ -62,6 +68,7 @@ def _feature_marker(py: Path, key: str) -> tuple[bool, str]:
         "manga_ocr": "import torch,torchvision,transformers,safetensors,PIL",
         "baberu_ocr": "import onnxruntime,numpy,PIL",
         "ocr48px": "import torch,einops,numpy,PIL",
+        "hayai_ocr": "import torch,numpy,PIL,hayai_ocr",
     }
     statement = imports.get(str(key))
     if not statement:
@@ -80,16 +87,40 @@ def _feature_marker(py: Path, key: str) -> tuple[bool, str]:
     return True, "ready"
 
 
-def runtime_status(key: str) -> VisionRuntimeStatus:
+def _vision_runtime_python() -> Path:
+    """Use the shared Torch venv for vision even when LightGlue extras are absent.
+
+    Vision models only require the shared interpreter/Torch stack; they must not be
+    blocked by unrelated deep-registration extras such as LightGlue/Kornia.
+    """
     try:
-        py = require_runtime_python()
+        return require_runtime_python()
+    except Exception:
+        py = deep_venv_python()
+        if py.exists():
+            return py
+        raise
+
+
+@functools.lru_cache(maxsize=16)
+def runtime_status(key: str) -> VisionRuntimeStatus:
+    """Probe an optional vision runtime once per process/key.
+
+    The probe imports Torch/RF-DETR in a fresh subprocess and can take seconds
+    or, under memory pressure, much longer. Re-running it before every layout
+    request makes multi-page CPU batches stall even though the already-started
+    worker is healthy. Installation/repair paths explicitly clear this cache.
+    """
+    key = str(key)
+    try:
+        py = _vision_runtime_python()
     except Exception as exc:
         return VisionRuntimeStatus(str(key), False, None, "共享独立 Torch 运行环境未就绪：" + str(exc))
     ok, detail = _feature_marker(py, str(key))
     label = {
         "mangalens":"MangaLens", "ysg_obb":"YSG YOLO OBB", "rtdetr_v2":"RT-DETR-v2", "sam2":"SAM 2.1",
         "koharu_layout":"Koharu Layout RF-DETR Seg 2XL", "manga_ocr":"Manga OCR",
-        "baberu_ocr":"Baberu OCR", "ocr48px":"48px AR OCR",
+        "baberu_ocr":"Baberu OCR", "ocr48px":"48px AR OCR", "hayai_ocr":"Hayai OCR 2.3 · v2.5-nova",
     }.get(str(key), str(key))
     if ok:
         return VisionRuntimeStatus(str(key), True, str(py), f"{label} 独立运行环境已就绪：{py}")
@@ -119,7 +150,7 @@ def _install_rtdetr(py: Path, progress: ProgressFn | None) -> None:
 
 def _install_sam2(py: Path, progress: ProgressFn | None) -> None:
     _emit(progress, "在独立 Torch venv 中安装 SAM 2.1 运行依赖；macOS 禁用 CUDA 扩展。")
-    deep_pip_install(py, ["torch>=2.5.1", "torchvision>=0.20.1", "hydra-core>=1.3.2", "iopath>=0.1.10", "tqdm>=4.66.1", "pillow>=9.4"], progress)
+    deep_pip_install(py, [*shared_torch_specs(), "hydra-core>=1.3.2", "iopath>=0.1.10", "tqdm>=4.66.1", "pillow>=9.4"], progress)
     urls = [
         "https://github.com/facebookresearch/sam2/archive/refs/heads/main.zip",
         "https://codeload.github.com/facebookresearch/sam2/zip/refs/heads/main",
@@ -155,8 +186,15 @@ def _install_manga_ocr(py: Path, progress: ProgressFn | None) -> None:
 
 
 def _install_baberu_ocr(py: Path, progress: ProgressFn | None) -> None:
-    _emit(progress, "安装 Baberu OCR ONNX 运行依赖；不安装 PyTorch/Transformers 额外模型代码。")
-    deep_pip_install(py, ["onnxruntime>=1.18", "pillow>=9.4"], progress)
+    _emit(progress, "安装 Baberu OCR ONNX 运行依赖；Apple Silicon 使用当前 CoreML 可用的 ONNX Runtime。")
+    machine = platform.machine().lower()
+    ort_spec = "onnxruntime>=1.30,<1.31" if sys.platform == "darwin" and machine in {"arm64", "aarch64"} else "onnxruntime>=1.18"
+    deep_pip_install(py, [ort_spec, "pillow>=9.4"], progress)
+
+
+def _install_hayai_ocr(py: Path, progress: ProgressFn | None) -> None:
+    _emit(progress, "安装 Hayai OCR 2.3（默认 v2.5-nova）；共享 Torch/MPS 运行环境，不在 GUI 进程加载模型。")
+    deep_pip_install(py, ["hayai-ocr==2.3.0", "pillow>=9.4"], progress)
 
 
 def _install_ocr48px(py: Path, progress: ProgressFn | None) -> None:
@@ -166,12 +204,18 @@ def _install_ocr48px(py: Path, progress: ProgressFn | None) -> None:
 
 def ensure_runtime(key: str, progress: ProgressFn | None = None) -> VisionRuntimeStatus:
     key = str(key)
-    if key not in {"mangalens", "ysg_obb", "rtdetr_v2", "sam2", "koharu_layout", "manga_ocr", "baberu_ocr", "ocr48px"}:
+    # Dependency installation can change importability inside this process.
+    # Never let a stale positive/negative probe survive an explicit repair.
+    runtime_status.cache_clear()
+    if key not in {"mangalens", "ysg_obb", "rtdetr_v2", "sam2", "koharu_layout", "manga_ocr", "baberu_ocr", "ocr48px", "hayai_ocr"}:
         raise ValueError(key)
-    # Reuse the isolated Torch venv.  This means one Torch/MPS stack is shared
-    # by LightGlue, LoFTR and optional vision models instead of duplicating GBs.
-    ensure_deep_runtime(progress)
-    py = require_runtime_python()
+    # Reuse the isolated Torch venv. Vision readiness is intentionally independent
+    # from optional LightGlue/Kornia registration extras.
+    try:
+        py = _vision_runtime_python()
+    except Exception:
+        ensure_deep_runtime(progress)
+        py = _vision_runtime_python()
     status = runtime_status(key)
     if status.ready:
         _emit(progress, status.detail)
@@ -190,11 +234,14 @@ def ensure_runtime(key: str, progress: ProgressFn | None = None) -> VisionRuntim
         _install_manga_ocr(py, progress)
     elif key == "baberu_ocr":
         _install_baberu_ocr(py, progress)
+    elif key == "hayai_ocr":
+        _install_hayai_ocr(py, progress)
     else:
         _install_ocr48px(py, progress)
     ok, detail = _feature_marker(py, key)
     if not ok:
         raise RuntimeError(f"{key} 独立运行环境安装后仍无法导入。\n{detail}")
+    runtime_status.cache_clear()
     status = runtime_status(key)
     _emit(progress, status.detail)
     return status
@@ -211,7 +258,7 @@ class _PersistentWorker:
     def _start(self) -> None:
         if self._proc is not None and self._proc.poll() is None:
             return
-        py = require_runtime_python()
+        py = _vision_runtime_python()
         self._responses = queue.Queue(); self._stderr_tail = []
         self._proc = subprocess.Popen(
             [str(py), str(worker_script())],
@@ -254,18 +301,33 @@ class _PersistentWorker:
                 self.stop(); self._start()
                 assert self._proc is not None and self._proc.stdin is not None
                 self._proc.stdin.write(json.dumps(row, ensure_ascii=False) + "\n"); self._proc.stdin.flush()
+            deadline = time.monotonic() + max(0.1, float(timeout))
             while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    detail = "\n".join(self._stderr_tail[-30:])
+                    self.stop()
+                    raise RuntimeError("视觉模型 Worker 超时。\n" + detail[-5000:])
                 try:
-                    result = self._responses.get(timeout=timeout)
+                    result = self._responses.get(timeout=remaining)
                 except queue.Empty as exc:
                     detail = "\n".join(self._stderr_tail[-30:])
                     self.stop()
                     raise RuntimeError("视觉模型 Worker 超时。\n" + detail[-5000:]) from exc
                 if int(result.get("request_id", -1)) != rid:
+                    # A late response from a recycled request must not reset the
+                    # timeout budget for the current request.
                     continue
                 if not result.get("ok"):
                     raise RuntimeError(str(result.get("error") or "视觉模型 Worker 执行失败"))
                 return result
+
+    def trim_cache(self, *, unload_models: bool = False) -> dict[str, Any]:
+        """Trim only an already-running worker; never start one just to clean it."""
+        with self._lock:
+            if self._proc is None or self._proc.poll() is not None:
+                return {"trimmed": False, "reason": "worker_not_running"}
+        return self.request({"op": "trim_cache", "unload_models": bool(unload_models)}, timeout=60.0)
 
     def stop(self) -> None:
         with self._lock:
@@ -285,16 +347,64 @@ class _PersistentWorker:
 
 
 _WORKER = _PersistentWorker()
+_KOHARU_CPU_REQUESTS = 0
+# CPU RF-DETR can retain a large postprocess/model working set between calls.
+# One Direct page normally performs exactly two Koharu requests (SOURCE + TARGET).
+# Recycle after that pair by default: restarting after *every* request reloads the
+# large RF-DETR model twice per page and was observed to wedge the second page in
+# small cloud CPU containers (Vol.04 0081 -> 0082). Users may override this;
+# GPU/MPS workers remain persistent.
+_KOHARU_CPU_RESTART_EVERY = max(1, int(os.environ.get("MHD_KOHARU_CPU_RESTART_EVERY", "2") or 2))
 atexit.register(_WORKER.stop)
 
 
-def _run_image_request(op: str, image: np.ndarray, payload: dict[str, Any]) -> dict[str, Any]:
+def trim_runtime_cache(*, unload_models: bool = False) -> dict[str, Any]:
+    """Trim the isolated vision worker; model unload is opt-in for pressure."""
+    return _WORKER.trim_cache(unload_models=unload_models)
+
+
+def recycle_runtime_worker() -> dict[str, Any]:
+    """Hard-recycle the isolated vision process at a page boundary.
+
+    A process exit is the only reliable way to return native Torch/RF-DETR CPU
+    allocator state to the OS in very small cloud containers.  This is exposed
+    separately from ``trim_runtime_cache`` so normal GPU/MPS/higher-memory runs
+    can keep a hot worker.
+    """
+    global _KOHARU_CPU_REQUESTS
+    _WORKER.stop()
+    _KOHARU_CPU_REQUESTS = 0
+    return {"recycled": True}
+
+
+def _run_image_request(
+    op: str, image: np.ndarray, payload: dict[str, Any], *,
+    timeout: float = 600.0, retry_timeout_once: bool = False,
+) -> dict[str, Any]:
     root = deep_runtime_root(); root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="mhd-vision-", dir=str(root)) as td:
         p = Path(td) / "image.npy"
         np.save(p, np.asarray(image), allow_pickle=False)
-        return _WORKER.request({"op": op, "image": str(p), **payload})
+        request = {"op": op, "image": str(p), **payload}
+        try:
+            return _WORKER.request(request, timeout=float(timeout))
+        except RuntimeError as exc:
+            # A wedged CPU RF-DETR process must not consume the whole GUI batch.
+            # _PersistentWorker.request() already kills the timed-out worker; the
+            # explicit stop below is idempotent and also covers alternate worker
+            # implementations. Retry only once with the same immutable .npy input.
+            if not retry_timeout_once or "Worker 超时" not in str(exc):
+                raise
+            _WORKER.stop()
+            return _WORKER.request(request, timeout=float(timeout))
 
+def _run_image_batch_request(op: str, images: list[np.ndarray], payload: dict[str, Any]) -> dict[str, Any]:
+    root = deep_runtime_root(); root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="mhd-vision-batch-", dir=str(root)) as td:
+        paths=[]
+        for i,image in enumerate(images):
+            p=Path(td)/f"image-{i:04d}.npy"; np.save(p,np.asarray(image),allow_pickle=False); paths.append(str(p))
+        return _WORKER.request({"op":op,"images":paths,"batch":True,**payload})
 
 def run_mangalens(image: np.ndarray, *, model_path: str, confidence: float, imgsz: int, device: str) -> dict[str, Any]:
     status = runtime_status("mangalens")
@@ -340,17 +450,29 @@ def run_koharu_layout(
     bubble_threshold: float = .50, panel_threshold: float = .50,
     shape: int = 1152, postprocess_max_side: int = 1152,
     postprocess_downscale_trigger_side: int = 2048,
+    optimize_weights_fp16: bool = False,
 ) -> dict[str, Any]:
     status = runtime_status("koharu_layout")
     if not status.ready:
         raise RuntimeError("Koharu Layout 独立运行环境尚未就绪。请在模型中心安装依赖。\n" + status.detail)
-    return _run_image_request("koharu_layout", image, {
+    global _KOHARU_CPU_REQUESTS
+    koharu_timeout = max(30.0, float(os.environ.get("MHD_KOHARU_REQUEST_TIMEOUT", "180") or 180))
+    result = _run_image_request("koharu_layout", image, {
         "model_dir": str(model_dir), "device": str(device), "shape": int(shape),
         "postprocess_max_side": int(postprocess_max_side),
         "postprocess_downscale_trigger_side": int(postprocess_downscale_trigger_side),
         "text_threshold": float(text_threshold), "sfx_threshold": float(sfx_threshold),
         "bubble_threshold": float(bubble_threshold), "panel_threshold": float(panel_threshold),
-    })
+        "optimize_weights_fp16": bool(optimize_weights_fp16),
+    }, timeout=koharu_timeout, retry_timeout_once=True)
+    if str(result.get("device", "")).strip().lower() == "cpu":
+        _KOHARU_CPU_REQUESTS += 1
+        if _KOHARU_CPU_REQUESTS >= int(_KOHARU_CPU_RESTART_EVERY):
+            _WORKER.stop()
+            _KOHARU_CPU_REQUESTS = 0
+    else:
+        _KOHARU_CPU_REQUESTS = 0
+    return result
 
 
 def run_manga_ocr(image: np.ndarray, *, model_dir: str, device: str, max_new_tokens: int = 128) -> dict[str, Any]:
@@ -362,12 +484,33 @@ def run_manga_ocr(image: np.ndarray, *, model_dir: str, device: str, max_new_tok
     })
 
 
-def run_baberu_ocr(image: np.ndarray, *, model_dir: str, max_new_tokens: int = 128) -> dict[str, Any]:
+def run_manga_ocr_batch(images: list[np.ndarray], *, model_dir: str, device: str, max_new_tokens: int = 128) -> dict[str, Any]:
+    status = runtime_status("manga_ocr")
+    if not status.ready:
+        raise RuntimeError("Manga OCR 独立运行环境尚未就绪。请在模型中心安装依赖。\n" + status.detail)
+    return _run_image_batch_request("manga_ocr", images, {
+        "model_dir": str(model_dir), "device": str(device), "max_new_tokens": int(max_new_tokens),
+    })
+
+
+def run_baberu_ocr_batch(images: list[np.ndarray], *, model_dir: str, max_new_tokens: int = 128, backend: str = "auto", coreml_cache_dir: str | None = None, coreml_profile: bool = False) -> dict[str, Any]:
+    status = runtime_status("baberu_ocr")
+    if not status.ready:
+        raise RuntimeError("Baberu OCR ONNX 运行环境尚未就绪。请在模型中心安装依赖。\n" + status.detail)
+    return _run_image_batch_request("baberu_ocr", images, {
+        "model_dir": str(model_dir), "max_new_tokens": int(max_new_tokens),
+        "backend": str(backend), "coreml_cache_dir": coreml_cache_dir, "coreml_profile": bool(coreml_profile),
+    })
+
+
+def run_baberu_ocr(image: np.ndarray, *, model_dir: str, max_new_tokens: int = 128, backend: str = "auto", coreml_cache_dir: str | None = None, coreml_profile: bool = False) -> dict[str, Any]:
     status = runtime_status("baberu_ocr")
     if not status.ready:
         raise RuntimeError("Baberu OCR ONNX 运行环境尚未就绪。请在模型中心安装依赖。\n" + status.detail)
     return _run_image_request("baberu_ocr", image, {
         "model_dir": str(model_dir), "max_new_tokens": int(max_new_tokens),
+        "backend": str(backend), "coreml_cache_dir": coreml_cache_dir,
+        "coreml_profile": bool(coreml_profile),
     })
 
 
@@ -382,3 +525,65 @@ def run_ocr48px(
         "model_dir": str(model_dir), "device": str(device),
         "beams_k": int(beams_k), "max_seq_length": int(max_seq_length),
     })
+
+def run_ocr48px_batch(
+    images: list[np.ndarray], *, model_dir: str, device: str = "auto",
+    beams_k: int = 5, max_seq_length: int = 255,
+) -> dict[str, Any]:
+    status = runtime_status("ocr48px")
+    if not status.ready:
+        raise RuntimeError("48px AR OCR 独立运行环境尚未就绪。请在模型中心安装依赖。\n" + status.detail)
+    return _run_image_batch_request("ocr48px", images, {
+        "model_dir": str(model_dir), "device": str(device),
+        "beams_k": int(beams_k), "max_seq_length": int(max_seq_length),
+    })
+
+
+
+
+def _hayai_request_payload(*, model_cache_dir: str | None, quantize: str, use_v2: bool, backend: str, max_num_patches: int, allow_download: bool) -> dict[str, Any]:
+    from .hayai_support import normalize_hayai_patch_budget
+    resolved_backend = str(backend or "auto")
+    patches = normalize_hayai_patch_budget(max_num_patches, backend=resolved_backend)
+    if not allow_download:
+        if not model_cache_dir:
+            raise RuntimeError("Hayai OCR 尚未在模型中心预热：缺少 Folirina 模型缓存目录。")
+        from .hayai_support import hayai_ready_marker_matches
+        ready, detail = hayai_ready_marker_matches(
+            model_cache_dir, quantize=quantize, use_v2=use_v2, backend=resolved_backend, max_num_patches=patches,
+        )
+        if not ready:
+            raise RuntimeError("Hayai OCR 模型缓存未就绪或设置已变化；请在模型中心重新安装/预热。\n" + detail)
+    return {
+        "model_cache_dir": model_cache_dir, "quantize": str(quantize),
+        "use_v2": bool(use_v2), "backend": resolved_backend,
+        "max_num_patches": int(patches), "allow_download": bool(allow_download),
+    }
+
+
+def run_hayai_ocr(
+    image: np.ndarray, *, model_cache_dir: str | None = None,
+    quantize: str = "none", use_v2: bool = False, backend: str = "auto",
+    max_num_patches: int = 384, allow_download: bool = False,
+) -> dict[str, Any]:
+    status = runtime_status("hayai_ocr")
+    if not status.ready:
+        raise RuntimeError("Hayai OCR 独立运行环境尚未就绪。请在模型中心安装依赖。\n" + status.detail)
+    return _run_image_request("hayai_ocr", image, _hayai_request_payload(
+        model_cache_dir=model_cache_dir, quantize=quantize, use_v2=use_v2, backend=backend,
+        max_num_patches=max_num_patches, allow_download=allow_download,
+    ))
+
+
+def run_hayai_ocr_batch(
+    images: list[np.ndarray], *, model_cache_dir: str | None = None,
+    quantize: str = "none", use_v2: bool = False, backend: str = "auto",
+    max_num_patches: int = 384, allow_download: bool = False,
+) -> dict[str, Any]:
+    status = runtime_status("hayai_ocr")
+    if not status.ready:
+        raise RuntimeError("Hayai OCR 独立运行环境尚未就绪。请在模型中心安装依赖。\n" + status.detail)
+    return _run_image_batch_request("hayai_ocr", images, _hayai_request_payload(
+        model_cache_dir=model_cache_dir, quantize=quantize, use_v2=use_v2, backend=backend,
+        max_num_patches=max_num_patches, allow_download=allow_download,
+    ))

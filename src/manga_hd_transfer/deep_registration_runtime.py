@@ -29,12 +29,53 @@ from typing import Callable, Iterable, Any
 
 import numpy as np
 
-from .model_downloads import model_home
+from .storage_paths import model_home
 from .tls_support import apply_runtime_tls_environment, ssl_failure_hint
 
 ProgressFn = Callable[[str], None]
 DEEP_MIN_MINOR = 10
 DEEP_MAX_MINOR = 13
+
+# Single source of truth for the shared isolated Torch runtime. Optional vision
+# features (SAM2/Koharu/OCR/etc.) must not silently upgrade this environment to
+# a different Torch build after LightGlue/LoFTR created it.
+APPLE_TORCH_SPECS = ("torch==2.14.0", "torchvision==0.29.0")
+APPLE_ONNXRUNTIME_SPEC = "onnxruntime>=1.26,<1.31"
+
+
+def shared_torch_specs() -> list[str]:
+    if platform.system() == "Darwin" and platform.machine().lower() in {"arm64", "aarch64"}:
+        return list(APPLE_TORCH_SPECS)
+    return ["torch", "torchvision"]
+
+
+def shared_runtime_base_specs() -> list[str]:
+    """Dependencies owned by the shared isolated vision/deep runtime.
+
+    Apple Silicon keeps ONNX Runtime in the same isolated environment so
+    CoreML-capable OCR backends (for example Baberu) do not depend on whatever
+    happens to be installed in the GUI interpreter.
+    """
+    specs = ["numpy<3", "opencv-python-headless>=4.8", *shared_torch_specs(), "kornia>=0.8"]
+    if platform.system() == "Darwin" and platform.machine().lower() in {"arm64", "aarch64"}:
+        specs.append(APPLE_ONNXRUNTIME_SPEC)
+    return specs
+
+
+def _runtime_contract_issue(payload: dict[str, Any]) -> str:
+    """Return a human-readable version drift reason for the shared runtime."""
+    if platform.system() != "Darwin" or platform.machine().lower() not in {"arm64", "aarch64"}:
+        return ""
+    actual_torch = str(payload.get("torch") or "").split("+", 1)[0]
+    actual_tv = str(payload.get("torchvision") or "").split("+", 1)[0]
+    expected_torch = "2.14.0"
+    expected_tv = "0.29.0"
+    mismatches: list[str] = []
+    if actual_torch != expected_torch:
+        mismatches.append(f"Torch {actual_torch or 'unknown'} != {expected_torch}")
+    if actual_tv != expected_tv:
+        mismatches.append(f"torchvision {actual_tv or 'unknown'} != {expected_tv}")
+    return "; ".join(mismatches)
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,6 +311,16 @@ def runtime_status() -> DeepRegistrationRuntimeStatus:
     ok, detail, payload = _runtime_marker(py)
     if not ok:
         return DeepRegistrationRuntimeStatus(False, str(py), "独立深度配准环境缺包/损坏：" + detail, architecture=info.get("machine", ""))
+    contract_issue = _runtime_contract_issue(payload)
+    if contract_issue:
+        return DeepRegistrationRuntimeStatus(
+            False,
+            str(py),
+            "独立深度配准环境版本漂移，需要修复：" + contract_issue,
+            version=f"Torch {payload.get('torch','')} / Kornia {payload.get('kornia','')} / LightGlue",
+            architecture=info.get("machine", ""),
+            mps_available=bool(payload.get("mps")),
+        )
     version = f"Torch {payload.get('torch','')} / Kornia {payload.get('kornia','')} / LightGlue"
     return DeepRegistrationRuntimeStatus(
         True, str(py), f"独立配准环境已就绪：{version} · {info.get('machine','')}" + (" · MPS" if payload.get("mps") else " · CPU"),
@@ -302,7 +353,8 @@ def ensure_runtime(progress: ProgressFn | None = None) -> DeepRegistrationRuntim
         if code != 0:
             raise RuntimeError("初始化深度配准 venv 的内置 pip 失败。\n" + tail[-3000:])
 
-    ok, detail, _payload = _runtime_marker(py)
+    ok, detail, payload = _runtime_marker(py)
+    contract_issue = _runtime_contract_issue(payload) if ok else ""
     if not ok:
         # Also repair a half-created venv left by an earlier TLS failure.
         code, tail = _run([str(py), "-m", "ensurepip", "--upgrade"], progress, timeout=300)
@@ -316,7 +368,8 @@ def ensure_runtime(progress: ProgressFn | None = None) -> DeepRegistrationRuntim
                 raise RuntimeError("初始化深度配准 venv 的 pip 失败。\n" + ssl_failure_hint(py) + "\n\n" + str(exc)[-5000:]) from exc
             raise
         _emit(progress, "安装 LightGlue / LoFTR 独立运行依赖…")
-        _pip_install(py, ["numpy<3", "opencv-python-headless>=4.8", "torch", "torchvision", "kornia>=0.8"], progress)
+        # Keep every optional model on the exact same shared Torch contract.
+        _pip_install(py, shared_runtime_base_specs(), progress)
         # LightGlue is installed from its official source package.  --no-deps
         # prevents pip from replacing the already isolated OpenCV/Torch stack.
         urls = [
@@ -331,10 +384,19 @@ def ensure_runtime(progress: ProgressFn | None = None) -> DeepRegistrationRuntim
             failures.append(tail[-2500:])
         else:
             raise RuntimeError("LightGlue 官方源码包安装失败。\n" + "\n".join(failures[-2:]))
+    elif contract_issue:
+        # A previously-created runtime may still import successfully while
+        # carrying an older Torch build. Repair only the shared base contract;
+        # keep already-installed optional models and LightGlue intact.
+        _emit(progress, "检测到 Apple Silicon 共享运行时版本漂移，原位修复：" + contract_issue)
+        _pip_install(py, shared_runtime_base_specs(), progress)
 
-    ok, detail, _ = _runtime_marker(py)
+    ok, detail, payload = _runtime_marker(py)
     if not ok:
         raise RuntimeError("独立 LightGlue / LoFTR 环境安装后仍无法导入。\n" + detail[-5000:])
+    contract_issue = _runtime_contract_issue(payload)
+    if contract_issue:
+        raise RuntimeError("独立 LightGlue / LoFTR 环境修复后仍不符合 Apple Silicon 运行时合同：" + contract_issue)
     runtime_status.cache_clear()
     status = runtime_status()
     if not status.ready:
@@ -423,6 +485,13 @@ class _PersistentWorker:
                     raise RuntimeError(str(result.get("error") or "深度配准 Worker 执行失败"))
                 return result
 
+    def trim_cache(self, *, unload_models: bool = False) -> dict[str, Any]:
+        """Trim only an already-running worker; never create a process for cleanup."""
+        with self._lock:
+            if self._proc is None or self._proc.poll() is not None:
+                return {"trimmed": False, "reason": "worker_not_running"}
+        return self.request({"op": "trim_cache", "unload_models": bool(unload_models)}, timeout=60.0)
+
     def stop(self) -> None:
         with self._lock:
             proc, self._proc = self._proc, None
@@ -442,6 +511,11 @@ class _PersistentWorker:
 
 _WORKER = _PersistentWorker()
 atexit.register(_WORKER.stop)
+
+
+def trim_runtime_cache(*, unload_models: bool = False) -> dict[str, Any]:
+    """Trim the deep worker; unload resident matchers only under pressure."""
+    return _WORKER.trim_cache(unload_models=unload_models)
 
 
 def run_deep_registration(

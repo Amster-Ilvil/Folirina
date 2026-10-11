@@ -65,6 +65,69 @@ def _annotate_side_with_layout(bubbles, evidence, shape: tuple[int, int]) -> dic
             "sfx_overlap": round(sfx_overlap, 4),
             "panel_overlap": round(panel_overlap, 4),
         }
+        # Preserve compact serializable Koharu text geometry for renderers.  The
+        # post-processed polygon is ideal for semantic admission, but some stylised
+        # vertical lettering (large/bold punctuation in burst bubbles) is clipped by
+        # mask post-processing.  `raw_box` remains model semantic evidence and is
+        # useful as a *clear-only* hint; it must never enlarge SOURCE write authority.
+        text_hints = []
+        for item in text_items:
+            im = (item.mask > 0)
+            ia = int(np.count_nonzero(im))
+            area = int(np.count_nonzero(mask))
+            if ia <= 0 or area <= 0 or im.shape != mask.shape:
+                continue
+            inter = int(np.count_nonzero((mask > 0) & im))
+            overlap = float(inter / max(1, min(area, ia)))
+            if overlap < 0.20:
+                continue
+            raw_box = list((getattr(item, "meta", {}) or {}).get("raw_box") or [])
+            if len(raw_box) != 4:
+                raw_box = [float(v) for v in getattr(item, "box", ())]
+            if len(raw_box) != 4:
+                continue
+            text_hints.append({
+                "confidence": round(float(getattr(item, "confidence", 0.0)), 6),
+                "overlap": round(overlap, 4),
+                "box": [int(v) for v in getattr(item, "box", ())],
+                "raw_box": [float(v) for v in raw_box],
+            })
+        if text_hints:
+            text_hints.sort(key=lambda row: (float(row["overlap"]), float(row["confidence"])), reverse=True)
+            meta["koharu_layout_text_hints"] = text_hints[:8]
+
+        # Preserve the overlapping Koharu bubble geometry as *TARGET clear-only*
+        # semantic evidence.  Some paired-diff complex/free-text polygons are a
+        # narrow changed-text lane and clip the outer strokes of large Japanese
+        # glyphs.  Renderers may use this polygon to widen TARGET cleanup, but it
+        # must never widen SOURCE write authority.
+        bubble_hints = []
+        area = int(np.count_nonzero(mask))
+        for item in bubble_items:
+            im = (item.mask > 0)
+            ia = int(np.count_nonzero(im))
+            if ia <= 0 or area <= 0 or im.shape != mask.shape:
+                continue
+            inter = int(np.count_nonzero((mask > 0) & im))
+            overlap = float(inter / max(1, min(area, ia)))
+            if overlap < 0.20:
+                continue
+            polygon = [[float(x), float(y)] for x, y in (getattr(item, "polygon", None) or [])]
+            if len(polygon) < 3:
+                continue
+            row = {
+                "confidence": round(float(getattr(item, "confidence", 0.0)), 6),
+                "overlap": round(overlap, 4),
+                "box": [int(v) for v in getattr(item, "box", ())],
+                "polygon": polygon,
+            }
+            raw_box = list((getattr(item, "meta", {}) or {}).get("raw_box") or [])
+            if len(raw_box) == 4:
+                row["raw_box"] = [float(v) for v in raw_box]
+            bubble_hints.append(row)
+        if bubble_hints:
+            bubble_hints.sort(key=lambda row: (float(row["overlap"]), float(row["confidence"])), reverse=True)
+            meta["koharu_layout_bubble_hints"] = bubble_hints[:4]
         bubble.meta = meta
         supported += int(is_supported)
     count = len(bubbles or [])

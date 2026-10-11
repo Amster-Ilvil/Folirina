@@ -46,5 +46,14 @@ class StudioState:
     book_pairing_ready: bool = False
     restored_processed_only: bool = False
 
+    def remember_completed_project(self, project, *, limit: int = 2) -> None:
+        """Bound GUI-only array retention; persisted page workspaces stay intact."""
+        key = str(project.page_id)
+        self.last_project = project
+        self.projects_by_page.pop(key, None)
+        self.projects_by_page[key] = project
+        while len(self.projects_by_page) > max(1, int(limit)):
+            self.projects_by_page.pop(next(iter(self.projects_by_page)))
+
 
 __all__ = ["StudioState", "studio_default_config"]

@@ -33,6 +33,7 @@ from .detector_policy import (
     STRATEGY_ALWAYS,
 )
 from .layout_evidence import collect_koharu_layout_evidence_cached, filter_candidates_by_layout_authority
+from .m6_runtime_plan import m6_cache_token
 from .models import BubbleInstance
 
 
@@ -87,6 +88,7 @@ def _detect_policy_provider(
     cache: PageStageCache | None,
     cache_enabled: bool,
     stats: dict[str, str] | None,
+    strict_primary_errors: bool = False,
 ) -> list[BubbleInstance] | None:
     backend = str(backend or "").lower().strip()
     if backend == "koharu_layout":
@@ -110,7 +112,10 @@ def _detect_policy_provider(
         return _retag_role(rows, role, blocks)
     if backend == "rtdetr_v2":
         from .source_detectors import detect_source_rtdetr_v2
-        rows = detect_source_rtdetr_v2(image, MaskReplaceConfig(), bubble_config, existing=[])
+        rows = detect_source_rtdetr_v2(
+            image, MaskReplaceConfig(), bubble_config, existing=[],
+            strict_errors=bool(strict_primary_errors),
+        )
         return _retag_role(rows, role, blocks)
     if backend == "sam2":
         from .source_detectors import detect_source_sam2
@@ -177,11 +182,29 @@ def primary_bubbles_cached(
     primary = primary_detector(bubble_config)
     cache_role = f"primary_{role}"
     cache_enabled = bool(cache_enabled and cache is not None and getattr(cache, "enabled", True))
+
+    # Koharu Layout already owns a compact polygon cache. Do not duplicate its
+    # reconstructed full-resolution masks into bubbles_primary_source.npz for
+    # multi-megapixel photographed SOURCE pages: six 5824x4096 uint8 masks are
+    # ~136 MiB before compression and can stall whole-book processing. Rebuild
+    # these bubbles from the canonical LayoutEvidence cache instead.
+    large_koharu_side = int(getattr(bubble_config, "koharu_layout_postprocess_downscale_trigger_side", 2048) or 2048)
+    if primary == "koharu_layout" and max(int(image.shape[0]), int(image.shape[1])) > large_koharu_side:
+        preferred = _preferred_koharu_bubbles(
+            role, image, [], image_path, bubble_config=bubble_config, cache=cache,
+            cache_enabled=cache_enabled and bool(getattr(bubble_config, "koharu_layout_cache_enabled", True)),
+            stats=stats,
+        )
+        rows = _retag_role(list(preferred or []), role, [])
+        stats[f"primary_detector_{role}"] = f"layout_compact:{primary}:{len(rows)}"
+        stats[f"primary_detector_{role}_cache"] = "layout_evidence_polygon"
+        return rows
+
     sig = None
     if cache_enabled and cache is not None:
         sig = image_stage_signature(
             image_path, bubble_config,
-            {"role": role, "detector_policy_primary": primary, "primary_only_stage": True},
+            {"role": role, "detector_policy_primary": primary, "primary_only_stage": True, "m6_policy": m6_cache_token(bubble_config)},
         )
         hit = cache.load_bubbles(cache_role, sig)
         if hit is not None:
@@ -212,7 +235,7 @@ def primary_bubbles_cached(
         role, primary, image, [], image_path, bubble_config,
         cache=cache,
         cache_enabled=cache_enabled and bool(getattr(bubble_config, "koharu_layout_cache_enabled", True)),
-        stats=stats,
+        stats=stats, strict_primary_errors=True,
     )
     rows = _retag_role(list(rows or []), role, [])
     if cache_enabled and cache is not None and sig is not None:
@@ -243,7 +266,7 @@ def bubbles_cached(
         sig = image_stage_signature(
             image_path,
             bubble_config,
-            {"role": role, "blocks": blocks_signature(blocks), "detector_policy": policy_payload},
+            {"role": role, "blocks": blocks_signature(blocks), "detector_policy": policy_payload, "m6_policy": m6_cache_token(bubble_config)},
         )
         hit = cache.load_bubbles(role, sig)
         if hit is not None:

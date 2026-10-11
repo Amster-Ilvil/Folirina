@@ -24,24 +24,58 @@ from .ocr import NullOCRBackend
 logger = logging.getLogger(__name__)
 
 
+class _LazyBudgetTargetOCR:
+    """Create the optional TARGET OCR backend only when a weak candidate needs it."""
+
+    def __init__(self, config: PipelineConfig, cache_stats: dict) -> None:
+        self.config = config
+        self.cache_stats = cache_stats
+        self.backend = None
+        self.calls = 0
+        self.max_calls = max(0, int(getattr(
+            config.transparent_bubble_reveal,
+            "target_text_presence_ocr_max_regions",
+            6,
+        )))
+        self.cache_stats["transparent_ocr_target"] = "deferred"
+        self.cache_stats["transparent_ocr_target_queries"] = 0
+
+    def _ensure(self):
+        if self.backend is not None:
+            return self.backend
+        backend_name = str(self.config.ocr.target_backend or self.config.ocr.backend or "none")
+        failures: list[str] = []
+        backend = build_ocr_backend_soft(
+            self.config.ocr,
+            str(self.config.ocr.target_lang or "japan"),
+            backend_name,
+            role="target",
+            soft_failures=failures,
+        )
+        if isinstance(backend, NullOCRBackend):
+            self.cache_stats["transparent_ocr_target"] = "unavailable"
+            if failures:
+                self.cache_stats["transparent_ocr_target_error"] = failures[-1]
+            raise RuntimeError("transparent target OCR unavailable")
+        self.backend = backend
+        self.cache_stats["transparent_ocr_target"] = f"ready:{type(backend).__name__}"
+        return backend
+
+    def recognize_region(self, *args, **kwargs):
+        if self.max_calls <= 0 or self.calls >= self.max_calls:
+            self.cache_stats["transparent_ocr_target_budget_exhausted"] = True
+            raise RuntimeError("transparent target OCR candidate budget exhausted")
+        self.calls += 1
+        self.cache_stats["transparent_ocr_target_queries"] = int(self.calls)
+        return self._ensure().recognize_region(*args, **kwargs)
+
+
 def _build_transparent_target_ocr(config: PipelineConfig, cache_stats: dict) -> object | None:
     tcfg = config.transparent_bubble_reveal
     if not bool(getattr(tcfg, "target_text_presence_ocr_enabled", False)):
         cache_stats["transparent_ocr_target"] = "disabled"
         return None
-    backend_name = str(config.ocr.target_backend or config.ocr.backend or "none")
-    failures: list[str] = []
-    backend = build_ocr_backend_soft(
-        config.ocr, str(config.ocr.target_lang or "japan"), backend_name,
-        role="target", soft_failures=failures,
-    )
-    if isinstance(backend, NullOCRBackend):
-        cache_stats["transparent_ocr_target"] = "unavailable"
-        if failures:
-            cache_stats["transparent_ocr_target_error"] = failures[-1]
-        return None
-    cache_stats["transparent_ocr_target"] = f"ready:{backend_name}"
-    return backend
+    return _LazyBudgetTargetOCR(config, cache_stats)
 
 
 @dataclass(slots=True)
@@ -150,7 +184,7 @@ def run_page_route_stage(
         mode=mode, direct_requested=direct_requested, config=config,
         authority_source=authority_source, authority_source_path=str(authority_source_path),
         source=source, source_path_local=str(source_path_local), target=target,
-        registration=registration, pair_check=pair_check,
+        target_path_local=str(pair.target_path), registration=registration, pair_check=pair_check,
         replace_source_specs=replace_source_specs,
         secondary_source_available=bool(secondary_source_available),
         stage_cache=stage_cache, cache_enabled=bool(config.cache.bubbles) and bool(getattr(config.bubbles, "koharu_layout_cache_enabled", True)), cache_stats=cache_stats,
@@ -229,40 +263,32 @@ def run_page_route_stage(
             dual_source_arbitration, selected_arbitration_evidence, decision, early,
         )
 
-    # Direct Patch is strict: rejection preserves TARGET unchanged and never
-    # silently falls through to Mask Replace.
+    # Direct Patch remains strict when its whole-container planner rejects the page:
+    # never fall through to Mask Replace / OCR-guided / photo-SFX transfer.  However,
+    # a rejected Direct plan must not short-circuit Koharu semantic completion.  The
+    # latter is a bounded, registered-source-ink-only recovery path backed by the
+    # primary SOURCE/TARGET layout evidence, and is exactly what recovers translated
+    # open text / coloured semantic regions such as p-115 and p-116.
+    #
+    # Keep routing alive and let the Direct-private pixel stage enter its
+    # ``direct_semantic_only`` branch.  If semantic completion finds nothing safe,
+    # the result is still byte-identical TARGET with an explicit review warning.
     if mode == "direct_patch" and not direct_container_fast:
-        reject_mark = PageMark(
-            page_type="content", origin=mark.origin, confidence=float(pair_check.confidence),
-            reason=f"direct_patch_rejected:{decision.reason}",
-            bubble_regions=0, free_text_regions=0,
-            registration_confidence=float(registration.confidence),
-            source_name=Path(pair.source_path).name, target_name=Path(pair.target_path).name,
-        )
-        early = emit_passthrough_page(
-            config, pair, page_root, final_path, reject_mark, source=source, target=target,
-            registration=registration, passthrough_reason="direct_patch_rejected",
-            extra_meta={
-                "transfer_mode": mode,
-                "transfer_planner": decision.to_dict(),
-                "page_pairing_check": pair_check.to_dict(),
-                "direct_patch": {
-                    "used": False,
-                    "diagnostics": dict(direct_container_plan.diagnostics) if direct_container_plan is not None else {},
-                    "manual_effect_candidates": list(((direct_container_plan.diagnostics if direct_container_plan is not None else {}) or {}).get("manual_effect_candidates", []) or []),
-                    "review_required": True,
-                },
-            },
-            qa=[QAItem(
-                "direct_patch_rejected", "warning",
-                "Direct Patch could not prove a safe same-layout whole-container transfer; target page was kept unchanged. Use Mask Transfer/Auto for non-identical layouts.",
-                meta={"reason": decision.reason, "pairing": pair_check.to_dict()},
-            )],
-        )
-        return PageRouteState(
-            source, registration, pair_check, str(source_path_local), direct_container_plan,
-            direct_container_fast, selected_source_kind, selected_secondary_source,
-            dual_source_arbitration, selected_arbitration_evidence, decision, early,
+        rejected_reason = str(decision.reason)
+        cache_stats["direct_patch_rejected_continue_semantic"] = "1"
+        cache_stats["direct_patch_rejected_reason"] = rejected_reason
+        # The renderer ownership remains Direct: only its bounded semantic-only
+        # subroute may execute.  Marking this as ``direct_reject`` would make
+        # workspace validation treat legitimate Direct artifacts as stale
+        # passthrough files.
+        decision = TransferDecision(
+            requested_mode="direct_patch", strategy="direct_patch", fallback_allowed=False,
+            reason=f"semantic_completion_only_after:{rejected_reason}",
+            same_page_confidence=float(pair_check.confidence), direct_plan_safe=False,
+            evidence={**dict(getattr(decision, "evidence", {}) or {}),
+                      "semantic_completion_only": True,
+                      "whole_container_rejected_reason": rejected_reason},
+            force_actions=list(getattr(decision, "force_actions", []) or []),
         )
 
     return PageRouteState(

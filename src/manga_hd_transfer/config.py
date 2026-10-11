@@ -18,9 +18,18 @@ class TransferModeConfig(BaseModel):
 class RuntimeConfig(BaseModel):
     device: str = "auto"  # auto|mps|cuda|cpu
     cpu_thread_ratio: float = 0.50
+    cpu_thread_auto: bool = True
     min_cpu_threads: int = 1
     max_cpu_threads: int = 8
     mps_fallback: bool = True
+    # Hardware-aware budget remains enabled by default. ``m6_auto`` is retained as
+    # a backward-compatible config key; the runtime now applies it to all
+    # detected accelerator-capable hardware rather than only M6.
+    hardware_profile: str = "auto"  # auto|legacy|apple_silicon|cuda_*|m6_*
+    m6_auto: bool = True
+    m6_dynamic_resolution_auto: bool = True
+    mps_precision: str = "auto"  # auto|fp32|fp16|bf16
+    mps_memory_auto: bool = True
     mps_memory_fraction: float = 0.82
     release_cache_every: int = 8
     # Long-running books should not retain full-page NumPy masks for every finished page.
@@ -60,6 +69,9 @@ class BatchConfig(BaseModel):
     decode_prefetch_enabled: bool = False
     decode_prefetch_pages: int = 1
     decode_prefetch_experimental_opt_in: bool = False
+    # On M6, a bounded one-page decode look-ahead is enabled automatically.
+    # It never overlaps MPS/model execution and can be disabled explicitly.
+    decode_prefetch_auto: bool = True
     # Per-page project transactions are already the authoritative resume boundary.
     # Coalesce book-level control files so a 300-1000 page run does not fsync two
     # redundant JSON files after every page. Terminal/cancel/failure states still
@@ -238,7 +250,140 @@ class PixelTransferConfigBase(BaseModel):
     koharu_semantic_text_min_confidence: float = 0.75
     koharu_semantic_max_existing_overlap: float = 0.28
     koharu_semantic_standalone_min_change_ratio: float = 0.18
+    # A container text cluster may legitimately touch the detector boundary.
+    # Suppress that geometry-only review warning only when an independent post-
+    # transfer audit proves near-total SOURCE retention and near-zero TARGET
+    # residual. Standalone/open text never receives this exception.
+    koharu_semantic_boundary_safe_min_source_coverage: float = 0.98
+    koharu_semantic_boundary_safe_max_target_residual: float = 0.01
+    # Two-sided SOURCE/TARGET Koharu proof for same-position open text. This is
+    # intentionally stricter than simply lowering the standalone threshold: a
+    # high-confidence SOURCE text seed must project onto the TARGET seed, and a
+    # 1 px tolerant ink comparison must still show a real glyph-shape change.
+    koharu_semantic_paired_text_min_overlap: float = 0.45
+    koharu_semantic_paired_text_tolerance_px: int = 1
+    koharu_semantic_paired_text_min_change_ratio: float = 0.30
+    # Direct open-text recovery must not discard the true paired SOURCE merely
+    # because Koharu's SOURCE confidence is lower on a monochrome/scan rendition.
+    # A sub-0.70 SOURCE text seed is admitted only with strong independent
+    # TARGET confidence, page registration, projected polygon overlap, raw-box
+    # overlap/scale agreement and a real 1px-tolerant glyph-shape change.
+    koharu_semantic_paired_text_lowconf_source_min_confidence: float = 0.45
+    koharu_semantic_paired_text_lowconf_target_min_confidence: float = 0.85
+    koharu_semantic_paired_text_lowconf_min_registration: float = 0.80
+    koharu_semantic_paired_text_lowconf_min_overlap: float = 0.55
+    koharu_semantic_paired_text_lowconf_min_raw_overlap: float = 0.85
+    koharu_semantic_paired_text_lowconf_min_raw_area_similarity: float = 0.55
+    koharu_semantic_paired_text_lowconf_min_change_ratio: float = 0.15
+    # High-confidence paired text can still be severely under-segmented by Koharu.
+    # A tiny raw-box rescue may use bounded Telea only when bilateral geometry is strong.
+    koharu_semantic_paired_text_raw_telea_min_raw_overlap: float = 0.80
+    koharu_semantic_paired_text_raw_telea_min_area_similarity: float = 0.60
+    koharu_semantic_paired_text_raw_telea_max_page_area_ratio: float = 0.006
+    # Larger paired-text raw boxes may be rescued only on an independently
+    # proven bright/neutral paper field. This is stricter than broad Telea:
+    # both sides must be high-confidence and geometrically paired, and writes
+    # remain clipped to the paired raw-box union (Vol.04 p0048 class).
+    koharu_semantic_paired_text_raw_plain_paper_enabled: bool = True
+    koharu_semantic_paired_text_raw_plain_min_target_confidence: float = 0.85
+    koharu_semantic_paired_text_raw_plain_min_source_confidence: float = 0.85
+    koharu_semantic_paired_text_raw_plain_min_raw_overlap: float = 0.80
+    koharu_semantic_paired_text_raw_plain_min_area_similarity: float = 0.60
+    koharu_semantic_paired_text_raw_plain_max_page_area_ratio: float = 0.03
+    # If TARGET open text is strong and registered SOURCE text exists at the same
+    # location, an uncovered region is publication-blocking rather than a mere
+    # review warning. TARGET-only scene text remains warning/suppression governed.
+    koharu_semantic_uncovered_text_error_confidence: float = 0.85
+    # Cross-rendition paired open text can be printed on a compact SOURCE-only
+    # white/neutral backing label while TARGET prints Japanese directly on art.
+    # Only the already-proven bilateral low-confidence text pair may enter this
+    # route. The label detector must prove a dense bright SOURCE rectangle, a
+    # substantially darker TARGET counterpart, and clustered TARGET glyph
+    # components before copying any SOURCE backing raster.
+    koharu_semantic_source_label_raster_enabled: bool = True
+    koharu_semantic_source_label_min_raw_overlap: float = 0.90
+    koharu_semantic_source_label_min_area_similarity: float = 0.60
+    koharu_semantic_source_label_bright_value: int = 220
+    koharu_semantic_source_label_max_saturation: int = 48
+    koharu_semantic_source_label_dense_window_px: int = 13
+    koharu_semantic_source_label_dense_fraction: float = 0.58
+    koharu_semantic_source_label_component_min_area: int = 450
+    koharu_semantic_source_label_component_min_width: int = 24
+    koharu_semantic_source_label_component_min_height: int = 28
+    koharu_semantic_source_label_bbox_pad_px: int = 3
+    koharu_semantic_source_label_min_bright_ratio: float = 0.34
+    koharu_semantic_source_label_min_bright_gap: float = 0.16
+    koharu_semantic_source_label_min_dark_ratio: float = 0.06
+    koharu_semantic_source_label_max_area_fraction: float = 0.65
+    koharu_semantic_source_label_target_outline_value: int = 180
+    koharu_semantic_source_label_target_component_min_area: int = 90
+    koharu_semantic_source_label_target_cluster_span_ratio: float = 0.24
+    koharu_semantic_source_label_target_cluster_center_ratio: float = 0.15
+    koharu_semantic_source_label_target_clear_dilate_px: int = 3
+    koharu_semantic_source_label_target_inpaint_radius: float = 3.0
+    # Strict raw-box group rescue for detector under-segmentation (p-140 class).
+    # This never admits target-only SFX: both renditions need overlapping,
+    # under-segmented text raw boxes plus a large registered glyph-shape change.
+    koharu_semantic_paired_raw_group_min_source_confidence: float = 0.60
+    koharu_semantic_paired_raw_group_min_target_confidence: float = 0.35
+    koharu_semantic_paired_raw_group_min_registration: float = 0.70
+    koharu_semantic_paired_raw_group_min_underseg_ratio: float = 2.0
+    koharu_semantic_paired_raw_group_min_overlap: float = 0.75
+    # ``inter / min(area)`` alone can score a tiny SOURCE box as 1.0 when it is
+    # fully contained by a much larger TARGET raw group.  That was enough to
+    # pair a full-page letter block with one unrelated small caption on p-203.
+    # Keep raw-group pairing scale-compatible before using overlap as evidence.
+    koharu_semantic_paired_raw_group_min_area_similarity: float = 0.17
+    koharu_semantic_paired_raw_group_min_change_ratio: float = 0.50
+    koharu_semantic_paired_raw_group_target_hint_dilate_px: int = 6
+    # If the detector polygon covers only a tiny fragment of very large display
+    # lettering, a proven SOURCE/TARGET raw-box pair may expand farther than the
+    # ordinary 12x polygon-area cap. Keep that rescue bounded to a small part of
+    # the page and to bright, saturated TARGET artwork.
+    koharu_semantic_paired_raw_group_max_page_area_ratio: float = 0.22
+    koharu_semantic_raw_group_large_min_target_saturation_p50: float = 80.0
+    koharu_semantic_raw_group_large_source_gray_max: int = 180
+    koharu_semantic_raw_group_large_target_gray_max: int = 175
+    koharu_semantic_raw_group_large_source_component_min_area: int = 25
+    koharu_semantic_raw_group_large_target_component_min_area: int = 35
+    koharu_semantic_raw_group_large_target_clear_px: int = 4
+    koharu_semantic_raw_group_large_inpaint_radius: float = 5.0
+    # Large paired text can also live on a bright neutral paper object (letter,
+    # note, sign) rather than saturated artwork.  In that case clear/write only
+    # glyph components supported by the paper field; never copy SOURCE paper or
+    # the hand/object holding it.
+    koharu_semantic_raw_group_plain_paper_enabled: bool = True
+    koharu_semantic_raw_group_plain_min_bright_ratio: float = 0.62
+    koharu_semantic_raw_group_plain_min_value: int = 198
+    koharu_semantic_raw_group_plain_max_saturation: int = 84
+    koharu_semantic_raw_group_plain_source_gray_max: int = 188
+    koharu_semantic_raw_group_plain_target_gray_max: int = 194
+    koharu_semantic_raw_group_plain_component_min_area: int = 5
+    koharu_semantic_raw_group_plain_target_clear_px: int = 3
+    koharu_semantic_raw_group_plain_pair_tolerance_px: int = 2
+    koharu_semantic_raw_group_plain_component_unique_fraction: float = 0.06
+    koharu_semantic_raw_group_plain_boundary_pad_px: int = 12
     koharu_semantic_include_sfx: bool = False
+    # Large coloured/open SFX can leave a huge invalidation hole after the
+    # TARGET glyph mask is admitted.  Telea is appropriate for compact strokes
+    # but produces radial smears across textured starbursts.  When the SOURCE is
+    # a registered monochrome rendition and the TARGET container is saturated,
+    # reconstruct only the invalidated footprint from SOURCE luminance while
+    # borrowing TARGET chroma.  This preserves the coloured master structure and
+    # keeps Direct OCR-free.
+    koharu_semantic_source_recolor_enabled: bool = True
+    koharu_semantic_source_recolor_min_clear_pixels: int = 2500
+    koharu_semantic_source_recolor_max_source_saturation_p90: float = 28.0
+    koharu_semantic_source_recolor_max_source_chroma_spread_p90: float = 30.0
+    koharu_semantic_source_recolor_min_target_saturation_p50: float = 58.0
+    koharu_semantic_source_recolor_text_halo_px: int = 11
+    # Paired raw-box text rescue is active only after two-sided Koharu geometry
+    # proof.  SOURCE and TARGET use different stroke evidence so manga screen
+    # tone is not mistaken for translated glyphs.
+    koharu_semantic_raw_source_core_gray_max: int = 105
+    koharu_semantic_raw_target_core_saturation_max: int = 80
+    koharu_semantic_raw_target_core_gray_max: int = 135
+    koharu_semantic_raw_target_outline_clear_px: int = 5
     photo_pair_salvage_max_expand_px: int = 3
     photo_pair_salvage_coverage_margin: float = 0.08
     photo_pair_salvage_spill_extra: float = 0.04
@@ -465,6 +610,21 @@ class PixelTransferConfigBase(BaseModel):
     source_direct_text_seed_min_dark_ratio: float = 0.02
     source_direct_text_seed_max_dark_ratio: float = 0.24
     source_direct_text_seed_max_area_to_text_ratio: float = 45.0
+    # Complete a vetted white SOURCE hint with nearby bilateral Koharu glyph
+    # pixels only; never expand the authority as a rectangle/background patch.
+    source_direct_semantic_hint_completion_enabled: bool = True
+    source_direct_semantic_hint_completion_min_pixels: int = 18
+    source_direct_semantic_hint_completion_max_distance_px: int = 96
+    source_direct_semantic_hint_completion_max_added_ratio: float = 0.80
+    # TARGET semantic evidence is erase-only.  It may extend a trusted TARGET
+    # clear authority by only a tiny same-component fringe; it must never expand
+    # SOURCE write/support authority.  This covers clipped glyph tops while
+    # keeping detector spill on hair/artwork outside the writable raster.
+    source_direct_semantic_target_clear_fringe_enabled: bool = True
+    source_direct_semantic_target_clear_fringe_max_distance_px: int = 6
+    source_direct_semantic_target_clear_fringe_seed_dilate_px: int = 1
+    source_direct_semantic_target_clear_fringe_min_seed_pixels: int = 4
+    source_direct_semantic_target_clear_fringe_max_added_ratio: float = 0.35
     source_direct_small_unhinted_min_compact_components: int = 6
     source_direct_small_unhinted_area_ratio: float = 0.0020
     source_direct_artwork_low_solidity_min_ink_change: float = 0.18
@@ -512,6 +672,126 @@ class PixelTransferConfigBase(BaseModel):
     rigid_container_source_text_tolerance_px: int = 2
     rigid_container_source_text_unique_ratio: float = 0.055
     rigid_container_source_text_max_component_fraction: float = 0.10
+    # v2.3.70: the same SOURCE-only changed-text proof used to admit a rigid
+    # container must remain authoritative at render time.  Older Mask/Hybrid
+    # verified changed text here, then rendered every dark SOURCE pixel inside
+    # the balloon, which could copy monochrome character art into a colour
+    # TARGET (p-194 class).  Keep the gate only when it retains most of the
+    # admitted SOURCE ink; otherwise fail open to the older raster authority.
+    rigid_container_changed_text_gate_enabled: bool = True
+    rigid_container_changed_text_gate_min_retained_ratio: float = 0.65
+    rigid_container_changed_text_gate_dilate_px: int = 1
+    # TARGET-side mirror: edition-exclusive TARGET glyphs are text-clear
+    # authority, not structure.  Relieve them from immutable/border structure
+    # guards before clearing so Japanese remnants cannot survive inside a burst.
+    rigid_container_target_changed_text_relief_enabled: bool = True
+    rigid_container_target_changed_text_relief_dilate_px: int = 2
+    # Koharu raw text boxes are clear-only semantic hints.  They recover complete
+    # target lettering when mask post-processing trims large/bold punctuation, but
+    # never enlarge SOURCE write authority.  The hint is admitted only inside a
+    # verified container and on a bright/low-saturation paper-like background.
+    rigid_container_target_raw_text_clear_enabled: bool = True
+    rigid_container_target_raw_text_min_confidence: float = 0.50
+    rigid_container_target_raw_text_min_overlap: float = 0.20
+    rigid_container_target_raw_text_max_area_fraction: float = 0.48
+    # Large Koharu raw text boxes are never cleared as rectangles. They may only
+    # recover complete TARGET dark components already seeded by changed-text evidence.
+    rigid_container_target_raw_text_seed_dilate_px: int = 3
+    rigid_container_target_raw_text_component_max_fraction: float = 0.12
+    rigid_container_target_raw_text_component_min_seed_pixels: int = 3
+    rigid_container_target_raw_text_component_min_seed_fraction: float = 0.006
+    # A high-confidence Koharu text raw-box may contain disconnected glyphs that
+    # have no changed-text seed at all (e.g. a separate punctuation/vertical
+    # column).  Recover those only as TARGET-clear authority when they are compact,
+    # on white paper, and spatially chained to already seeded text components.
+    rigid_container_target_raw_text_unseeded_semantic_enabled: bool = True
+    rigid_container_target_raw_text_unseeded_min_confidence: float = 0.80
+    rigid_container_target_raw_text_unseeded_min_bright_ratio: float = 0.60
+    rigid_container_target_raw_text_unseeded_halo_px: int = 7
+    rigid_container_target_raw_text_unseeded_min_halo_bright_ratio: float = 0.72
+    rigid_container_target_raw_text_unseeded_max_halo_saturation_median: float = 45.0
+    rigid_container_target_raw_text_unseeded_max_halo_high_saturation_ratio: float = 0.08
+    rigid_container_target_raw_text_unseeded_max_span_x: float = 0.58
+    rigid_container_target_raw_text_unseeded_max_span_y: float = 0.35
+    rigid_container_target_raw_text_unseeded_neighbor_gap_ratio: float = 0.38
+    rigid_container_target_raw_text_unseeded_neighbor_gap_min_px: int = 10
+    rigid_container_target_raw_text_unseeded_min_boundary_distance_px: float = 8.0
+    # Strong semantic completion is TARGET-clear-only. It recovers bold glyph
+    # fragments that spill a few pixels beyond a high-confidence Koharu raw box
+    # without widening SOURCE write authority or admitting long structural lines.
+    rigid_container_target_raw_text_completion_enabled: bool = True
+    rigid_container_target_raw_text_completion_min_confidence: float = 0.90
+    rigid_container_target_raw_text_completion_min_bubble_overlap: float = 0.90
+    rigid_container_target_raw_text_completion_padding_px: int = 10
+    rigid_container_target_raw_text_completion_min_bright_ratio: float = 0.62
+    rigid_container_target_raw_text_completion_max_saturation_median: float = 35.0
+    rigid_container_target_raw_text_completion_halo_px: int = 7
+    rigid_container_target_raw_text_completion_min_halo_bright_ratio: float = 0.72
+    rigid_container_target_raw_text_completion_max_halo_saturation_median: float = 45.0
+    rigid_container_target_raw_text_completion_max_halo_high_saturation_ratio: float = 0.08
+    rigid_container_target_raw_text_completion_max_aspect: float = 14.0
+    rigid_container_target_raw_text_completion_min_boundary_distance_px: float = 4.0
+    rigid_container_target_raw_text_completion_neighbor_gap_ratio: float = 0.48
+    rigid_container_target_raw_text_completion_neighbor_gap_min_px: int = 14
+    # v2.3.89: Koharu raw text boxes can end inside the final punctuation/glyph
+    # component.  The raw box remains the semantic seed, but TARGET-clear
+    # authority may follow the *same dark component* a bounded distance past a
+    # raw-box edge, then pick up immediately adjacent punctuation components.
+    # This is intentionally clear-only and is constrained to a verified Koharu
+    # bubble on neutral/white paper.  It never changes SOURCE write authority.
+    rigid_container_target_raw_text_edge_spill_enabled: bool = True
+    rigid_container_target_raw_text_edge_spill_min_confidence: float = 0.90
+    rigid_container_target_raw_text_edge_spill_min_bubble_overlap: float = 0.90
+    rigid_container_target_raw_text_edge_spill_padding_ratio: float = 0.45
+    rigid_container_target_raw_text_edge_spill_padding_min_px: int = 28
+    rigid_container_target_raw_text_edge_spill_padding_max_px: int = 112
+    rigid_container_target_raw_text_edge_spill_seed_dilate_px: int = 3
+    rigid_container_target_raw_text_edge_spill_neighbor_gap_px: int = 18
+    rigid_container_target_raw_text_edge_spill_min_boundary_distance_px: float = 8.0
+    # For very large/bold TARGET lettering, changed-text seeds can miss entire
+    # disconnected glyphs even though Koharu's high-confidence raw text box and
+    # bubble jointly prove the text domain. Recover complete dark components only
+    # when their halo is neutral white paper and they stay off the bubble edge.
+    rigid_container_target_raw_text_full_component_enabled: bool = True
+    rigid_container_target_raw_text_full_component_min_confidence: float = 0.90
+    rigid_container_target_raw_text_full_component_min_bubble_overlap: float = 0.90
+    rigid_container_target_raw_text_full_component_min_bright_ratio: float = 0.62
+    rigid_container_target_raw_text_full_component_max_saturation_median: float = 35.0
+    rigid_container_target_raw_text_full_component_min_raw_overlap_fraction: float = 0.55
+    rigid_container_target_raw_text_full_component_min_boundary_distance_px: float = 8.0
+    rigid_container_target_raw_text_full_component_min_halo_bright_ratio: float = 0.68
+    rigid_container_target_raw_text_full_component_max_halo_saturation_median: float = 35.0
+    rigid_container_target_raw_text_full_component_max_halo_high_saturation_ratio: float = 0.08
+    rigid_container_target_raw_text_min_bright_ratio: float = 0.42
+    rigid_container_target_raw_text_max_saturation_median: float = 80.0
+    rigid_container_target_raw_text_gray_threshold: int = 228
+    rigid_container_target_raw_text_inset_px: int = 1
+    rigid_container_target_raw_text_dilate_px: int = 2
+    # SOURCE semantic extension is still text-pixel-only.  It exists for narrow
+    # paired-diff lanes that clip valid translated punctuation/columns.  A high-
+    # confidence Koharu text raw-box selects compact dark components on white paper;
+    # components hugging the semantic bubble boundary are treated as structure.
+    rigid_container_source_raw_text_write_enabled: bool = True
+    rigid_container_source_raw_text_write_min_confidence: float = 0.80
+    rigid_container_source_raw_text_write_min_overlap: float = 0.20
+    rigid_container_source_raw_text_write_min_bright_ratio: float = 0.60
+    rigid_container_source_raw_text_write_max_saturation_median: float = 80.0
+    rigid_container_source_raw_text_write_gray_threshold: int = 228
+    rigid_container_source_raw_text_write_max_component_fraction: float = 0.12
+    rigid_container_source_raw_text_write_max_span_x: float = 0.65
+    rigid_container_source_raw_text_write_max_span_y: float = 0.35
+    rigid_container_source_raw_text_write_halo_px: int = 7
+    rigid_container_source_raw_text_write_min_halo_bright_ratio: float = 0.72
+    rigid_container_source_raw_text_write_max_halo_saturation_median: float = 45.0
+    rigid_container_source_raw_text_write_min_boundary_distance_px: float = 8.0
+    # High-confidence SOURCE raw text boxes occasionally clip/abut trailing
+    # punctuation at one edge (p-194 burst balloon). Recover only boundary-rejected
+    # components that remain strongly aligned with an already accepted text column.
+    rigid_container_source_raw_text_edge_recovery_enabled: bool = True
+    rigid_container_source_raw_text_edge_recovery_max_gap_ratio: float = 0.12
+    rigid_container_source_raw_text_edge_recovery_min_axis_overlap: float = 0.55
+    rigid_container_source_raw_text_edge_recovery_max_width_ratio: float = 0.52
+    rigid_container_source_raw_text_edge_recovery_max_height_ratio: float = 0.12
     # v2.0.85: changed-text evidence may still contain edition-exclusive artwork
     # edges (helmet rings, glasses, buttons). Reject support masks dominated by
     # a large hollow art component so precise mask / hybrid never upgrade those
@@ -865,6 +1145,15 @@ class PixelTransferConfigBase(BaseModel):
     content_completeness_max_target_residual: float = 0.10
     content_completeness_tolerance_px: int = 2
     content_completeness_gate_erode_px: int = 4
+    # Direct's compact SOURCE-ink detector can include a balloon border/tail
+    # fragment as an apparent text component.  When Koharu independently
+    # supplies SOURCE text evidence, completeness QA may use that evidence only
+    # as a *support gate* over literal SOURCE ink.  It never audits a filled
+    # detector polygon directly and falls back to the original mask if semantic
+    # support would discard too much ink.
+    content_audit_semantic_support_enabled: bool = True
+    content_audit_semantic_support_dilate_px: int = 2
+    content_audit_semantic_support_min_retained_ratio: float = 0.65
     # v0.8.34.3: turn completeness QA into a bounded self-repair loop. One extra
     # pass may grow the write mask inside the already trusted target envelope,
     # clear compact target-only glyph remnants, and re-audit before Review.
@@ -1025,6 +1314,11 @@ class DirectPatchConfig(PixelTransferConfigBase):
     direct_post_structural_restore_min_area_px: int = 10
     direct_post_structural_restore_fringe_px: int = 1
     direct_post_structural_restore_fringe_gray_max: int = 238
+    # Post-clear structural recovery must never resurrect TARGET lettering that
+    # happens to sit close to a bubble edge. Compact TARGET text is automatically
+    # excluded from restore authority; independently detected long container
+    # borders still have priority so a real broken outline remains recoverable.
+    direct_post_structural_restore_text_exclusion_dilate_px: int = 2
 
     # Direct mode should preserve typesetting orientation. Location can still be
     # refined by registration, but final SOURCE overlay is axis-locked.
@@ -1156,6 +1450,13 @@ class TransparentBubbleRevealConfig(BaseModel):
     target_text_presence_ocr_enabled: bool = False  # optional TARGET OCR verifier; never used for translation/relettering
     target_text_presence_ocr_min_confidence: float = 0.35
     target_text_presence_ocr_fail_open: bool = True
+    # OCR is evidence, not destructive geometry authority. By default a positive
+    # result may rescue a weak TARGET text candidate, while a negative result
+    # cannot veto geometry/component evidence that already passed.
+    target_text_presence_ocr_negative_veto: bool = False
+    # Bound optional OCR cost per page and create the backend lazily. This matters
+    # for cloud/CPU fallbacks and long books with many weak candidates.
+    target_text_presence_ocr_max_regions: int = 6
     require_source_translation_evidence: bool = False  # optional legacy/strict gate to suppress untranslated or unsupported candidates
     seed_fallback_protect_detected_white_bubbles: bool = True  # prevent open/seed fallback candidates from swallowing already-detected white speech bubbles
     seeded_container_quality_min_fill_ratio: float = 0.56  # reject overgrown recovered white containers with too much empty bbox area
@@ -1173,6 +1474,15 @@ class TransparentBubbleRevealConfig(BaseModel):
     border_protect_px: int = 2
 
     clear_mode: str = "hybrid"  # hybrid|full_bubble|text_only; safest default for mixed/color pages
+    # Cross-rendition guard: when the registered SOURCE is effectively mono but
+    # TARGET is a coloured edition, a whole-bubble reveal can expose grayscale
+    # face/art pixels where the two bubble silhouettes differ by a few pixels.
+    # Hybrid therefore demotes Koharu full-bubble holes to text-only transfer;
+    # explicit full_bubble remains an opt-in override.
+    cross_rendition_full_reveal_guard: bool = True
+    cross_rendition_source_saturation_p90_max: float = 28.0
+    cross_rendition_target_saturation_p90_min: float = 55.0
+    cross_rendition_min_saturation_gap: float = 30.0
     text_ink_threshold: int = 190
     paper_white_threshold: int = 215
     composite_ink_threshold: int = 110  # strict dark ink for CN paste; protects skin
@@ -1196,6 +1506,16 @@ class PairingConfig(BaseModel):
     aspect_weight: float = 0.10
     edge_weight: float = 0.16
     confidence_floor: float = 0.45
+    # Hard structural outlier guard for smart pairing.  Cross-language/color
+    # editions may legitimately differ in glyphs and palette, so this is NOT a
+    # generic low-confidence cutoff.  It only rejects a proposed pair when the
+    # coarse edge layout is almost unrelated *and* the perceptual hash/overall
+    # cost independently agree that the pages are different.  This prevents
+    # end-matter pages with similar blank margins/aspect ratios from being paired
+    # merely because the sequence aligner prefers a pair over two gaps.
+    smart_hard_edge_reject: float = 0.72
+    smart_hard_hash_reject: float = 0.18
+    smart_hard_total_reject: float = 0.24
     # Full O(N*M) sequence alignment is retained for ordinary books. Large smart
     # segments use a diagonal band; the band automatically widens for count
     # differences and falls back to full alignment only if no valid path exists.
@@ -1276,7 +1596,7 @@ class RegistrationConfig(BaseModel):
 
 
 class OCRConfig(BaseModel):
-    backend: str = "paddle"  # paddle_*|paddle|manga_ocr|baberu_ocr|ocr48px|external|apple|sidecar|none
+    backend: str = "paddle"  # paddle_*|paddle|manga_ocr|baberu_ocr|ocr48px|hayai_ocr|ndlocr_lite|m6_japanese_auto|external|apple|sidecar|none
     source_backend: str | None = None
     target_backend: str | None = None
     source_lang: str = "ch"
@@ -1316,7 +1636,35 @@ class OCRConfig(BaseModel):
     # directly. Models are local/explicit and are never pulled at import time.
     manga_ocr_model_path: str | None = None
     baberu_ocr_model_path: str | None = None
+    coreml_onnx_backend: str = "auto"  # auto|ane|coreml|cpu
+    coreml_model_cache_dir: str | None = None
+    coreml_profile_compute_plan: bool = False
+    paddle_coreml_compute_units: str = "ane"  # ane|gpu|all|cpu; explicit Paddle ONNXRuntime bridge only
+    ocr_batch_auto: bool = True
+    ocr_batch_size: int = 8
+    # A batch failure must never fail an otherwise valid page. The current chunk
+    # is retried serially and the fallback reason is preserved in block metadata.
+    ocr_batch_serial_fallback: bool = True
     ocr48px_model_path: str | None = None
+    # Hayai OCR 2.3 package, defaulting to the v2.5-nova checkpoint. It is an
+    # independent crop OCR beside Manga OCR / Baberu / 48px, never a replacement.
+    # The official Nova model exposes 256 / 384 / 512 NaFlex budgets; Folirina
+    # defaults to 384 as the balanced profile. LiteRT is fixed at 256 upstream.
+    hayai_ocr_model_cache_dir: str | None = None
+    hayai_ocr_quantize: str = "none"  # none|int8|int4
+    hayai_ocr_use_v2: bool = False  # compatibility switch; False => v2.5-nova
+    hayai_ocr_backend: str = "auto"  # auto|torch|litert
+    hayai_ocr_max_num_patches: int = 384  # 256|384|512; LiteRT coerces to 256
+    hayai_ocr_assumed_confidence: float = 0.74
+    # NDL OCR Lite is an optional full-page/reference OCR path. It is kept
+    # isolated from the main GUI and from Paddle; CoreML is experimental and
+    # always falls back to the official CPU execution path.
+    ndlocr_lite_runtime_path: str | None = None
+    ndlocr_lite_source_path: str | None = None
+    ndlocr_lite_coreml_auto: bool = True
+    ndlocr_lite_coreml_compute_units: str = "ane"  # ane|gpu|all|cpu
+    ndlocr_lite_assumed_confidence: float = 0.72
+    ndlocr_lite_timeout_seconds: int = 300
     koharu_layout_model_path: str | None = None
     koharu_layout_text_threshold: float = 0.25
     koharu_layout_sfx_threshold: float = 0.20
@@ -1334,9 +1682,56 @@ class OCRConfig(BaseModel):
     retry_low_confidence: bool = True
     retry_scale: float = 2.0
     # Missing optional OCR packages must not crash Direct/Mask/Auto processing.
-    # The pipeline falls back to a Null OCR evidence backend and leaves uncertain
-    # regions for QA/manual review instead of downloading models silently.
+    # When the requested engine is unavailable, the pipeline may fall back to a
+    # lightweight OCR already present in the current runtime instead of
+    # discarding OCR evidence entirely. Use ``none`` to keep the old Null-OCR
+    # behaviour.
     soft_fail_missing_backend: bool = True
+    soft_fail_fallback_backend: str = "tesseract"  # tesseract|none
+    # Lightweight cloud/runtime Tesseract fallback. Manga region OCR rotates
+    # vertical crops to horizontal reading order before recognition so columns
+    # become top-to-bottom lines and can be reconstructed deterministically.
+    tesseract_rotate_vertical_regions: bool = True
+    tesseract_region_vertical_aspect: float = 1.12
+    tesseract_retry_otsu_on_empty: bool = True
+    tesseract_min_confidence: float = 0.42
+    # Hard per-process guard for cloud/headless fallback OCR. Artwork-heavy
+    # false-positive regions must never stall a whole page/book.
+    # Cloud/runtime Tesseract is a fallback, never a reason to stall a page.
+    # Bound both each subprocess call and the total work spent on one manga
+    # region; difficult false-positive art regions are then held for review.
+    tesseract_call_timeout_seconds: float = 3.0
+    tesseract_region_budget_seconds: float = 7.0
+    # Column refinement is bounded: manga text regions normally contain only a
+    # handful of vertical columns. Art/linework false positives can expose dozens
+    # of narrow bands and must never fan out into unbounded OCR calls.
+    tesseract_column_refine_enabled: bool = True
+    tesseract_max_column_retries: int = 8
+    tesseract_column_replace_conf_gain: float = 0.08
+    tesseract_consensus_min_routes: int = 2
+    tesseract_consensus_min_char_coverage: float = 0.74
+    tesseract_consensus_min_length_ratio: float = 0.88
+    tesseract_consensus_min_pairwise_agreement: float = 0.50
+    # Tesseract fallback may contain one weak vertical column even when the
+    # region median looks healthy. Cap such regions below the publication gate
+    # so the target remains intact and the GUI exposes a review item.
+    tesseract_region_review_min_child_confidence: float = 0.62
+    tesseract_region_review_min_consensus_coverage: float = 0.90
+    tesseract_region_review_min_consensus_agreement: float = 0.55
+    tesseract_region_review_confidence_cap: float = 0.64
+    # When the projected SOURCE text covers only part of the paired bubble,
+    # compare OCR on the masked and original bounded crop. A material transcript
+    # disagreement is review-only even if one route reports high confidence;
+    # this catches high-confidence common-mode errors caused by mask clipping.
+    tesseract_unmasked_compare_projection_coverage: float = 0.72
+    tesseract_unmasked_disagreement_min_ratio: float = 0.96
+    tesseract_unmasked_override_confidence_gain: float = 0.10
+    # Multi-route column consensus is reserved for genuinely suspicious columns
+    # (missing, low confidence, or PSM disagreement).  Rechecking every healthy
+    # column multiplies OCR calls without improving publication quality.
+    tesseract_max_consensus_columns: int = 3
+    tesseract_consensus_trigger_confidence: float = 0.90
+    tesseract_psm_column_conf_gain: float = 0.08
     # Extra deterministic variants for photographed/reflective old editions.
     photo_ocr_preprocess: bool = True
     photo_ocr_clahe_clip: float = 2.2
@@ -1383,6 +1778,8 @@ class BubbleConfig(BaseModel):
     device: str = "auto"  # auto|mps|cuda|cpu
     mangalens_confidence: float = 0.35
     mangalens_imgsz: int = 1600
+    m6_auto: bool = True
+    m6_dynamic_resolution_auto: bool = True
     # Apache-2.0 Comic-Translate RT-DETR-v2 source detector adapter. The
     # pretrained repo is only accessed when model downloads are explicitly allowed.
     rtdetr_model_path: str | None = None
@@ -1418,6 +1815,10 @@ class BubbleConfig(BaseModel):
     # size. Cap that input on photographed/4K SOURCE pages to avoid multi-GiB
     # temporary tensors; geometry is scaled back to original coordinates.
     koharu_layout_postprocess_max_side: int = 1152
+    # On M6 FP16 inference, RF-DETR can irreversibly optimize the resident model
+    # weights for inference. Keep this Auto by default; failure leaves the stable
+    # FP32-weight + autocast path untouched.
+    m6_koharu_weight_fp16_auto: bool = True
     # Preserve normal ~1600px TARGET input; only very large scans are pre-scaled.
     koharu_layout_postprocess_downscale_trigger_side: int = 2048
     white_threshold: int = 205

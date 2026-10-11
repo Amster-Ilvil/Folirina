@@ -28,6 +28,10 @@ STATIC_REVIEW_INPUTS: tuple[str, ...] = (
     "manual_direct_patch_regions.png",
     "manual_target_layer_erase_mask.png",
     "manual_target_layer_restore_mask.png",
+    # The action order determines which still-active brush must be replayed
+    # when the other is reset. Keep it with the human review inputs across
+    # mode archives and failed-run restoration.
+    "target_layer_edit_order.json",
 )
 
 _DYNAMIC_REVIEW_FILE_KEYS: tuple[str, ...] = (

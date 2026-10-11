@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox, QLineEdit, QProgressBar, QButtonGroup, QCheckBox,
 )
 
+from .gui_toast import notify
 from .gui_components import Card, OptionRow, StableComboBox, StableSpinBox, StableDoubleSpinBox
 from .gui_dialogs import confirm_action
 from .gui_workers import ComponentProbeWorker, ModelDownloadWorker, DependencyInstallWorker, ModelNetworkProbeWorker
@@ -131,9 +132,13 @@ class ModelPage(QWidget):
             ("PaddleOCR v6 Medium", "paddle_v6_medium", "传统 detection + recognition · 质量优先"),
             ("PaddleOCR v6 Small", "paddle_v6_small", "传统 detection + recognition · 更快更省资源"),
             ("PaddleOCR-VL 1.6", "paddle_vl_16", "独立 VLM 文档解析接口；不是 OCR v6 的档位"),
+            ("PaddleOCR ONNX / CoreML", "paddle_onnx_coreml", "显式实验后端：PaddleOCR ONNXRuntime + CoreML；失败时必须手动切回标准 Paddle"),
             ("Manga OCR", "manga_ocr", "日文漫画专用 · Koharu Layout 分区后逐区识别"),
             ("Baberu OCR", "baberu_ocr", "ONNX 轻量漫画 OCR · 日/中/英 · Layout 分区"),
             ("48px AR OCR", "ocr48px", "经典 Manga Image Translator 48px 自回归 OCR；原生独立 Torch/MPS 运行，外部 runner 仅作兼容回退"),
+            ("Hayai OCR 2.3 · v2.5-nova", "hayai_ocr", "日文/中韩漫画 OCR；多行识别 + 真 batch，M6 优先共享 Torch/MPS"),
+            ("NDLOCR-Lite 1.2.3", "ndlocr_lite", "整页 OCR / 校验路线；独立 ONNXRuntime，Apple Silicon 可探测 CoreML"),
+            ("M6 Japanese Auto", "m6_japanese_auto", "日文竖排自动路由：整页优先 NDL，分区优先 Hayai，48px 作为安全 fallback"),
             ("PP-StructureV3", "paddle_structure_v3", "独立版面结构解析接口"),
             ("外部 OCR JSON / MD", "external", "导入云端/别台机器 OCR 结果，不在本机跑模型"),
             ("Sidecar", "sidecar", "每页 .ocr.json 外部结果"),
@@ -238,15 +243,55 @@ class ModelPage(QWidget):
         self.paddle_profile_status=QLabel("已缓存引擎：检测中…"); self.paddle_profile_status.setObjectName("quiet"); self.paddle_profile_status.setWordWrap(True)
         net.addWidget(self.paddle_profile_status,7,0,1,4)
 
+        net.addWidget(QLabel("Hayai 后端"),13,0)
+        self.hayai_ocr_backend=QComboBox()
+        self.hayai_ocr_backend.addItem("Auto · M6 优先 Torch/MPS", "auto")
+        self.hayai_ocr_backend.addItem("Torch/MPS", "torch")
+        self.hayai_ocr_backend.addItem("LiteRT（实验）", "litert")
+        net.addWidget(self.hayai_ocr_backend,13,1,1,3)
+        net.addWidget(QLabel("Hayai 量化"),14,0)
+        self.hayai_ocr_quantize=QComboBox()
+        self.hayai_ocr_quantize.addItem("不量化 · 精度优先", "none")
+        self.hayai_ocr_quantize.addItem("INT8 · 节省内存", "int8")
+        self.hayai_ocr_quantize.addItem("INT4 · 最省内存", "int4")
+        net.addWidget(self.hayai_ocr_quantize,14,1,1,3)
+        net.addWidget(QLabel("Hayai 图像预算"),15,0)
+        self.hayai_ocr_patches=QComboBox()
+        self.hayai_ocr_patches.addItem("256 · 最快", 256)
+        self.hayai_ocr_patches.addItem("384 · 平衡（默认）", 384)
+        self.hayai_ocr_patches.addItem("512 · 最高质量 / 小字竖排", 512)
+        self.hayai_ocr_patches.setToolTip("Hayai v2.5-nova NaFlex max_num_patches。LiteRT 图固定为 256。")
+        net.addWidget(self.hayai_ocr_patches,15,1,1,3)
+        self.ndlocr_coreml_auto=QCheckBox("NDLOCR-Lite 在 Apple Silicon 上尝试 CoreML EP，失败自动回官方 CPU")
+        net.addWidget(self.ndlocr_coreml_auto,16,0,1,4)
+        net.addWidget(QLabel("Paddle CoreML 计算单元"),17,0)
+        self.paddle_coreml_units=QComboBox()
+        self.paddle_coreml_units.addItem("ANE 优先", "ane")
+        self.paddle_coreml_units.addItem("GPU 优先", "gpu")
+        self.paddle_coreml_units.addItem("CoreML 全部可用单元", "all")
+        self.paddle_coreml_units.addItem("CPU", "cpu")
+        net.addWidget(self.paddle_coreml_units,17,1,1,3)
+        net.addWidget(QLabel("NDL CoreML 计算单元"),18,0)
+        self.ndlocr_coreml_units=QComboBox()
+        self.ndlocr_coreml_units.addItem("ANE 优先", "ane")
+        self.ndlocr_coreml_units.addItem("GPU 优先", "gpu")
+        self.ndlocr_coreml_units.addItem("CoreML 全部可用单元", "all")
+        self.ndlocr_coreml_units.addItem("CPU", "cpu")
+        net.addWidget(self.ndlocr_coreml_units,18,1,1,3)
+
         role_choices = [
             ("跟随上方主选择", "inherit"),
             ("Apple Live Text", "apple"),
             ("PaddleOCR v6 Medium", "paddle_v6_medium"),
             ("PaddleOCR v6 Small", "paddle_v6_small"),
             ("PaddleOCR-VL 1.6", "paddle_vl_16"),
+            ("PaddleOCR ONNX / CoreML", "paddle_onnx_coreml"),
             ("Manga OCR", "manga_ocr"),
             ("Baberu OCR", "baberu_ocr"),
             ("48px AR OCR", "ocr48px"),
+            ("Hayai OCR 2.3 · v2.5-nova", "hayai_ocr"),
+            ("NDLOCR-Lite 1.2.3", "ndlocr_lite"),
+            ("M6 Japanese Auto", "m6_japanese_auto"),
             ("PP-StructureV3", "paddle_structure_v3"),
             ("外部 OCR JSON / MD", "external"),
             ("Sidecar", "sidecar"),
@@ -281,6 +326,7 @@ class ModelPage(QWidget):
             self.source_ocr_backend, self.target_ocr_backend,
             self.external_source_path, self.external_source_pick, self.external_source_start,
             self.external_target_path, self.external_target_pick, self.external_target_start,
+            self.hayai_ocr_backend, self.hayai_ocr_quantize, self.hayai_ocr_patches, self.ndlocr_coreml_auto, self.ndlocr_coreml_units, self.paddle_coreml_units,
         ]
         settings.layout.addLayout(net)
 
@@ -290,12 +336,12 @@ class ModelPage(QWidget):
         self.model_import_buttons = {}
         self.dependency_buttons = {}
         self._dependency_installable = {}
-        downloadable = {"paddle", "lightglue", "loftr", "mangalens", "ysg_obb", "rtdetr_v2", "sam2", "koharu_layout", "manga_ocr", "baberu_ocr", "ocr48px", "lama_manga", "aot_inpainting", "flux2_klein", "rorem_mixed"}
+        downloadable = {"paddle", "lightglue", "loftr", "mangalens", "ysg_obb", "rtdetr_v2", "sam2", "koharu_layout", "manga_ocr", "baberu_ocr", "ocr48px", "hayai_ocr", "ndlocr_lite", "lama_manga", "aot_inpainting", "flux2_klein", "rorem_mixed"}
         status_rows = [
             ("paddle","PaddleOCR"), ("lightglue","LightGlue"), ("loftr","LoFTR"),
             ("mangalens","MangaLens"), ("ysg_obb","YSG YOLO OBB"), ("rtdetr_v2","RT-DETR-v2"), ("sam2","SAM 2.1"),
             ("koharu_layout","Koharu Layout"), ("manga_ocr","Manga OCR"), ("baberu_ocr","Baberu OCR"),
-            ("ocr48px","48px AR OCR"), ("lama_manga","LaMa Manga"), ("aot_inpainting","AOT"), ("flux2_klein","FLUX.2 Klein"), ("rorem_mixed","RORem Mixed"),
+            ("ocr48px","48px AR OCR"), ("hayai_ocr","Hayai OCR 2.3 · v2.5-nova"), ("ndlocr_lite","NDLOCR-Lite 1.2.3"), ("lama_manga","LaMa Manga"), ("aot_inpainting","AOT"), ("flux2_klein","FLUX.2 Klein"), ("rorem_mixed","RORem Mixed"),
             ("torch_sr","Torch 局部超分"), ("apple_live_text","Apple Live Text"),
             ("apple_shortcut","ExtractText 快捷指令"),
         ]
@@ -314,7 +360,7 @@ class ModelPage(QWidget):
                     dep.setToolTip("创建/修复独立 PaddleOCR Python 3.9–3.13 venv；不会把 Paddle 强装进 GUI Python。")
                 elif key in {"lightglue", "loftr"}:
                     dep.setToolTip("创建/修复共享的 LightGlue / LoFTR 独立 Python 3.10–3.13 venv；GUI Python 3.14 不再 import Torch。")
-                elif key in {"mangalens", "ysg_obb", "rtdetr_v2", "sam2", "koharu_layout", "manga_ocr", "baberu_ocr", "ocr48px"}:
+                elif key in {"mangalens", "ysg_obb", "rtdetr_v2", "sam2", "koharu_layout", "manga_ocr", "baberu_ocr", "ocr48px", "hayai_ocr", "ndlocr_lite"}:
                     dep.setToolTip(f"把 {name} 安装到共享的独立 Python 3.10–3.13 Torch venv；GUI Python 3.14 不加载 Torch/Ultralytics/Transformers/SAM2。")
                 elif key in {"lama_manga", "aot_inpainting", "flux2_klein", "rorem_mixed"}:
                     dep.setEnabled(False); dep.setToolTip("生成/修补模型使用本地 runner；只需导入模型并配置 runner 命令。")
@@ -322,7 +368,11 @@ class ModelPage(QWidget):
                     dep.setToolTip(f"安装 {name} 的运行依赖，并在安装后真实导入验证。")
                 dep.clicked.connect(lambda _=False,k=key:self._install_model_dependencies(k)); self.dependency_buttons[key]=dep; line.addWidget(dep)
                 imp=QPushButton("离线导入"); imp.setObjectName("modelDownload"); imp.setMinimumWidth(68); imp.setMaximumWidth(82)
-                imp.clicked.connect(lambda _=False,k=key:self._import_model(k)); self.model_import_buttons[key]=imp; line.addWidget(imp)
+                if key in {"hayai_ocr", "ndlocr_lite"}:
+                    imp.setEnabled(False); imp.setToolTip("该运行时由独立 venv / HF cache 管理；请使用‘下载/校验’，或在配置中指定现有 cache/runtime。")
+                else:
+                    imp.clicked.connect(lambda _=False,k=key:self._import_model(k))
+                self.model_import_buttons[key]=imp; line.addWidget(imp)
                 b=QPushButton("下载/校验"); b.setObjectName("modelDownload"); b.setMinimumWidth(82); b.setMaximumWidth(96)
                 if key == "paddle": b.setText("下载/预热")
                 b.clicked.connect(lambda _=False,k=key:self._download_model(k)); self.model_download_buttons[key]=b; line.addWidget(b)
@@ -394,6 +444,12 @@ class ModelPage(QWidget):
         self.external_target_path.setText(str(getattr(ocr_cfg,"external_target_ocr_path","") or ""))
         self.external_source_start.setValue(int(getattr(ocr_cfg,"external_source_start_page",1) or 1))
         self.external_target_start.setValue(int(getattr(ocr_cfg,"external_target_start_page",1) or 1))
+        _hayai_backend = self.hayai_ocr_backend.findData(str(getattr(ocr_cfg,"hayai_ocr_backend","auto") or "auto")); self.hayai_ocr_backend.setCurrentIndex(max(0,_hayai_backend))
+        _hayai_quant = self.hayai_ocr_quantize.findData(str(getattr(ocr_cfg,"hayai_ocr_quantize","none") or "none")); self.hayai_ocr_quantize.setCurrentIndex(max(0,_hayai_quant))
+        _hayai_patches = self.hayai_ocr_patches.findData(int(getattr(ocr_cfg,"hayai_ocr_max_num_patches",384) or 384)); self.hayai_ocr_patches.setCurrentIndex(_hayai_patches if _hayai_patches >= 0 else self.hayai_ocr_patches.findData(384))
+        self.ndlocr_coreml_auto.setChecked(bool(getattr(ocr_cfg,"ndlocr_lite_coreml_auto",True)))
+        _paddle_units = self.paddle_coreml_units.findData(str(getattr(ocr_cfg,"paddle_coreml_compute_units","ane") or "ane")); self.paddle_coreml_units.setCurrentIndex(max(0,_paddle_units))
+        _ndl_units = self.ndlocr_coreml_units.findData(str(getattr(ocr_cfg,"ndlocr_lite_coreml_compute_units","ane") or "ane")); self.ndlocr_coreml_units.setCurrentIndex(max(0,_ndl_units))
         inpaint_cfg=self.window.state.config.inpainting
         self.ocr48px_command.setText(str(getattr(ocr_cfg,"ocr48px_command","") or ""))
         self.lama_manga_command.setText(str(getattr(inpaint_cfg,"lama_manga_command","") or ""))
@@ -406,6 +462,12 @@ class ModelPage(QWidget):
         self.paddle_model_profile.currentIndexChanged.connect(self._paddle_profile_changed)
         self.source_ocr_backend.currentIndexChanged.connect(self._role_ocr_changed)
         self.target_ocr_backend.currentIndexChanged.connect(self._role_ocr_changed)
+        self.hayai_ocr_backend.currentIndexChanged.connect(self._sync_m6_ocr_settings)
+        self.hayai_ocr_quantize.currentIndexChanged.connect(self._sync_m6_ocr_settings)
+        self.hayai_ocr_patches.currentIndexChanged.connect(self._sync_m6_ocr_settings)
+        self.ndlocr_coreml_auto.toggled.connect(self._sync_m6_ocr_settings)
+        self.ndlocr_coreml_units.currentIndexChanged.connect(self._sync_m6_ocr_settings)
+        self.paddle_coreml_units.currentIndexChanged.connect(self._sync_m6_ocr_settings)
         self.external_source_pick.clicked.connect(lambda:self._choose_external_ocr("source"))
         self.external_target_pick.clicked.connect(lambda:self._choose_external_ocr("target"))
         self.external_source_path.editingFinished.connect(self._role_ocr_changed)
@@ -438,7 +500,12 @@ class ModelPage(QWidget):
         self.mps_memory_label.setVisible(self._platform_family == "macos"); self.mps_fraction.setVisible(self._platform_family == "macos")
         hardware_layout.addLayout(hform)
         self.device_status = QLabel(); self.device_status.setObjectName("hint"); self.device_status.setWordWrap(True); hardware_layout.addWidget(self.device_status)
-        route = QLabel("自动按平台使用 Mac Apple MPS / Windows·Linux NVIDIA CUDA；不可用时自动回退 CPU。整册 Worker 常驻，模型只加载一次。")
+        self.m6_auto = QCheckBox("硬件自适应 Native 自动优化"); self.m6_auto.setChecked(True)
+        self.m6_auto.setToolTip("按实际设备自动选择 CPU/MPS/CUDA 等硬件策略、统一内存/显存预算、OCR batch、动态检测尺寸与有界预取；关闭后恢复手动/兼容策略。")
+        self.m6_dynamic_resolution = QCheckBox("M6 动态检测分辨率"); self.m6_dynamic_resolution.setChecked(True)
+        self.m6_dynamic_resolution.setToolTip("仅调整检测模型输入尺寸，不改变输出坐标或迁移语义；推理失败仍按原后端回退。")
+        hardware_layout.addWidget(self.m6_auto); hardware_layout.addWidget(self.m6_dynamic_resolution)
+        route = QLabel("自动按平台使用 Mac Apple MPS / Windows·Linux NVIDIA CUDA；不可用时自动回退 CPU。M6 上单 MPS 推理通道 + CPU/I/O 有界预取，模型保持常驻。")
         route.setObjectName("quiet"); route.setWordWrap(True); hardware_layout.addWidget(route)
         hardware_layout.addStretch(1)
         self.start_processing = QPushButton("处理当前页"); self.start_processing.setObjectName("softPrimary"); self.start_processing.setMinimumHeight(36)
@@ -449,7 +516,7 @@ class ModelPage(QWidget):
         runtime_grid.setColumnStretch(0, 3); runtime_grid.setColumnStretch(1, 2)
         runtime.layout.addLayout(runtime_grid)
         root.addWidget(runtime)
-        self.profile.currentIndexChanged.connect(self._set_profile); self.device.currentIndexChanged.connect(self._set_device); self.thread_ratio.valueChanged.connect(self._set_threads); self.mps_fraction.valueChanged.connect(self._set_mps_fraction)
+        self.profile.currentIndexChanged.connect(self._set_profile); self.device.currentIndexChanged.connect(self._set_device); self.thread_ratio.valueChanged.connect(self._set_threads); self.mps_fraction.valueChanged.connect(self._set_mps_fraction); self.m6_auto.toggled.connect(self._set_m6_auto); self.m6_dynamic_resolution.toggled.connect(self._set_m6_dynamic_resolution)
         self.apply_transfer_mode_ocr_lock(getattr(self.window.state.config.transfer, "mode", "auto"))
         root.addStretch(1)
 
@@ -653,10 +720,10 @@ class ModelPage(QWidget):
             self.window.statusBar().showMessage("已有依赖安装任务正在运行。", 3500)
             return
         if self._model_download_worker is not None and self._model_download_worker.isRunning():
-            QMessageBox.information(self, "模型正在下载", "请等待当前模型下载完成后再安装运行依赖。")
+            notify(self, "请等待当前模型下载完成后再安装运行依赖。", "warning")
             return
         if self.window._busy_running():
-            QMessageBox.information(self, "任务进行中", "请等待当前页面处理、模型维护或程序更新任务结束后再安装依赖。")
+            notify(self, "请等待当前页面处理、模型维护或程序更新任务结束后再安装依赖。", "warning")
             return
         self._apply_model_network_settings(show_message=False)
         labels={"paddle":"PaddleOCR","lightglue":"LightGlue","loftr":"LoFTR","mangalens":"MangaLens","ysg_obb":"YSG YOLO OBB","rtdetr_v2":"RT-DETR-v2","sam2":"SAM 2.1","all":"全部内置模型"}
@@ -717,7 +784,7 @@ class ModelPage(QWidget):
 
     def _import_model(self, key: str):
         if self.window._busy_running():
-            QMessageBox.information(self, "任务进行中", "请等待当前处理、模型维护或程序更新任务结束后再导入模型。")
+            notify(self, "请等待当前处理、模型维护或程序更新任务结束后再导入模型。", "warning")
             return
         if key == "paddle":
             profile=str(self.paddle_model_profile.currentData() or "ppocr_v6_medium") if hasattr(self,"paddle_model_profile") else "ppocr_v6_medium"
@@ -762,11 +829,11 @@ class ModelPage(QWidget):
         if self._dependency_worker is not None and self._dependency_worker.isRunning():
             self.window.statusBar().showMessage("已有依赖安装任务正在运行，请等待完成。",3500); return
         if self.window._busy_running():
-            QMessageBox.information(self, "任务进行中", "请等待当前页面处理、模型维护或程序更新任务结束后再下载模型。")
+            notify(self, "请等待当前页面处理、模型维护或程序更新任务结束后再下载模型。", "warning")
             return
         self._apply_model_network_settings(show_message=False)
-        sizes={"paddle":"模型大小随档位变化","lightglue":"约 45 MB","loftr":"约 45 MB","mangalens":"约 12 MB","ysg_obb":"YSG OBB 模型","rtdetr_v2":"约 172 MB + 配置","sam2":"约 156 MB","baberu_ocr":"约 121 MB ONNX","manga_ocr":"约 460 MB","ocr48px":"约 195 MB checkpoint + 字表 + 固定网络源码","lama_manga":"约 200 MB","koharu_layout":"大型实例分割模型","aot_inpainting":"模型 + 配置","flux2_klein":"超大型目录，建议离线导入","rorem_mixed":"约 1.9 GiB UNet + SDXL 运行组件"}
-        label={"paddle":self.paddle_model_profile.currentText(),"lightglue":"LightGlue SIFT","loftr":"LoFTR outdoor","mangalens":"MangaLens","ysg_obb":"YSG YOLO OBB","rtdetr_v2":"RT-DETR-v2","sam2":"SAM 2.1 Hiera Tiny","koharu_layout":"Koharu Layout RF-DETR Seg 2XL","manga_ocr":"Manga OCR","baberu_ocr":"Baberu OCR","ocr48px":"48px AR OCR","lama_manga":"LaMa Manga","aot_inpainting":"AOT Inpainting","flux2_klein":"FLUX.2 Klein","rorem_mixed":"RORem Mixed"}.get(key,key)
+        sizes={"paddle":"模型大小随档位变化","hayai_ocr":"约 90 MB Python 包 + 首次模型缓存","ndlocr_lite":"独立 ONNXRuntime + 官方模型文件","lightglue":"约 45 MB","loftr":"约 45 MB","mangalens":"约 12 MB","ysg_obb":"YSG OBB 模型","rtdetr_v2":"约 172 MB + 配置","sam2":"约 156 MB","baberu_ocr":"约 121 MB ONNX","manga_ocr":"约 460 MB","ocr48px":"约 195 MB checkpoint + 字表 + 固定网络源码","lama_manga":"约 200 MB","koharu_layout":"大型实例分割模型","aot_inpainting":"模型 + 配置","flux2_klein":"超大型目录，建议离线导入","rorem_mixed":"约 1.9 GiB UNet + SDXL 运行组件"}
+        label={"paddle":self.paddle_model_profile.currentText(),"lightglue":"LightGlue SIFT","loftr":"LoFTR outdoor","mangalens":"MangaLens","ysg_obb":"YSG YOLO OBB","rtdetr_v2":"RT-DETR-v2","sam2":"SAM 2.1 Hiera Tiny","koharu_layout":"Koharu Layout RF-DETR Seg 2XL","manga_ocr":"Manga OCR","baberu_ocr":"Baberu OCR","ocr48px":"48px AR OCR","hayai_ocr":"Hayai OCR 2.3 · v2.5-nova","ndlocr_lite":"NDLOCR-Lite 1.2.3","m6_japanese_auto":"M6 Japanese Auto","lama_manga":"LaMa Manga","aot_inpainting":"AOT Inpainting","flux2_klein":"FLUX.2 Klein","rorem_mixed":"RORem Mixed"}.get(key,key)
         self.model_download_status.setText(f"正在主动下载 {label} · {sizes.get(key,'')}。下载使用临时 .part 文件，完成后原子替换。")
         self._model_download_key=str(key); self._set_model_download_busy(True,key)
         self.model_progress.setRange(0,0)
@@ -825,6 +892,21 @@ class ModelPage(QWidget):
                 combo.blockSignals(True); combo.setCurrentIndex(idx if idx >= 0 else 0); combo.blockSignals(False)
         self.window.statusBar().showMessage(f"OCR：{key}",2500)
 
+    def _sync_m6_ocr_settings(self, *_args):
+        cfg=self.window.state.config.ocr
+        cfg.hayai_ocr_backend=str(self.hayai_ocr_backend.currentData() or "auto")
+        cfg.hayai_ocr_quantize=str(self.hayai_ocr_quantize.currentData() or "none")
+        patches=int(self.hayai_ocr_patches.currentData() or 384)
+        if cfg.hayai_ocr_backend == "litert" and patches != 256:
+            idx=self.hayai_ocr_patches.findData(256)
+            self.hayai_ocr_patches.blockSignals(True); self.hayai_ocr_patches.setCurrentIndex(max(0,idx)); self.hayai_ocr_patches.blockSignals(False)
+            patches=256
+        self.hayai_ocr_patches.setEnabled(cfg.hayai_ocr_backend != "litert")
+        cfg.hayai_ocr_max_num_patches=patches
+        cfg.ndlocr_lite_coreml_auto=bool(self.ndlocr_coreml_auto.isChecked())
+        cfg.ndlocr_lite_coreml_compute_units=str(self.ndlocr_coreml_units.currentData() or "ane")
+        self.window.statusBar().showMessage(f"Hayai：{cfg.hayai_ocr_backend} / {cfg.hayai_ocr_quantize} / {patches} patches · NDL CoreML：{cfg.ndlocr_lite_coreml_auto}/{cfg.ndlocr_lite_coreml_compute_units}",2500)
+
     def _role_ocr_changed(self, *_args):
         if not hasattr(self,"source_ocr_backend"):
             return
@@ -839,6 +921,7 @@ class ModelPage(QWidget):
         cfg.external_target_ocr_path = self.external_target_path.text().strip() or None
         cfg.external_source_start_page = int(self.external_source_start.value())
         cfg.external_target_start_page = int(self.external_target_start.value())
+        self._sync_m6_ocr_settings()
         self.window.statusBar().showMessage(f"SOURCE OCR：{src} · TARGET OCR：{tgt}",2500)
 
     def _choose_external_ocr(self, role: str):
@@ -922,19 +1005,50 @@ class ModelPage(QWidget):
             "fast": (.75, .90, 4, 12),
         }
         threads,mps_mem,prefetch,release_every=presets[key]
-        cfg.runtime.cpu_thread_ratio=threads; cfg.runtime.mps_memory_fraction=mps_mem
+        from .accelerator_policy import detect_apple_hardware, recommended_mps_memory_fraction
+        is_m6=bool(detect_apple_hardware().is_m6)
+        if is_m6 and key == "balanced":
+            cfg.runtime.m6_auto=True; cfg.bubbles.m6_auto=True; cfg.runtime.cpu_thread_auto=True; cfg.runtime.mps_memory_auto=True
+            mps_mem=recommended_mps_memory_fraction(detect_apple_hardware())
+        else:
+            cfg.runtime.cpu_thread_auto=False; cfg.runtime.mps_memory_auto=False
+        cfg.runtime.cpu_thread_ratio=threads
+        cfg.runtime.mps_memory_fraction=mps_mem
         cfg.batch.prefetch_workers=prefetch; cfg.runtime.release_cache_every=release_every
         self.thread_ratio.blockSignals(True); self.thread_ratio.setValue(threads); self.thread_ratio.blockSignals(False)
         self.mps_fraction.blockSignals(True); self.mps_fraction.setValue(mps_mem); self.mps_fraction.blockSignals(False)
         self.device_status.setText(f"运行策略：{self.profile.currentText()} · 批量预检 {prefetch} 线程 · 深度推理按设备能力受控执行")
+    def _set_m6_auto(self, checked: bool):
+        cfg=self.window.state.config
+        value=bool(checked)
+        cfg.runtime.m6_auto=value
+        cfg.bubbles.m6_auto=value
+        if value:
+            cfg.runtime.cpu_thread_auto=True
+            cfg.runtime.mps_memory_auto=True
+        self.refresh()
+    def _set_m6_dynamic_resolution(self, checked: bool):
+        value=bool(checked)
+        self.window.state.config.runtime.m6_dynamic_resolution_auto=value
+        self.window.state.config.bubbles.m6_dynamic_resolution_auto=value
+        self.refresh()
     def _set_device(self):
         key=self.device.currentData() or "auto"; cfg=self.window.state.config
         cfg.runtime.device=key; cfg.registration.device=key; cfg.bubbles.device=key; cfg.mask_replace.sr_device=key; cfg.direct_patch.sr_device=key
         self.refresh()
-    def _set_threads(self): self.window.state.config.runtime.cpu_thread_ratio=float(self.thread_ratio.value())
-    def _set_mps_fraction(self): self.window.state.config.runtime.mps_memory_fraction=float(self.mps_fraction.value())
+    def _set_threads(self):
+        cfg=self.window.state.config.runtime
+        cfg.cpu_thread_ratio=float(self.thread_ratio.value()); cfg.cpu_thread_auto=False
+    def _set_mps_fraction(self):
+        cfg=self.window.state.config.runtime
+        cfg.mps_memory_fraction=float(self.mps_fraction.value()); cfg.mps_memory_auto=False
     def refresh(self, force_probe: bool = False):
         cfg=self.window.state.config
+        if hasattr(self, "m6_auto"):
+            for widget, value in ((self.m6_auto, bool(getattr(cfg.runtime, "m6_auto", True))), (self.m6_dynamic_resolution, bool(getattr(cfg.runtime, "m6_dynamic_resolution_auto", True)))):
+                widget.blockSignals(True); widget.setChecked(value); widget.blockSignals(False)
+            cfg.bubbles.m6_auto = bool(getattr(cfg.runtime, "m6_auto", True))
+            cfg.bubbles.m6_dynamic_resolution_auto = bool(getattr(cfg.runtime, "m6_dynamic_resolution_auto", True))
         if hasattr(self, "pipeline_registration"):
             mode=str(getattr(cfg.transfer,"mode","auto") or "auto")
             try:
@@ -943,7 +1057,7 @@ class ModelPage(QWidget):
                 may_ocr=True
             detector_labels={"koharu_layout":"Koharu Layout","mangalens":"MangaLens","rtdetr_v2":"RT-DETR-v2"}
             reg_labels={"auto":"Auto / SIFT","lightglue":"LightGlue","loftr":"LoFTR"}
-            ocr_labels={"apple":"Apple Live Text","apple_shortcut":"Apple Shortcut","paddle_v6_medium":"PaddleOCR v6 M","paddle_v6_small":"PaddleOCR v6 S","paddle_vl_16":"PaddleOCR-VL","manga_ocr":"Manga OCR","baberu_ocr":"Baberu OCR","ocr48px":"48px AR","external":"External OCR","sidecar":"Sidecar","none":"关闭"}
+            ocr_labels={"apple":"Apple Live Text","apple_shortcut":"Apple Shortcut","paddle_v6_medium":"PaddleOCR v6 M","paddle_v6_small":"PaddleOCR v6 S","paddle_vl_16":"PaddleOCR-VL","manga_ocr":"Manga OCR","baberu_ocr":"Baberu OCR","ocr48px":"48px AR","hayai_ocr":"Hayai OCR","ndlocr_lite":"NDLOCR-Lite","external":"External OCR","sidecar":"Sidecar","none":"关闭"}
             inpaint_labels={"auto":"Auto","solid":"Solid","opencv":"OpenCV","lama":"LaMa","lama_manga":"LaMa Manga","aot_inpainting":"AOT","flux2_klein":"FLUX.2","rorem_mixed":"RORem"}
             reg_key=str(getattr(cfg.registration,"backend","auto") or "auto")
             det_key=str(getattr(cfg.bubbles,"primary_detector","koharu_layout") or "koharu_layout")
@@ -1064,7 +1178,21 @@ class ModelPage(QWidget):
             auto_selected = "CUDA" if bool(cuda and cuda.ready) else "CPU / 自动"
             selected=cfg.runtime.device.upper() if cfg.runtime.device != "auto" else auto_selected
             detail=(cuda.detail if cuda is not None else "CUDA 可用性在任务启动时由 PyTorch 验证；不可用时自动回退 CPU。")
-        self.device_status.setText(f"计划设备：{selected} · {detail}")
+        try:
+            from .runtime import runtime_summary
+            summary = runtime_summary(str(getattr(cfg.runtime, "device", "auto")), probe_torch=False)
+            hw = summary.get("hardware", {})
+            policy = summary.get("policy", {})
+            chip = str(hw.get("chip") or hw.get("profile") or "")
+            memory = hw.get("memory_gb")
+            precision = str(policy.get("mps_precision") or "auto")
+            extra = f" · {chip}" if chip else ""
+            if memory:
+                extra += f" · 内存 {memory:g}GB"
+            extra += f" · MPS {precision}"
+        except Exception:
+            extra = ""
+        self.device_status.setText(f"计划设备：{selected} · {detail}{extra}")
         try:
             selected_key=str(self.paddle_model_profile.currentData() or getattr(cfg.ocr,"paddle_model_profile","ppocr_v6_medium"))
             selected_ready,warmed=paddle_profile_marker_status(selected_key)

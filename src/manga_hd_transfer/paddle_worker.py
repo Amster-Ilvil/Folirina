@@ -17,6 +17,30 @@ import os
 from typing import Any
 
 
+def _enable_coreml_onnxruntime(compute_units: str) -> dict[str, Any]:
+    import onnxruntime as ort
+    from manga_hd_transfer.paddle_onnx_coreml_runtime import provider_options
+    available = set(ort.get_available_providers())
+    if "CoreMLExecutionProvider" not in available:
+        raise RuntimeError("ONNX Runtime 未提供 CoreMLExecutionProvider")
+    original = ort.InferenceSession
+    opts = provider_options(compute_units)
+
+    def wrapped(model_path_or_bytes, *args, **kwargs):
+        providers = list(kwargs.get("providers") or [])
+        provider_opts = list(kwargs.get("provider_options") or [])
+        providers = [x for x in providers if x != "CoreMLExecutionProvider"]
+        providers.insert(0, "CoreMLExecutionProvider")
+        opts_list = [opts] + provider_opts
+        kwargs["providers"] = providers
+        kwargs["provider_options"] = opts_list[:len(providers)]
+        return original(model_path_or_bytes, *args, **kwargs)
+
+    ort.InferenceSession = wrapped
+    return {"coreml": True, "provider": "CoreMLExecutionProvider", "compute_units": opts.get("MLComputeUnits")}
+
+
+
 _SKIP_LABELS = {
     "number", "footnote", "header", "header_image", "footer", "footer_image",
     "aside_text", "image", "figure", "chart", "formula", "table", "seal",
@@ -279,6 +303,11 @@ def _exception_detail(exc: BaseException) -> str:
 
 def _engine(args):
     pipeline = str(args.pipeline or "ocr").lower()
+    coreml_info = {}
+    if args.onnx_engine:
+        if pipeline != "ocr":
+            raise RuntimeError("Paddle ONNXRuntime/CoreML bridge 当前仅用于 classic PP-OCR；VL/Structure 保持原生隔离路径。")
+        coreml_info = _enable_coreml_onnxruntime(args.coreml_units)
     if pipeline == "vl":
         from paddleocr import PaddleOCRVL
         return PaddleOCRVL(
@@ -334,7 +363,17 @@ def _engine(args):
         kwargs["text_recognition_model_dir"] = args.rec_dir
     if args.device:
         kwargs["device"] = args.device
-    return PaddleOCR(**kwargs)
+    if args.onnx_engine:
+        import inspect
+        if "engine" not in inspect.signature(PaddleOCR).parameters:
+            raise RuntimeError("当前 PaddleOCR 版本未提供 engine=onnxruntime 接口；已安全回退前置层。")
+        kwargs["engine"] = "onnxruntime"
+    engine = PaddleOCR(**kwargs)
+    try:
+        setattr(engine, "_folirina_coreml_info", coreml_info)
+    except Exception:
+        pass
+    return engine
 
 
 def _predict(engine, path: str, pipeline: str) -> list[dict[str, Any]]:
@@ -383,6 +422,8 @@ def main() -> int:
     p.add_argument("--det-dir", default="")
     p.add_argument("--rec-dir", default="")
     p.add_argument("--device", default="")
+    p.add_argument("--onnx-engine", action="store_true", help="classic PP-OCR: use PaddleOCR engine=onnxruntime and scoped CoreML EP")
+    p.add_argument("--coreml-units", default="ane", choices=["ane", "gpu", "all", "cpu"])
     p.add_argument("--preheat", action="store_true")
     p.add_argument("--probe", action="store_true", help="initialize/download models and exit")
     args = p.parse_args()
@@ -391,6 +432,7 @@ def main() -> int:
     except Exception as exc:
         _emit({"ok": False, "type": "init", "error": _exception_detail(exc)})
         return 2
+    coreml_info = dict(getattr(engine, "_folirina_coreml_info", {}) or {})
     _emit({
         "ok": True, "type": "probe" if args.probe else "ready", "pid": os.getpid(),
         "model_source": os.environ.get("PADDLE_PDX_MODEL_SOURCE", "local" if args.det_dir and args.rec_dir else "default"),
@@ -400,6 +442,8 @@ def main() -> int:
         "model_profile": "local_dirs" if args.det_dir and args.rec_dir else args.model_profile,
         "text_detection_model_name": args.det_name or None,
         "text_recognition_model_name": args.rec_name or None,
+        "onnx_engine": bool(args.onnx_engine), "coreml": bool(coreml_info),
+        "coreml_units": str(args.coreml_units),
     })
     if args.preheat or args.probe:
         return 0

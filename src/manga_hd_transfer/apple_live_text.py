@@ -38,6 +38,7 @@ if TYPE_CHECKING:  # pragma: no cover
 
 ROOT = Path(__file__).resolve().parents[2]
 HELPER_SOURCE = ROOT / "tools" / "apple_live_text_helper" / "AppleLiveTextOCRHelper.swift"
+HELPER_OBJC_SOURCE = ROOT / "tools" / "apple_live_text_helper" / "AppleLiveTextOCRHelper.m"
 HELPER_BINARY = ROOT / "tools" / "apple_live_text_helper" / "bin" / "apple_live_text_helper"
 HELPER_BUILD = ROOT / "build_apple_live_text_helper.command"
 
@@ -64,15 +65,20 @@ def ensure_live_text_helper() -> Path:
     # LiveTextHelperBackend. Older macOS versions still use the Shortcut route.
     if _mac_version_major() < 15:
         raise AppleLiveTextInfrastructureError("Swift VisionKit Live Text Helper 需要 macOS 15 或更高版本")
-    if not HELPER_SOURCE.exists():
-        raise AppleLiveTextInfrastructureError(f"缺少 Swift Live Text Helper 源码：{HELPER_SOURCE}")
+    helper_sources = tuple(path for path in (HELPER_OBJC_SOURCE, HELPER_SOURCE) if path.exists())
+    if not helper_sources:
+        raise AppleLiveTextInfrastructureError("缺少 Apple Live Text Helper 源码")
     needs_build = not HELPER_BINARY.exists()
     if HELPER_BINARY.exists():
         try:
-            needs_build = HELPER_BINARY.stat().st_mtime < HELPER_SOURCE.stat().st_mtime
+            needs_build = HELPER_BINARY.stat().st_mtime < max(path.stat().st_mtime for path in helper_sources)
         except OSError:
             needs_build = True
     if not needs_build:
+        # ZIP extractors may drop Unix execute bits while preserving mtime.
+        # A valid bundled helper must not silently fall back to Shortcuts.
+        if not os.access(HELPER_BINARY, os.X_OK):
+            HELPER_BINARY.chmod(HELPER_BINARY.stat().st_mode | 0o100)
         return HELPER_BINARY
     if not shutil.which("xcrun"):
         raise AppleLiveTextInfrastructureError("未找到 xcrun，请先安装 Xcode Command Line Tools")
@@ -80,14 +86,14 @@ def ensure_live_text_helper() -> Path:
         raise AppleLiveTextInfrastructureError(f"缺少编译脚本：{HELPER_BUILD}")
     try:
         result = subprocess.run(
-            [str(HELPER_BUILD)], cwd=str(ROOT), capture_output=True, text=True,
+            ["/bin/zsh", str(HELPER_BUILD)], cwd=str(ROOT), capture_output=True, text=True,
             timeout=180,
         )
     except Exception as exc:
-        raise AppleLiveTextInfrastructureError(f"Swift Live Text Helper 编译失败：{exc}") from exc
+        raise AppleLiveTextInfrastructureError(f"Apple Live Text Helper 编译失败：{exc}") from exc
     if result.returncode != 0 or not HELPER_BINARY.exists():
-        detail = (result.stderr or result.stdout or "Swift Helper 编译失败").strip()
-        raise AppleLiveTextInfrastructureError(f"Swift Live Text Helper 编译失败：{detail}")
+        detail = (result.stderr or result.stdout or "原生 Helper 编译失败").strip()
+        raise AppleLiveTextInfrastructureError(f"Apple Live Text Helper 编译失败：{detail}")
     return HELPER_BINARY
 
 
@@ -115,7 +121,7 @@ class _JSONLineClient:
     def request(self, payload: dict, timeout: float) -> dict:
         if self.process.poll() is not None:
             raise AppleLiveTextInfrastructureError(
-                f"Swift Live Text Helper 已退出：{self._stderr_tail() or self.process.returncode}"
+                f"Apple Live Text Helper 已退出：{self._stderr_tail() or self.process.returncode}"
             )
         assert self.process.stdin is not None and self.process.stdout is not None
         self.process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -125,23 +131,23 @@ class _JSONLineClient:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 self.close()
-                raise AppleLiveTextInfrastructureError("Swift Live Text Helper OCR 超时，已终止 Helper")
+                raise AppleLiveTextInfrastructureError("Apple Live Text Helper OCR 超时，已终止 Helper")
             ready, _, _ = select.select([self.process.stdout], [], [], min(0.25, remaining))
             if ready:
                 break
             if self.process.poll() is not None:
                 raise AppleLiveTextInfrastructureError(
-                    f"Swift Live Text Helper 异常退出：{self._stderr_tail() or self.process.returncode}"
+                    f"Apple Live Text Helper 异常退出：{self._stderr_tail() or self.process.returncode}"
                 )
         line = self.process.stdout.readline()
         if not line:
             raise AppleLiveTextInfrastructureError(
-                f"Swift Live Text Helper 未返回结果：{self._stderr_tail()}"
+                f"Apple Live Text Helper 未返回结果：{self._stderr_tail()}"
             )
         try:
             return json.loads(line)
         except json.JSONDecodeError as exc:
-            raise AppleLiveTextInfrastructureError(f"Swift Live Text Helper 返回了无效 JSON：{line[:300]}") from exc
+            raise AppleLiveTextInfrastructureError(f"Apple Live Text Helper 返回了无效 JSON：{line[:300]}") from exc
 
     def close(self) -> None:
         proc = getattr(self, "process", None)
@@ -283,7 +289,7 @@ class AppleVisionKitLiveTextBackend(_TextOnlyBase):
                 self.close()
                 raise
             if not bool(response.get("success")):
-                error = str(response.get("error") or "Swift VisionKit Live Text OCR 失败")
+                error = str(response.get("error") or "Apple Vision Live Text OCR 失败")
                 raise AppleLiveTextError(error)
             return self._block(image, str(response.get("text") or ""), "apple_live_text")
         finally:
@@ -358,12 +364,30 @@ class AppleAutoLiveTextBackend(_TextOnlyBase):
         return self._shortcut
 
     def recognize(self, image: np.ndarray, *, image_path: str | Path | None = None) -> list[TextBlock]:
+        empty_helper = False
+        native_blocks = []
+        short_helper = False
         if not self._helper_disabled:
             try:
                 blocks = self._get_helper().recognize(image, image_path=image_path)
                 for b in blocks:
                     b.meta["apple_auto_route"] = "visionkit_live_text"
-                return blocks
+                native_blocks = blocks
+                transcript = ''.join(b.text for b in blocks)
+                cjk_count = sum('\u3400' <= c <= '\u9fff' for c in transcript)
+                # Vision sometimes returns only the first vertical column with
+                # a successful status. Retry the system transcript route when
+                # a short Chinese result contradicts substantial compact ink.
+                if blocks and self.lang.lower() in {'ch', 'chi_sim', 'zh', 'zh-hans', 'zh-cn'} and cjk_count <= 8:
+                    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+                    _, _, stats, _ = cv2.connectedComponentsWithStats((gray < 180).astype(np.uint8), 8)
+                    compact = sum(12 <= a <= 2000 and 3 <= w <= 60 and 3 <= h <= 60 for x, y, w, h, a in stats[1:])
+                    short_helper = compact >= max(6, cjk_count * 2)
+                if blocks and not short_helper:
+                    return blocks
+                # Vision can return success with no transcript for vertical
+                # manga text that ImageAnalyzer/Shortcuts can still read.
+                empty_helper = not blocks
             except Exception as exc:
                 self._helper_disabled = True
                 self._last_fallback_reason = f"{type(exc).__name__}: {exc}"
@@ -373,6 +397,8 @@ class AppleAutoLiveTextBackend(_TextOnlyBase):
                 finally:
                     self._helper = None
         if self._shortcut_disabled:
+            if native_blocks:
+                return native_blocks
             if bool(getattr(self.config, "apple_live_text_soft_fail", True)):
                 return []
             raise AppleLiveTextInfrastructureError(self._all_unavailable_reason or "Apple OCR 后端均不可用")
@@ -385,12 +411,18 @@ class AppleAutoLiveTextBackend(_TextOnlyBase):
                 f"Shortcut: {type(exc).__name__}: {exc}"
             )
             if bool(getattr(self.config, "apple_live_text_soft_fail", True)):
-                return []
+                return native_blocks
             raise
+        if native_blocks and len(''.join(b.text.strip() for b in blocks)) <= len(''.join(b.text.strip() for b in native_blocks)):
+            return native_blocks
         for b in blocks:
             b.meta["apple_auto_route"] = "shortcut"
             if self._last_fallback_reason:
                 b.meta["apple_live_text_fallback_reason"] = self._last_fallback_reason
+            elif empty_helper:
+                b.meta["apple_live_text_fallback_reason"] = "visionkit_empty_result"
+            elif short_helper:
+                b.meta["apple_live_text_fallback_reason"] = "vision_short_transcript_with_compact_ink"
         return blocks
 
     def close(self) -> None:
@@ -405,7 +437,7 @@ def apple_live_text_probe(config: "OCRConfig" | None = None) -> dict[str, object
     is_mac = platform.system() == "Darwin"
     return {
         "platform": platform.system(),
-        "visionkit_source": HELPER_SOURCE.exists(),
+        "visionkit_source": HELPER_SOURCE.exists() or HELPER_OBJC_SOURCE.exists(),
         "visionkit_binary": HELPER_BINARY.exists(),
         "xcrun": bool(shutil.which("xcrun")) if is_mac else False,
         "shortcuts": bool(shutil.which("shortcuts")) if is_mac else False,

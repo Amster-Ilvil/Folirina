@@ -167,8 +167,13 @@ def compose_reveal_patch(
     *,
     transparent_feather_px: int = 3,
     transparent_opacity: float = 1.0,
+    target_bgr: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return live preview BGR and exact replayable BGRA underlay patch."""
+    """Clean TARGET ink in the stroke, then reveal SOURCE ink over its colour.
+
+    The saved patch includes both cleaned background pixels and SOURCE ink so
+    replay has exactly the same erase-before-reveal order as the live preview.
+    """
     if base_bgr.shape != underlay_bgr.shape or base_bgr.ndim != 3 or base_bgr.shape[2] != 3:
         raise ValueError("brush reveal base/underlay shape mismatch")
     if transparent_mask.shape != base_bgr.shape[:2] or hole_mask.shape != base_bgr.shape[:2]:
@@ -178,13 +183,82 @@ def compose_reveal_patch(
         transparent_feather_px=transparent_feather_px,
         transparent_opacity=transparent_opacity,
     )
+    # Transparent strokes reveal neutral dark ink, not SOURCE paper or colour.
+    # Hole strokes deliberately retain their exact full-underlay semantics.
+    channels = underlay_bgr.astype(np.float32)
+    darkest = channels.min(axis=2)
+    brightest = channels.max(axis=2)
+    ink = np.clip((225.0 - brightest) / 45.0, 0.0, 1.0)
+    ink *= (brightest - darkest <= 45.0)
+    transparent_alpha = alpha.astype(np.float32) * ink
+    support = (transparent_mask > 0) & (hole_mask == 0)
+    reference = base_bgr if target_bgr is None else target_bgr
+    if reference.shape != base_bgr.shape:
+        raise ValueError("brush TARGET reference shape mismatch")
+    ref_max = reference.max(axis=2)
+    ref_min = reference.min(axis=2)
+    local_paper = cv2.morphologyEx(ref_max, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    neutral_faint_ink = ((ref_max < 245)
+                        & ((ref_max.astype(np.int16) - ref_min.astype(np.int16)) <= 25)
+                        & (local_paper.astype(np.int16) - ref_max.astype(np.int16) >= 8))
+    clear = (((ref_max < 210) | neutral_faint_ink) & support).astype(np.uint8) * 255
+    # A manual transparent brush explicitly authorises TARGET ink cleanup.
+    # The old SOURCE-ink prerequisite made a Japanese glyph return unchanged
+    # when the paired Chinese area happened to be blank or offset.
+    if np.any(clear):
+        clear = cv2.dilate(clear, np.ones((5, 5), np.uint8))
+        clear[~support] = 0
+        # Telea on the entire 256-320px preview tile is needlessly expensive
+        # for a 20px Japanese stroke. Work on the tight dirty ROI plus enough
+        # context for the 3px inpainting neighbourhood. This also makes each
+        # brush stroke independent of the page's total pixel count.
+        xx,yy,ww,hh=cv2.boundingRect(cv2.findNonZero(clear))
+        pad=12
+        xa=max(0,xx-pad); ya=max(0,yy-pad)
+        xb=min(reference.shape[1],xx+ww+pad); yb=min(reference.shape[0],yy+hh+pad)
+        cleaned=reference.copy()
+        tile=cv2.inpaint(reference[ya:yb,xa:xb],clear[ya:yb,xa:xb],3,cv2.INPAINT_TELEA)
+        local=clear[ya:yb,xa:xb]>0
+        cleaned_roi=cleaned[ya:yb,xa:xb]
+        cleaned_roi[local]=tile[local]
+    else:
+        clear[:] = 0
+        cleaned = reference
+    # The clean background owns erased pixels fully, but SOURCE still obeys
+    # the requested opacity and feather even where it overlaps erased ink.
+    ink_a = (ink * np.where(clear > 0, alpha.astype(np.float32) / 255.0, 1.0))[:, :, None]
+    replacement = np.clip(cleaned.astype(np.float32) * (1.0 - ink_a) + channels * ink_a, 0, 255).astype(np.uint8)
+    # Publication covers cleanup as well as ink, while preserving stroke
+    # feather/opacity. Never use SOURCE white as the fill.
+    # Erasure must complete before source opacity/feather is applied. Mixing
+    # the original Japanese back into a cleaned pixel leaves ghost strokes.
+    publish_alpha = np.where(clear > 0, 255, np.where(transparent_alpha > 0, alpha, 0))
+    # Do not publish the *entire* stroke from the original TARGET. In a review
+    # session base may already contain accepted Chinese/art edits: publishing
+    # untouched TARGET pixels over them causes the infamous "Japanese comes
+    # back after a brush stroke" regression. Only cleaned or added ink owns
+    # pixels in the transparent stroke; a hole is an explicit full reveal.
+    if target_bgr is not None:
+        # Exception: a previously bleached WHITE patch on coloured TARGET is
+        # an obvious non-canonical artifact that should be restored. Existing
+        # dark Chinese glyphs remain protected from TARGET overwrites.
+        # A white pixel over a *black TARGET glyph* is usually a previously
+        # accepted JP cleanup, NOT damage. Restoring TARGET there would visibly
+        # resurrect Japanese on the next stroke. Only restore white damage on
+        # clearly coloured (non-ink) TARGET backgrounds.
+        ref_min=reference.min(axis=2); ref_max=reference.max(axis=2)
+        coloured_target=(ref_max>=210)&(ref_min>=25)&((ref_max.astype(np.int16)-ref_min.astype(np.int16))>=30)
+        white_damage=support & (base_bgr.min(axis=2)>=250) & coloured_target
+        publish_alpha = np.where(white_damage, alpha, publish_alpha)
+    replacement = np.where((hole_mask > 0)[:, :, None], underlay_bgr, replacement)
+    alpha = np.where(hole_mask > 0, alpha, publish_alpha).astype(np.uint8)
     a = alpha.astype(np.float32)[:, :, None] / 255.0
     preview = np.clip(
-        base_bgr.astype(np.float32) * (1.0 - a) + underlay_bgr.astype(np.float32) * a,
+        base_bgr.astype(np.float32) * (1.0 - a) + replacement.astype(np.float32) * a,
         0, 255,
     ).astype(np.uint8)
     patch = np.zeros((base_bgr.shape[0], base_bgr.shape[1], 4), np.uint8)
-    patch[:, :, :3] = underlay_bgr
+    patch[:, :, :3] = replacement
     patch[:, :, 3] = alpha
     return preview, patch
 

@@ -102,7 +102,12 @@ def _build_page_pairs_from_alignment(
     page_pairs: list[PagePair] = []
     for si, tj in reversed(pairs_rev):
         c = cost_lookup(si, tj)
-        if c.total > cfg.max_pair_cost:
+        hard_structure_mismatch = bool(
+            c.edge_cost >= float(getattr(cfg, "smart_hard_edge_reject", 0.72))
+            and c.hash_cost >= float(getattr(cfg, "smart_hard_hash_reject", 0.18))
+            and c.total >= float(getattr(cfg, "smart_hard_total_reject", 0.24))
+        )
+        if c.total > cfg.max_pair_cost or hard_structure_mismatch:
             unmatched_source.append(si)
             unmatched_target.append(tj)
             continue

@@ -20,6 +20,31 @@ from .ocr import OCRBackend, NullOCRBackend, RetryingOCRBackend, build_backend
 logger = logging.getLogger(__name__)
 
 
+def _set_ocr_stats(
+    stats: dict[str, Any],
+    role: str,
+    *,
+    route: str,
+    route_entered: bool,
+    backend: OCRBackend,
+    model_invoked: bool,
+    evidence_available: bool,
+) -> None:
+    """Record truthful OCR execution semantics alongside the legacy route string.
+
+    ``route_entered`` means the mode reached an OCR decision point.  It is not
+    equivalent to invoking a recognition model: a missing/Null backend is a
+    valid route outcome and must never be reported as OCR usage.  Cache hits
+    consume OCR evidence without invoking the model in the current run.
+    """
+    stats[f"ocr_{role}"] = str(route)
+    stats[f"ocr_{role}_route_entered"] = bool(route_entered)
+    stats[f"ocr_{role}_backend"] = type(backend).__name__
+    stats[f"ocr_{role}_backend_available"] = not isinstance(backend, NullOCRBackend)
+    stats[f"ocr_{role}_model_invoked"] = bool(model_invoked)
+    stats[f"ocr_{role}_evidence_available"] = bool(evidence_available)
+
+
 def build_ocr_backend_soft(
     ocr_config: Any,
     lang: str,
@@ -31,13 +56,28 @@ def build_ocr_backend_soft(
     """Build one OCR backend while preserving the project's optional-backend policy."""
     try:
         backend = build_backend(ocr_config, lang, backend_name, role=role)
-    except (RuntimeError, ImportError, ModuleNotFoundError) as exc:
+    except (RuntimeError, ImportError, ModuleNotFoundError, ValueError) as exc:
         if not bool(getattr(ocr_config, "soft_fail_missing_backend", True)):
             raise
         message = f"OCR backend {backend_name!r} unavailable: {exc}"
-        logger.warning("%s; continuing without OCR evidence", message)
         if soft_failures is not None:
             soft_failures.append(message)
+        fallback_name = str(getattr(ocr_config, "soft_fail_fallback_backend", "tesseract") or "").strip().lower()
+        if fallback_name and fallback_name not in {"none", backend_name.lower().strip()}:
+            try:
+                backend = build_backend(ocr_config, lang, fallback_name, role=role)
+                fallback_msg = f"{message}; fallback -> {fallback_name!r}"
+                logger.warning("%s", fallback_msg)
+                if soft_failures is not None:
+                    soft_failures.append(fallback_msg)
+                return backend
+            except (RuntimeError, ImportError, ModuleNotFoundError, ValueError) as fallback_exc:
+                fallback_message = f"OCR fallback {fallback_name!r} unavailable: {fallback_exc}"
+                logger.warning("%s; continuing without OCR evidence", fallback_message)
+                if soft_failures is not None:
+                    soft_failures.append(fallback_message)
+        else:
+            logger.warning("%s; continuing without OCR evidence", message)
         return NullOCRBackend()
 
     if (
@@ -63,8 +103,18 @@ def recognize_cached(
     ocr_config: Any,
     cache: PageStageCache,
     cache_enabled: bool,
-    stats: dict[str, str],
+    stats: dict[str, Any],
 ) -> list:
+    # NullOCR is an explicit no-evidence route.  Do not load/save empty cache
+    # entries under it: that would let a later receipt claim a cache hit even
+    # though no recognizer has ever evaluated the image.
+    if isinstance(backend, NullOCRBackend):
+        _set_ocr_stats(
+            stats, role, route="null_backend", route_entered=True, backend=backend,
+            model_invoked=False, evidence_available=False,
+        )
+        return []
+
     sig = image_stage_signature(
         image_path,
         ocr_config,
@@ -77,12 +127,18 @@ def recognize_cached(
     if cache_enabled:
         hit = cache.load_blocks(role, sig)
         if hit is not None:
-            stats[f"ocr_{role}"] = "hit"
+            _set_ocr_stats(
+                stats, role, route="hit", route_entered=True, backend=backend,
+                model_invoked=False, evidence_available=True,
+            )
             return hit
     blocks = backend.recognize(image, image_path=image_path)
     if cache_enabled:
         cache.save_blocks(role, sig, blocks)
-    stats[f"ocr_{role}"] = "miss"
+    _set_ocr_stats(
+        stats, role, route="miss", route_entered=True, backend=backend,
+        model_invoked=True, evidence_available=True,
+    )
     return blocks
 
 
@@ -104,8 +160,15 @@ def recognize_source_rectified_cached(
     ocr_config: Any,
     cache: PageStageCache,
     cache_enabled: bool,
-    stats: dict[str, str],
+    stats: dict[str, Any],
 ) -> list:
+    if isinstance(backend, NullOCRBackend):
+        _set_ocr_stats(
+            stats, "source", route="null_backend", route_entered=True, backend=backend,
+            model_invoked=False, evidence_available=False,
+        )
+        return []
+
     H = transform_to_homography(registration.matrix)
     th, tw = target_shape
     rect_scale = 1.0
@@ -140,7 +203,10 @@ def recognize_source_rectified_cached(
     if cache_enabled:
         hit = cache.load_blocks("source", sig)
         if hit is not None:
-            stats["ocr_source"] = "hit_rectified"
+            _set_ocr_stats(
+                stats, "source", route="hit_rectified", route_entered=True, backend=backend,
+                model_invoked=False, evidence_available=True,
+            )
             return hit
 
     rectified = cv2.warpPerspective(
@@ -163,7 +229,10 @@ def recognize_source_rectified_cached(
         block.meta["ocr_rectified_scale"] = float(rect_scale)
     if cache_enabled:
         cache.save_blocks("source", sig, blocks)
-    stats["ocr_source"] = "miss_rectified"
+    _set_ocr_stats(
+        stats, "source", route="miss_rectified", route_entered=True, backend=backend,
+        model_invoked=True, evidence_available=True,
+    )
     return blocks
 
 

@@ -185,16 +185,41 @@ class ReletterExecutor:
                 (sx0, sy0, sx1, sy1), recovered_from_truncation, source_projection_coverage = _recover_source_crop_bbox(
                     matched_bbox, tuple(int(v) for v in projected_bbox), tuple(int(round(v)) for v in sb.bbox), (sh, sw)
                 )
+                source_crop_padding_applied = False
                 if recovered_from_truncation:
                     source_crop_route = "target_projection_recovered_truncated_source_region"
                 elif matched_source_region is not None:
                     source_crop_route = "paired_source_subregion"
                 else:
                     source_crop_route = "normalized_target_projection"
+                # One transcript belongs to the whole paired SOURCE container,
+                # not the shorter Japanese ink envelope. Multi-region bubbles
+                # retain subregion binding to avoid duplicated transcripts.
+                if (len(regions) == 1 and len(source_regions) <= 1
+                        and bool(getattr(backend, "region_text_only", False))):
+                    # Transcript-only fallback OCR needs a small amount of paper
+                    # around the detected container. Cropping exactly on the
+                    # balloon polygon lets border strokes touch the OCR frame and
+                    # sharply lowers confidence on otherwise clean vertical CJK.
+                    # Use a bounded padding based on the *short* container side so
+                    # context is restored without admitting nearby panel art.
+                    sbw = max(1.0, float(sb.bbox[2] - sb.bbox[0]))
+                    sbh = max(1.0, float(sb.bbox[3] - sb.bbox[1]))
+                    context_pad = max(4, min(12, int(round(min(sbw, sbh) * 0.04))))
+                    sx0, sy0, sx1, sy1 = (
+                        max(0, int(np.floor(sb.bbox[0])) - context_pad),
+                        max(0, int(np.floor(sb.bbox[1])) - context_pad),
+                        min(sw, int(np.ceil(sb.bbox[2])) + context_pad),
+                        min(sh, int(np.ceil(sb.bbox[3])) + context_pad),
+                    )
+                    recovered_from_truncation = True
+                    source_crop_padding_applied = True
+                    source_crop_route = "single_region_source_container"
                 if sx1 - sx0 < 4 or sy1 - sy0 < 4:
                     continue
 
                 crop = source[sy0:sy1, sx0:sx1].copy()
+                unmasked_crop = crop.copy()
                 local_mask = None
                 # A recovered crop must not reuse the truncated SOURCE text mask;
                 # doing so would whiten the newly recovered lower/right glyphs
@@ -212,7 +237,13 @@ class ReletterExecutor:
                 ):
                     local_mask = sb.mask[sy0:sy1, sx0:sx1]
                 if local_mask is not None and local_mask.size and cv2.countNonZero(local_mask) > 0:
-                    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+                    mask_scale = min(
+                        max(1.0, float(sb.bbox[2] - sb.bbox[0])),
+                        max(1.0, float(sb.bbox[3] - sb.bbox[1])),
+                    )
+                    mask_k = max(3, int(round(mask_scale * 0.025)) | 1)
+                    mask_k = min(mask_k, 11)
+                    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (mask_k, mask_k))
                     local_mask = cv2.dilate((local_mask > 0).astype(np.uint8) * 255, k, iterations=1)
                     crop[local_mask == 0] = 255
 
@@ -222,10 +253,14 @@ class ReletterExecutor:
                 if bool(getattr(backend, "supports_crop_recognition", True)) and not bool(
                     getattr(backend, "supports_region_query", False)
                 ):
-                    raw = backend.recognize(crop, image_path=None)
-                    ocr_route = "masked_crop"
+                    if hasattr(backend, "recognize_manga_region"):
+                        raw = backend.recognize_manga_region(crop, orientation=region.orientation)
+                        ocr_route = "masked_crop_manga_orientation"
+                    else:
+                        raw = backend.recognize(crop, image_path=None)
+                        ocr_route = "masked_crop"
                     query_diag = {
-                        "route": "masked_crop",
+                        "route": ocr_route,
                         "input_blocks": len(raw),
                         "accepted_blocks": len(raw),
                     }
@@ -243,6 +278,8 @@ class ReletterExecutor:
                     )
                     ocr_route = "region_query"
 
+                if not raw and getattr(backend, "_all_unavailable_reason", ""):
+                    raise RuntimeError("Apple OCR 后端不可用（不是页面无文字）：" + backend._all_unavailable_reason)
                 text_value, ocr_norm_diag = normalize_region_ocr_text(raw, region.orientation)
                 ocr_norm_diag["region_query"] = query_diag
                 if not text_value:
@@ -257,7 +294,178 @@ class ReletterExecutor:
                     continue
 
                 confs = [float(x.confidence) for x in raw if str(x.text).strip()]
-                conf = float(np.mean(confs)) if confs else 0.88
+                raw_backend = str((raw[0].meta or {}).get("backend", "") if raw else "").lower()
+                # Tesseract vertical manga OCR is column-based. One difficult
+                # glyph column should not drag an otherwise stable transcript
+                # below the global acceptance threshold, so use the robust
+                # median for this fallback only. Other OCR engines keep their
+                # historical mean-confidence semantics.
+                conf = (
+                    float(np.median(confs)) if confs and raw_backend == "tesseract"
+                    else float(np.mean(confs)) if confs
+                    else 0.88
+                )
+                if raw_backend == "tesseract":
+                    cjk_count = sum(
+                        1 for ch in str(text_value)
+                        if "\u3040" <= ch <= "\u30ff" or "\u3400" <= ch <= "\u9fff"
+                    )
+                    # Masking protects nearby artwork, but on some photographed
+                    # balloons it clips antialiased edge strokes and depresses OCR
+                    # confidence. Retry the same bounded crop without whitening only
+                    # when the masked result is below the publication threshold,
+                    # then keep whichever transcript has stronger CJK evidence.
+                    compare_unmasked = bool(
+                        hasattr(backend, "recognize_manga_region")
+                        and (
+                            conf < float(getattr(self.config.qa, "ocr_min_confidence", 0.66))
+                            or float(source_projection_coverage) < float(getattr(
+                                self.config.ocr, "tesseract_unmasked_compare_projection_coverage", 0.72
+                            ))
+                        )
+                    )
+                    masked_text_before_compare = str(text_value or "")
+                    masked_conf_before_compare = float(conf)
+                    masked_unmasked_material_disagreement = False
+                    if compare_unmasked:
+                        alt_raw = backend.recognize_manga_region(
+                            unmasked_crop, orientation=region.orientation
+                        )
+                        alt_text, alt_norm = normalize_region_ocr_text(alt_raw, region.orientation)
+                        alt_confs = [float(x.confidence) for x in alt_raw if str(x.text).strip()]
+                        alt_conf = float(np.mean(alt_confs)) if alt_confs else 0.0
+                        alt_cjk = sum(
+                            1 for ch in str(alt_text)
+                            if "\u3040" <= ch <= "\u30ff" or "\u3400" <= ch <= "\u9fff"
+                        )
+                        current_score = (int(cjk_count > 0), min(cjk_count, 24), float(conf))
+                        alt_score = (int(alt_cjk > 0), min(alt_cjk, 24), float(alt_conf))
+                        if alt_text and masked_text_before_compare and alt_text != masked_text_before_compare:
+                            import difflib
+                            def _cjk_only(value: str) -> str:
+                                return "".join(
+                                    ch for ch in str(value or "")
+                                    if "\u3040" <= ch <= "\u30ff" or "\u3400" <= ch <= "\u9fff"
+                                )
+                            masked_cjk_text = _cjk_only(masked_text_before_compare)
+                            alt_cjk_text = _cjk_only(alt_text)
+                            ratio = difflib.SequenceMatcher(
+                                None, masked_cjk_text, alt_cjk_text, autojunk=False
+                            ).ratio() if masked_cjk_text and alt_cjk_text else 0.0
+                            same_length_substitution = bool(
+                                masked_cjk_text and alt_cjk_text
+                                and len(masked_cjk_text) == len(alt_cjk_text)
+                                and masked_cjk_text != alt_cjk_text
+                            )
+                            masked_unmasked_material_disagreement = bool(
+                                same_length_substitution
+                                or ratio < float(getattr(
+                                    self.config.ocr, "tesseract_unmasked_disagreement_min_ratio", 0.96
+                                ))
+                            )
+                            alt_review_flag = any(
+                                bool((getattr(child, "meta", {}) or {}).get("column_consensus_review_required"))
+                                for child in alt_raw
+                            )
+                            alt_clearly_dominates = bool(
+                                alt_conf >= masked_conf_before_compare + float(getattr(
+                                    self.config.ocr, "tesseract_unmasked_override_confidence_gain", 0.10
+                                ))
+                                and not alt_review_flag
+                            )
+                            ocr_norm_diag["masked_unmasked_compare"] = {
+                                "masked_text": masked_text_before_compare,
+                                "unmasked_text": str(alt_text),
+                                "masked_confidence": masked_conf_before_compare,
+                                "unmasked_confidence": float(alt_conf),
+                                "cjk_similarity": float(ratio),
+                                "source_projection_coverage": float(source_projection_coverage),
+                                "unmasked_clearly_dominates": bool(alt_clearly_dominates),
+                            }
+                            if masked_unmasked_material_disagreement and not alt_clearly_dominates:
+                                ocr_norm_diag.setdefault("fallback_review_reasons", [])
+                                if "masked_unmasked_ocr_disagreement" not in ocr_norm_diag["fallback_review_reasons"]:
+                                    ocr_norm_diag["fallback_review_reasons"].append("masked_unmasked_ocr_disagreement")
+                        if alt_text and (alt_conf >= conf + 0.03 or alt_score > current_score):
+                            raw = alt_raw
+                            text_value = alt_text
+                            conf = alt_conf
+                            cjk_count = alt_cjk
+                            previous_review_reasons = list(ocr_norm_diag.get("fallback_review_reasons", []) or [])
+                            previous_compare = ocr_norm_diag.get("masked_unmasked_compare")
+                            ocr_norm_diag = alt_norm
+                            if previous_review_reasons:
+                                ocr_norm_diag["fallback_review_reasons"] = previous_review_reasons
+                            if previous_compare is not None:
+                                ocr_norm_diag["masked_unmasked_compare"] = previous_compare
+                            ocr_norm_diag["region_query"] = {
+                                **dict(query_diag),
+                                "route": str(query_diag.get("route", ocr_route)) + "_unmasked_retry",
+                                "masked_confidence": float(current_score[2]),
+                                "unmasked_confidence": float(alt_conf),
+                            }
+                            ocr_route = str(ocr_route) + "_unmasked_retry"
+                    # Do not let a median region confidence hide one structurally
+                    # unreliable CJK column.  Tesseract is a cloud/runtime fallback,
+                    # so incomplete consensus or a near-zero glyph column must be
+                    # review-only instead of silently entering publication pixels.
+                    cjk_child_confidences = []
+                    consensus_coverages = []
+                    consensus_agreements = []
+                    for child in raw:
+                        child_text = str(getattr(child, "text", "") or "")
+                        child_cjk = sum(
+                            1 for ch in child_text
+                            if "\u3040" <= ch <= "\u30ff" or "\u3400" <= ch <= "\u9fff"
+                        )
+                        if child_cjk > 0:
+                            cjk_child_confidences.append(float(getattr(child, "confidence", 0.0) or 0.0))
+                        child_meta = dict(getattr(child, "meta", {}) or {})
+                        if bool(child_meta.get("column_consensus")):
+                            consensus_coverages.append(float(child_meta.get("consensus_char_coverage", 0.0) or 0.0))
+                            consensus_agreements.append(float(child_meta.get("consensus_pairwise_agreement", 0.0) or 0.0))
+                        if bool(child_meta.get("column_consensus_review_required")):
+                            ocr_norm_diag.setdefault("fallback_review_reasons", [])
+                            if "unresolved_column_consensus" not in ocr_norm_diag["fallback_review_reasons"]:
+                                ocr_norm_diag["fallback_review_reasons"].append("unresolved_column_consensus")
+                    min_child = min(cjk_child_confidences) if cjk_child_confidences else 1.0
+                    min_consensus_coverage = min(consensus_coverages) if consensus_coverages else 1.0
+                    min_consensus_agreement = min(consensus_agreements) if consensus_agreements else 1.0
+                    review_reasons = list(ocr_norm_diag.get("fallback_review_reasons", []) or [])
+                    if min_child < float(getattr(self.config.ocr, "tesseract_region_review_min_child_confidence", 0.35)):
+                        review_reasons.append("weak_cjk_column")
+                    if min_consensus_coverage < float(getattr(self.config.ocr, "tesseract_region_review_min_consensus_coverage", 0.90)):
+                        review_reasons.append("incomplete_column_consensus")
+                    if min_consensus_agreement < float(getattr(self.config.ocr, "tesseract_region_review_min_consensus_agreement", 0.55)):
+                        review_reasons.append("low_column_consensus_agreement")
+                    if review_reasons:
+                        conf = min(
+                            conf,
+                            float(getattr(self.config.ocr, "tesseract_region_review_confidence_cap", 0.64)),
+                        )
+                        ocr_norm_diag["fallback_review_reasons"] = list(review_reasons)
+                        ocr_norm_diag["fallback_min_child_confidence"] = float(min_child)
+                        ocr_norm_diag["fallback_min_consensus_coverage"] = float(min_consensus_coverage)
+                        ocr_norm_diag["fallback_min_consensus_agreement"] = float(min_consensus_agreement)
+                    reject_fallback = (
+                        cjk_count <= 0
+                        or (cjk_count == 1 and conf < 0.82)
+                        or (2 <= cjk_count <= 5 and conf < 0.35)
+                        or (cjk_count >= 6 and conf < 0.25)
+                    )
+                    if reject_fallback:
+                        stats["ocr_source_fallback_quality_rejected"] = int(
+                            stats.get("ocr_source_fallback_quality_rejected", 0) or 0
+                        ) + 1
+                        region_rows.append({
+                            "region_id": region.id,
+                            "target_bubble_id": tb.id,
+                            "source_bbox": [sx0, sy0, sx1, sy1],
+                            "status": "fallback_ocr_quality_rejected",
+                            "confidence": float(conf),
+                            "cjk_count": int(cjk_count),
+                        })
+                        continue
                 orientation = region.orientation
                 layout_profile = source_layout_profile(crop, text_value, orientation)
                 region_id = str(region.id)
@@ -286,6 +494,7 @@ class ReletterExecutor:
                             "paired_target_id": tb.id,
                             "source_region_bbox": [sx0, sy0, sx1, sy1],
                             "source_crop_route": source_crop_route,
+                            "source_crop_padding_applied": bool(source_crop_padding_applied),
                             "source_projected_bbox": [int(v) for v in projected_bbox],
                             "source_projection_coverage": float(source_projection_coverage),
                             "source_crop_recovered": bool(recovered_from_truncation),
@@ -293,6 +502,7 @@ class ReletterExecutor:
                             "source_layout_profile": layout_profile,
                             "ocr_normalization": dict(ocr_norm_diag),
                             "ocr_route": ocr_route,
+                            "ocr_backend_receipts": [dict(b.meta or {}) for b in raw],
                         },
                     )
                 )
@@ -333,6 +543,7 @@ class ReletterExecutor:
                         "component_count": region.component_count,
                         "status": "recognized",
                         "source_crop_route": source_crop_route,
+                        "source_crop_padding_applied": bool(source_crop_padding_applied),
                         "source_projected_bbox": [int(v) for v in projected_bbox],
                         "source_projection_coverage": float(source_projection_coverage),
                         "source_crop_recovered": bool(recovered_from_truncation),
@@ -404,6 +615,7 @@ class ReletterExecutor:
                 "lang": self.config.ocr.source_lang,
                 "regions": region_rows,
                 "orientation_policy": "source_ink_v1",
+                "recognition_policy": "manga_vertical_region_v3",
             },
         )
         if self.config.cache.ocr:
@@ -481,26 +693,68 @@ class ReletterExecutor:
                 )
                 layout_crop[inner == 0] = 255
 
-            raw = backend.recognize(crop, image_path=None)
-            text = "\n".join(
-                str(b.text).strip() for b in raw if str(b.text).strip()
-            ).strip()
+            # Determine manga text direction from the isolated ink before OCR.
+            # Transcript-only fallbacks such as Tesseract need this hint up front:
+            # a wide multi-column speech bubble is still vertical manga text and
+            # must not be treated as a horizontal paragraph merely from aspect.
+            orientation_hint, orientation_meta = infer_region_orientation(
+                layout_crop, "中文", bubble.kind
+            )
+            if hasattr(backend, "recognize_manga_region"):
+                raw = backend.recognize_manga_region(crop, orientation=orientation_hint)
+                # Ambiguous region-direction estimates are allowed one opposite-
+                # direction retry only when the primary route produced no CJK.
+                primary_text, _primary_diag = normalize_region_ocr_text(raw, orientation_hint)
+                if not primary_text:
+                    alt_orientation = "horizontal" if orientation_hint == "vertical" else "vertical"
+                    alt_raw = backend.recognize_manga_region(crop, orientation=alt_orientation)
+                    alt_text, _alt_diag = normalize_region_ocr_text(alt_raw, alt_orientation)
+                    if alt_text:
+                        raw = alt_raw
+                        orientation_hint = alt_orientation
+                        orientation_meta = dict(orientation_meta or {})
+                        orientation_meta["fallback_orientation_retry"] = True
+            else:
+                raw = backend.recognize(crop, image_path=None)
+            if not raw and getattr(backend, "_all_unavailable_reason", ""):
+                raise RuntimeError("Apple OCR 后端不可用（不是页面无文字）：" + backend._all_unavailable_reason)
+            text, norm_diag = normalize_region_ocr_text(raw, orientation_hint)
             if not text:
                 bubble.block_ids = []
                 continue
 
-            orientation_hint, orientation_meta = infer_region_orientation(
-                crop, text, bubble.kind
-            )
             layout_profile = source_layout_profile(layout_crop, text, orientation_hint)
             confs = [float(b.confidence) for b in raw if str(b.text).strip()]
+            raw_backend = str((raw[0].meta or {}).get("backend", "") if raw else "").lower()
             conf = (
-                float(np.mean(confs))
-                if confs
+                float(np.median(confs)) if confs and raw_backend == "tesseract"
+                else float(np.mean(confs)) if confs
                 else float(
                     getattr(self.config.ocr, "apple_live_text_assumed_confidence", 0.88)
                 )
             )
+            # Cloud/headless Tesseract is a safety fallback, not semantic
+            # authority. Large artwork fragments occasionally look like one or
+            # two CJK glyphs. Reject those low-information transcripts before
+            # they can create a huge Hybrid/Reletter clear region. Real short
+            # dialogue remains allowed when recognition confidence is strong.
+            if raw_backend == "tesseract":
+                cjk_count = sum(
+                    1 for ch in str(text)
+                    if "\u3040" <= ch <= "\u30ff" or "\u3400" <= ch <= "\u9fff"
+                )
+                reject_fallback = (
+                    cjk_count <= 0
+                    or (cjk_count == 1 and conf < 0.82)
+                    or (2 <= cjk_count <= 5 and conf < 0.35)
+                    or (cjk_count >= 6 and conf < 0.25)
+                )
+                if reject_fallback:
+                    bubble.block_ids = []
+                    stats["ocr_source_fallback_quality_rejected"] = int(
+                        stats.get("ocr_source_fallback_quality_rejected", 0) or 0
+                    ) + 1
+                    continue
             block_id = f"apple-region-{i:04d}"
             meta = {
                 "backend": str(raw[0].meta.get("backend") if raw else "apple_live_text"),
@@ -514,6 +768,7 @@ class ReletterExecutor:
                 "orientation_hint": orientation_hint,
                 "orientation_evidence": orientation_meta,
                 "source_layout_profile": layout_profile,
+                "ocr_normalization": dict(norm_diag),
             }
             if raw:
                 for key in (

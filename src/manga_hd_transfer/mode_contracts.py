@@ -185,6 +185,17 @@ def archive_review_state_if_mode_changed(page_root: str | Path, requested_mode: 
         return {"changed": False, "old_mode": old_mode, "new_mode": new_mode, "archived": []}
 
     sources = existing_review_input_paths(root)
+    # TARGET restore alters several driver masks in place. Its inverse snapshot
+    # is a small directory, not one of the flat review inputs above. Archiving
+    # the masks but leaving their inverse behind leaks old-mode authority into
+    # the next mode (and makes a later reset restore stale mask bytes).
+    inverse_name = ".target_restore_mask_backup"
+    inverse = root / inverse_name
+    if inverse.is_symlink() or (inverse.exists() and not inverse.is_dir()):
+        raise RuntimeError("unsafe TARGET restore inverse backup")
+    inverse_exists = inverse.is_dir()
+    if inverse_exists and any(p.is_symlink() or not p.is_file() for p in inverse.rglob("*")):
+        raise RuntimeError("unsafe TARGET restore inverse backup contents")
     review_root = root / "review_archive"
     if review_root.is_symlink():
         raise RuntimeError("review archive path is an unsafe symlink")
@@ -198,11 +209,14 @@ def archive_review_state_if_mode_changed(page_root: str | Path, requested_mode: 
     archive = review_root / f"{old_mode}_to_{new_mode}"
     stage = Path(tempfile.mkdtemp(prefix=f".txn-{old_mode}-to-{new_mode}-", dir=str(review_root)))
     removed_sources: list[Path] = []
+    moved_inverse = False
     published: list[str] = []
     try:
         try:
             for src in sources:
                 shutil.copy2(src, stage / src.name)
+            if inverse_exists:
+                shutil.copytree(inverse, stage / inverse_name)
         except OSError as exc:
             raise RuntimeError(f"review archive staging failed: {exc}") from exc
 
@@ -210,12 +224,20 @@ def archive_review_state_if_mode_changed(page_root: str | Path, requested_mode: 
             for src in sources:
                 src.unlink()
                 removed_sources.append(src)
+            if inverse_exists:
+                # Rename within the same page workspace: if publishing fails,
+                # moving the original directory back is lossless and cheap.
+                os.replace(inverse, stage / ".inverse-live-uncommitted")
+                moved_inverse = True
         except OSError as exc:
             for src in removed_sources:
                 try:
                     shutil.copy2(stage / src.name, src)
                 except OSError:
                     pass
+            if moved_inverse:
+                os.replace(stage / ".inverse-live-uncommitted", inverse)
+                moved_inverse = False
             raise RuntimeError(f"review archive source removal failed: {exc}") from exc
 
         try:
@@ -227,11 +249,23 @@ def archive_review_state_if_mode_changed(page_root: str | Path, requested_mode: 
                 shutil.copy2(staged, tmp)
                 os.replace(tmp, dst)
                 published.append(src.name)
+            if inverse_exists:
+                inverse_dst = archive / inverse_name
+                pending = archive / f".{inverse_name}.{uuid.uuid4().hex}.tmp"
+                shutil.copytree(stage / inverse_name, pending)
+                # Existing archives for repeated mode switches are already
+                # overwritten for flat inputs; apply that policy to this dir.
+                if inverse_dst.exists():
+                    if inverse_dst.is_symlink() or not inverse_dst.is_dir():
+                        raise RuntimeError("unsafe existing inverse archive")
+                    shutil.rmtree(inverse_dst)
+                os.replace(pending, inverse_dst)
             save_json(archive / "archive_manifest.json", {
                 "schema": "manga_hd_translation_transfer.review_mode_archive.v2",
                 "old_mode": old_mode,
                 "new_mode": new_mode,
                 "files": published,
+                "directories": [inverse_name] if inverse_exists else [],
             })
         except Exception as exc:
             # The archive is recovery-only. The live page state is authoritative:
@@ -243,11 +277,15 @@ def archive_review_state_if_mode_changed(page_root: str | Path, requested_mode: 
                         shutil.copy2(stage / src.name, src)
                     except OSError:
                         pass
+            if moved_inverse and (stage / ".inverse-live-uncommitted").exists():
+                os.replace(stage / ".inverse-live-uncommitted", inverse)
+                moved_inverse = False
             raise RuntimeError(f"review archive publish failed: {exc}") from exc
 
         return {
             "changed": True, "old_mode": old_mode, "new_mode": new_mode,
             "archived": published, "archive_dir": str(archive),
+            "archived_directories": [inverse_name] if inverse_exists else [],
         }
     finally:
         shutil.rmtree(stage, ignore_errors=True)
@@ -368,7 +406,51 @@ def ocr_route_executed(route: str | None) -> bool:
     value = str(route or "").strip().lower()
     if not value or value.startswith("skipped"):
         return False
-    return value not in {"none", "null", "disabled", "geometry_only"}
+    return value not in {"none", "null", "null_backend", "disabled", "unavailable", "geometry_only"}
+
+
+def ocr_execution_summary(stats: dict | None) -> dict:
+    """Normalize legacy OCR route strings and v3 execution flags.
+
+    This intentionally distinguishes reaching an OCR route from actually
+    invoking a model or consuming OCR evidence.  Older route-only projects stay
+    readable while new runs gain truthful accounting.
+    """
+    stats = stats or {}
+    roles: dict[str, dict] = {}
+    for role in ("source", "target"):
+        route = str(stats.get(f"ocr_{role}") or "")
+        route_l = route.strip().lower()
+        explicit_entered = stats.get(f"ocr_{role}_route_entered")
+        route_entered = bool(explicit_entered) if explicit_entered is not None else bool(route_l and not route_l.startswith("skipped"))
+        if stats.get(f"ocr_{role}_backend_available") is not None:
+            backend_available = bool(stats.get(f"ocr_{role}_backend_available"))
+        else:
+            backend_available = bool(ocr_route_executed(route))
+        if stats.get(f"ocr_{role}_model_invoked") is not None:
+            model_invoked = bool(stats.get(f"ocr_{role}_model_invoked"))
+        else:
+            model_invoked = route_l.startswith("miss") or route_l in {"target_driven_regions", "target_text_regions"}
+        if stats.get(f"ocr_{role}_evidence_available") is not None:
+            evidence_available = bool(stats.get(f"ocr_{role}_evidence_available"))
+        else:
+            evidence_available = bool(ocr_route_executed(route))
+        roles[role] = {
+            "route": route,
+            "route_entered": route_entered,
+            "backend": str(stats.get(f"ocr_{role}_backend") or ""),
+            "backend_available": backend_available,
+            "model_invoked": model_invoked,
+            "evidence_available": evidence_available,
+        }
+    return {
+        "source": roles["source"],
+        "target": roles["target"],
+        "route_entered": bool(roles["source"]["route_entered"] or roles["target"]["route_entered"]),
+        "backend_available": bool(roles["source"]["backend_available"] or roles["target"]["backend_available"]),
+        "model_invoked": bool(roles["source"]["model_invoked"] or roles["target"]["model_invoked"]),
+        "evidence_available": bool(roles["source"]["evidence_available"] or roles["target"]["evidence_available"]),
+    }
 
 
 def mode_ocr_execution_violations(mode: str, stats: dict | None) -> list[str]:

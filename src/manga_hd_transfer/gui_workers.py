@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Qt worker threads used by the GUI shell.
 
-The widgets/pages remain in ``gui_qt.py`` for now, but long-running page-local,
+The Studio widgets/pages are progressively split from ``gui_qt.py``; long-running page-local,
 model probe/download and dependency preparation jobs live here so the UI module
 does not own installation/runtime behavior.  No worker in this module imports
 ``gui_qt`` or ``pipeline``.
@@ -37,6 +37,10 @@ class PageActionWorker(QThread):
         # finished/deleteLater.  This matters for short page-local jobs where the
         # dialog may otherwise be the only strong reference to the QThread.
         super().__init__(parent)
+        # macOS QThread defaults to a small native stack (~512 KiB). Lazy
+        # scientific imports on Python 3.14 can exhaust it before an exception
+        # can be raised. Match the main-thread stack budget for editor actions.
+        self.setStackSize(8 * 1024 * 1024)
         self.label = str(label)
         self.action = action
 

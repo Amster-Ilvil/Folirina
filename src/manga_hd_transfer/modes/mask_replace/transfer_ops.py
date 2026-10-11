@@ -36,10 +36,10 @@ from .content_audit import _evaluate_content_completeness, _repair_content_regio
 from .transfer_models import MaskTransferRecord, MaskTransferResult
 from .raster_policy import paired_proxy_geometry_risk
 from ...external_command import run_external_command
-from .text_transfer import target_text_mask_in_container, cleanup_target_residual_specks, clear_uniform_white_container_interior, white_container_paper_mask, white_container_write_envelope, target_container_border_mask, remove_container_boundary_line_components
+from .text_transfer import changed_text_masks, target_text_mask_in_container, cleanup_target_residual_specks, clear_uniform_white_container_interior, white_container_paper_mask, white_container_write_envelope, target_container_border_mask, remove_container_boundary_line_components
 from .source_clarity import enhance_white_source_patch as _enhance_white_source_patch
 from ...config import MaskReplaceConfig
-from ...geometry import polygon_bbox, transform_points, transform_to_homography
+from ...geometry import polygon_bbox, rasterize_polygon, transform_points, transform_to_homography
 from ...io_utils import read_image, write_image
 from ...models import BubbleInstance, RegistrationResult, TextUnit, UnitMatch
 
@@ -276,6 +276,93 @@ def _transfer_saturated_text_container(
     }
 
 
+def _clear_empty_source_semantic_bubble(
+    aligned_source: np.ndarray,
+    target: np.ndarray,
+    bubble_gate: np.ndarray,
+    cfg: MaskReplaceConfig,
+) -> tuple[np.ndarray | None, np.ndarray, np.ndarray, dict]:
+    """Clear TARGET lettering when a trusted semantic bubble is empty in SOURCE.
+
+    Koharu can correctly recover a speech bubble that paired-diff missed while the
+    translated SOURCE intentionally contains no text. The generic complex-text
+    fallback must not turn bubble outlines or other dark structure into fake SOURCE
+    ink in that case. Detect emptiness on an eroded bubble interior with the same
+    container-aware text selector used by the rigid path, then clear only TARGET
+    text components. No SOURCE pixels are written.
+    """
+    shape = target.shape[:2]
+    empty = np.zeros(shape, np.uint8)
+    if not bool(getattr(cfg, "koharu_semantic_empty_source_clear_enabled", True)):
+        return None, empty, empty, {"reason": "empty_source_clear_disabled"}
+    if bubble_gate.shape != shape or cv2.countNonZero(bubble_gate) <= 0:
+        return None, empty, empty, {"reason": "empty_source_clear_empty_gate"}
+
+    erode_px = max(1, int(getattr(cfg, "koharu_semantic_empty_source_inner_erode_px", 4)))
+    inner = cv2.erode(
+        (bubble_gate > 0).astype(np.uint8) * 255,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_px * 2 + 1, erode_px * 2 + 1)),
+    )
+    if cv2.countNonZero(inner) <= 0:
+        return None, empty, empty, {"reason": "empty_source_clear_eroded_empty"}
+
+    source_text = target_text_mask_in_container(aligned_source, inner)
+    target_text = target_text_mask_in_container(target, inner)
+    source_px = int(cv2.countNonZero(source_text))
+    target_px = int(cv2.countNonZero(target_text))
+    min_target = max(8, int(getattr(cfg, "koharu_semantic_empty_source_min_target_text_pixels", 24)))
+    max_source = max(0, int(getattr(cfg, "koharu_semantic_empty_source_max_text_pixels", 12)))
+    max_ratio = float(getattr(cfg, "koharu_semantic_empty_source_max_source_target_ratio", 0.08))
+    if target_px < min_target:
+        return None, empty, empty, {
+            "reason": "empty_source_clear_insufficient_target_text",
+            "source_text_pixels": source_px,
+            "target_text_pixels": target_px,
+        }
+    if source_px > max_source and source_px / max(1, target_px) > max_ratio:
+        return None, empty, empty, {
+            "reason": "empty_source_clear_source_not_empty",
+            "source_text_pixels": source_px,
+            "target_text_pixels": target_px,
+            "source_target_ratio": float(source_px / max(1, target_px)),
+        }
+
+    dilate_px = max(1, int(getattr(cfg, "koharu_semantic_empty_source_clear_dilate_px", 2)))
+    clear = cv2.dilate(
+        target_text,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_px * 2 + 1, dilate_px * 2 + 1)),
+    )
+    clear = cv2.bitwise_and(clear, (bubble_gate > 0).astype(np.uint8) * 255)
+    if cv2.countNonZero(clear) <= 0:
+        return None, empty, empty, {
+            "reason": "empty_source_clear_no_clear_pixels",
+            "source_text_pixels": source_px,
+            "target_text_pixels": target_px,
+        }
+    out = cv2.inpaint(target, clear, 2.5, cv2.INPAINT_TELEA)
+    final_gray = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
+    residual = float(
+        np.count_nonzero((target_text > 0) & (final_gray <= 205)) / max(1, target_px)
+    )
+    max_residual = float(getattr(cfg, "koharu_semantic_empty_source_max_residual_ratio", 0.05))
+    return out, clear.copy(), empty, {
+        "reason": "ok_empty_source_bubble_clear",
+        "clear_backend": "koharu-semantic-empty-source-clear",
+        "clear_mask": clear,
+        "target_ink_mask": target_text,
+        "boundary_touch": False,
+        "source_text_pixels": source_px,
+        "target_text_pixels": target_px,
+        "clear_pixels": int(cv2.countNonZero(clear)),
+        "target_residual_ratio": residual,
+        "max_target_residual_ratio": max_residual,
+        "content_complete": bool(residual <= max_residual),
+        "empty_source_clear": True,
+        "inner_erode_px": erode_px,
+        "clear_dilate_px": dilate_px,
+    }
+
+
 def _transfer_open_complex_text_region(
     aligned_source: np.ndarray,
     target: np.ndarray,
@@ -426,6 +513,297 @@ def _semantic_local_change_ratio(
     return float(np.count_nonzero(unique) / denom)
 
 
+
+def _semantic_page_furniture_gate(gate: np.ndarray, shape: tuple[int, int], cfg) -> bool:
+    """Return True for tiny running-header/page-number semantic text."""
+    if gate is None or gate.shape != shape or cv2.countNonZero(gate) <= 0:
+        return False
+    if not bool(getattr(cfg, "paired_diff_protect_page_furniture", True)):
+        return False
+    box = _bbox_from_mask(gate)
+    if box is None:
+        return False
+    x0, y0, x1, y1 = [int(v) for v in box]
+    h, w = shape
+    bw=max(1,x1-x0); bh=max(1,y1-y0)
+    narrow = bw <= w * float(getattr(cfg, "paired_diff_page_furniture_max_width_ratio", 0.18))
+    short = bh <= h * float(getattr(cfg, "paired_diff_page_furniture_max_height_ratio", 0.12))
+    top_ratio = float(getattr(cfg, "paired_diff_page_furniture_top_ratio", 0.10))
+    bottom_ratio = min(float(getattr(cfg, "paired_diff_page_furniture_bottom_ratio", 0.965)), 0.94)
+    return bool((y1 <= h * top_ratio or y0 >= h * bottom_ratio) and narrow and short)
+
+def _plain_paper_text_components(
+    image: np.ndarray,
+    gate: np.ndarray,
+    *,
+    gray_max: int,
+    min_value: int,
+    max_saturation: int,
+    min_area: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[dict[str, float]], np.ndarray]:
+    """Return text-like dark components locally surrounded by bright paper.
+
+    The support test deliberately uses a *ring* around each component rather
+    than a rectangular white-region detector.  This allows slanted note/letter
+    text near the paper edge while excluding the hand, page border and large
+    artwork components that can share the same low saturation.
+    """
+    shape = gate.shape
+    out = np.zeros(shape, np.uint8)
+    if image.shape[:2] != shape or cv2.countNonZero(gate) <= 0:
+        return out, np.zeros(shape, np.int32), np.zeros((1, 5), np.int32), [], out.copy()
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    paper = (
+        (hsv[..., 2] >= int(min_value))
+        & (hsv[..., 1] <= int(max_saturation))
+        & (gate > 0)
+    )
+    # Select the dominant neutral-paper surface first.  Without this ownership
+    # step, short black burst rays immediately outside a slanted sheet can have
+    # "paper on one side" and be mistaken for glyph fragments.
+    paper_u8 = paper.astype(np.uint8)
+    paper_closed = cv2.morphologyEx(
+        paper_u8,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+    )
+    pn, plabels, pstats, _ = cv2.connectedComponentsWithStats(paper_closed, 8)
+    paper_surface = np.zeros(shape, np.uint8)
+    if pn > 1:
+        best_id = max(range(1, pn), key=lambda i: int(pstats[i, cv2.CC_STAT_AREA]))
+        paper_surface[plabels == best_id] = 255
+        # Expand just far enough to cover the dark centre of normal CJK strokes.
+        # Do *not* fill the external contour: on p-203 the white letter and an
+        # overlapping white caption form a shape that can enclose a red wedge;
+        # filling that contour would incorrectly grant write authority to the
+        # red burst artwork.
+        paper_surface = cv2.dilate(
+            paper_surface, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        )
+        paper_surface = cv2.bitwise_and(paper_surface, gate)
+    # Label dark components *before* clipping them to paper support.  Clipping
+    # first can chop a long red-burst ray at the paper edge into a tiny fragment
+    # that looks exactly like a glyph.  The full component geometry lets us
+    # reject such outside artwork by paper-support fraction and aspect.
+    candidate = ((gray <= int(gray_max)) & (gate > 0)).astype(np.uint8)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(candidate, 8)
+    ys, xs = np.where(gate > 0)
+    if xs.size == 0:
+        return out, labels, stats, [], paper_surface
+    bw = int(xs.max() - xs.min() + 1); bh = int(ys.max() - ys.min() + 1)
+    gate_area = max(1, int(cv2.countNonZero(gate)))
+    max_area = max(3000, int(round(gate_area * 0.03)))
+    max_w = max(100, int(round(bw * 0.30)))
+    max_h = max(140, int(round(bh * 0.30)))
+    rows: list[dict[str, float]] = []
+    ring_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    for comp_id in range(1, n):
+        x, y, cw, ch, area = [int(v) for v in stats[comp_id]]
+        if area < int(min_area) or area > max_area or cw < 1 or ch < 2:
+            continue
+        if cw > max_w or ch > max_h:
+            continue
+        fill = float(area / max(1, cw * ch))
+        aspect = max(cw / max(1.0, ch), ch / max(1.0, cw))
+        if fill < 0.015 or aspect > 22.0:
+            continue
+        component = (labels == comp_id).astype(np.uint8) * 255
+        support_fraction = float(
+            np.count_nonzero((component > 0) & (paper_surface > 0)) / max(1, area)
+        )
+        if support_fraction < 0.72:
+            continue
+        dilated = cv2.dilate(component, ring_kernel)
+        ring = (dilated > 0) & (component == 0) & (gate > 0)
+        ring_count = int(np.count_nonzero(ring))
+        paper_ratio = float(np.mean(paper[ring])) if ring_count else 0.0
+        # Tiny glyph fragments near the slanted paper boundary have paper on
+        # only one side.  Larger components need stronger all-around paper
+        # evidence so a hand, shirt or panel line is never admitted as text.
+        paper_floor = 0.10 if area <= 180 and max(cw, ch) <= 45 else 0.28
+        if paper_ratio < paper_floor:
+            continue
+        out[labels == comp_id] = 255
+        rows.append({
+            "id": float(comp_id), "area": float(area), "paper_ratio": paper_ratio,
+            "paper_support_fraction": support_fraction,
+            "x": float(x), "y": float(y), "w": float(cw), "h": float(ch),
+        })
+    return out, labels, stats, rows, paper_surface
+
+
+def _select_changed_plain_paper_components(
+    full_mask: np.ndarray,
+    other_mask: np.ndarray,
+    labels: np.ndarray,
+    *,
+    tolerance_px: int,
+    min_unique_fraction: float,
+) -> np.ndarray:
+    """Keep whole glyph components that have at least a small edition-unique seed."""
+    out = np.zeros(full_mask.shape, np.uint8)
+    if cv2.countNonZero(full_mask) <= 0:
+        return out
+    tol = max(1, int(tolerance_px))
+    near_other = cv2.dilate(
+        (other_mask > 0).astype(np.uint8) * 255,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (tol * 2 + 1, tol * 2 + 1)),
+    )
+    unique = cv2.bitwise_and(full_mask, cv2.bitwise_not(near_other))
+    ids = np.unique(labels[full_mask > 0])
+    for comp_id in ids:
+        comp_id = int(comp_id)
+        if comp_id <= 0:
+            continue
+        component = labels == comp_id
+        area = int(np.count_nonzero(component))
+        unique_px = int(np.count_nonzero((unique > 0) & component))
+        if unique_px >= 2 and unique_px / max(1, area) >= float(min_unique_fraction):
+            out[component] = 255
+    return out
+
+
+def _strict_raw_group_plain_paper_text_transfer(
+    aligned_source: np.ndarray,
+    target: np.ndarray,
+    region_mask: np.ndarray,
+    cfg: MaskReplaceConfig,
+    *,
+    source_text_gate: np.ndarray | None = None,
+) -> tuple[np.ndarray | None, np.ndarray, np.ndarray, dict]:
+    """Transfer a large paired text group on a bright neutral paper object.
+
+    SOURCE/TARGET paper, borders and the object/hand holding the paper remain
+    untouched.  Only changed dark glyph components supported by bright neutral
+    paper are erased/written.  This covers slanted letter/note pages such as
+    p-203 without turning the entire sheet into a rectangular SOURCE patch.
+    """
+    shape = target.shape[:2]
+    empty = np.zeros(shape, np.uint8)
+    if not bool(getattr(cfg, "koharu_semantic_raw_group_plain_paper_enabled", True)):
+        return None, empty, empty, {"reason": "raw_group_plain_disabled"}
+    if region_mask.shape != shape or cv2.countNonZero(region_mask) <= 0:
+        return None, empty, empty, {"reason": "raw_group_plain_empty_region"}
+
+    configured_pad = max(0, int(getattr(cfg, "koharu_semantic_raw_group_plain_boundary_pad_px", 12)))
+    region_box = _bbox_from_mask(region_mask)
+    if region_box is not None:
+        rx0, ry0, rx1, ry1 = [int(v) for v in region_box]
+        long_side = max(1, rx1 - rx0, ry1 - ry0)
+    else:
+        long_side = 1
+    # Koharu raw boxes can stop at the first/last detected line on a slanted
+    # letter.  Grow the *analysis* neighborhood (not write authority) enough to
+    # recover edge lines.  Component admission still requires membership in the
+    # dominant bright-neutral paper surface, so nearby red artwork/hand/captions
+    # do not become text authority.
+    adaptive_pad = min(112, int(round(long_side * 0.18)))
+    pad = max(configured_pad, adaptive_pad)
+    analysis_gate = region_mask.copy()
+    if pad > 0:
+        analysis_gate = cv2.dilate(
+            analysis_gate,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (pad * 2 + 1, pad * 2 + 1)),
+        )
+    target_hsv = cv2.cvtColor(target, cv2.COLOR_BGR2HSV)
+    min_v = int(getattr(cfg, "koharu_semantic_raw_group_plain_min_value", 198))
+    max_sat = int(getattr(cfg, "koharu_semantic_raw_group_plain_max_saturation", 84))
+    core = region_mask > 0
+    bright_ratio = float(np.mean((target_hsv[..., 2][core] >= min_v) & (target_hsv[..., 1][core] <= max_sat)))
+    min_bright = float(getattr(cfg, "koharu_semantic_raw_group_plain_min_bright_ratio", 0.62))
+    if bright_ratio < min_bright:
+        return None, empty, empty, {
+            "reason": "raw_group_plain_not_bright_paper",
+            "bright_paper_ratio": round(bright_ratio, 6),
+        }
+
+    min_area = int(getattr(cfg, "koharu_semantic_raw_group_plain_component_min_area", 5))
+    target_all, target_labels, _, target_rows, target_paper_surface = _plain_paper_text_components(
+        target, analysis_gate,
+        gray_max=int(getattr(cfg, "koharu_semantic_raw_group_plain_target_gray_max", 194)),
+        min_value=min_v, max_saturation=max_sat, min_area=min_area,
+    )
+    source_gate = analysis_gate
+    if isinstance(source_text_gate, np.ndarray) and source_text_gate.shape == shape and cv2.countNonZero(source_text_gate) > 0:
+        source_gate = cv2.bitwise_and(analysis_gate, cv2.dilate(
+            source_text_gate,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (pad * 2 + 1, pad * 2 + 1)) if pad > 0 else np.ones((1, 1), np.uint8),
+        ))
+    source_all, source_labels, _, source_rows, _source_paper_surface = _plain_paper_text_components(
+        aligned_source, source_gate,
+        gray_max=int(getattr(cfg, "koharu_semantic_raw_group_plain_source_gray_max", 188)),
+        min_value=min_v, max_saturation=max_sat, min_area=min_area,
+    )
+    tol = int(getattr(cfg, "koharu_semantic_raw_group_plain_pair_tolerance_px", 2))
+    unique_fraction = float(getattr(cfg, "koharu_semantic_raw_group_plain_component_unique_fraction", 0.06))
+    target_core = _select_changed_plain_paper_components(
+        target_all, source_all, target_labels,
+        tolerance_px=tol, min_unique_fraction=unique_fraction,
+    )
+    source_core = _select_changed_plain_paper_components(
+        source_all, target_all, source_labels,
+        tolerance_px=tol, min_unique_fraction=unique_fraction,
+    )
+    # SOURCE monochrome editions can have black burst rays immediately outside
+    # the slanted paper.  Even if a tiny ray fragment passes the component
+    # heuristic, it must never gain write authority on TARGET coloured artwork.
+    # Clip SOURCE glyph authority back to the TARGET-proven paper interior.
+    paper_write_surface = cv2.erode(
+        target_paper_surface, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    )
+    source_core = cv2.bitwise_and(source_core, paper_write_surface)
+    tgt_px = int(cv2.countNonZero(target_core)); src_px = int(cv2.countNonZero(source_core))
+    if src_px < 80 or tgt_px < 80:
+        return None, empty, empty, {
+            "reason": "raw_group_plain_insufficient_changed_glyphs",
+            "source_stroke_pixels": src_px,
+            "target_stroke_pixels": tgt_px,
+            "source_components": len(source_rows),
+            "target_components": len(target_rows),
+            "bright_paper_ratio": round(bright_ratio, 6),
+        }
+
+    clear_px = max(2, int(getattr(cfg, "koharu_semantic_raw_group_plain_target_clear_px", 3)))
+    clear = cv2.dilate(
+        target_core,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (clear_px * 2 + 1, clear_px * 2 + 1)),
+    )
+    # Keep the erase footprint on/near the proven paper field.  Dark glyph cores
+    # themselves are included explicitly so their centres are not lost from the
+    # bright-paper support test.
+    clear = cv2.bitwise_and(clear, np.maximum(target_paper_surface, target_core))
+    out = cv2.inpaint(target, clear, 3.0, cv2.INPAINT_TELEA)
+
+    src_gray = cv2.cvtColor(aligned_source, cv2.COLOR_BGR2GRAY)
+    near = cv2.dilate(source_core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    alpha = np.clip((245.0 - src_gray.astype(np.float32)) / 120.0, 0.0, 1.0)
+    alpha *= ((near > 0) & (source_gate > 0)).astype(np.float32)
+    alpha = cv2.GaussianBlur(alpha, (0, 0), 0.35)
+    a3 = alpha[..., None]
+    out = np.clip(
+        out.astype(np.float32) * (1.0 - a3) + aligned_source.astype(np.float32) * a3,
+        0, 255,
+    ).astype(np.uint8)
+    changed = np.any(out != target, axis=2)
+    write = np.zeros(shape, np.uint8); write[changed] = 255
+    return out, write, source_core, {
+        "reason": "ok_raw_group_plain_paper_text_transfer",
+        "clear_backend": "paired-raw-group-plain-paper-text",
+        "clear_mask": clear,
+        "target_ink_mask": target_core,
+        "source_ink_pixels": src_px,
+        "target_ink_pixels": tgt_px,
+        "clear_pixels": int(cv2.countNonZero(clear)),
+        "write_pixels": int(cv2.countNonZero(write)),
+        "source_components": int(len(source_rows)),
+        "target_components": int(len(target_rows)),
+        "bright_paper_ratio": round(bright_ratio, 6),
+        "plain_paper": True,
+        "boundary_touch": False,
+    }
+
+
 def transfer_koharu_semantic_regions(
     aligned_source: np.ndarray,
     target: np.ndarray,
@@ -434,6 +812,8 @@ def transfer_koharu_semantic_regions(
     *,
     exclude_mask: np.ndarray | None = None,
     include_sfx: bool = False,
+    bubble_min_confidence: float | None = None,
+    text_min_confidence: float | None = None,
 ) -> MaskTransferResult:
     """Recover Koharu regions missed by container pairing without OCR.
 
@@ -462,6 +842,7 @@ def transfer_koharu_semantic_regions(
     layer = np.zeros((shape[0], shape[1], 4), np.uint8)
     composite = np.zeros(shape, np.uint8)
     clear_all = np.zeros(shape, np.uint8)
+    authority_allow = np.zeros(shape, np.uint8)
     records: list[MaskTransferRecord] = []
     patch_matches: list[BubblePatchMatch] = []
     source_ink_cache: np.ndarray | None = None
@@ -469,8 +850,19 @@ def transfer_koharu_semantic_regions(
     rendered_target_ink_cache: np.ndarray | None = None
 
     max_overlap = float(getattr(cfg, "koharu_semantic_max_existing_overlap", 0.28))
-    bubble_min = float(getattr(cfg, "koharu_semantic_bubble_min_confidence", 0.70))
-    text_min = float(getattr(cfg, "koharu_semantic_text_min_confidence", 0.75))
+    # A selected primary detector owns candidate admission.  Do not silently
+    # re-threshold a Koharu bubble/text above the threshold that already admitted
+    # it at the layout stage; doing so creates the confusing state "detected in
+    # overlay, never replaced".  Renderer-specific floors remain the fallback
+    # only when no primary threshold was supplied.
+    bubble_min = float(
+        bubble_min_confidence if bubble_min_confidence is not None
+        else getattr(cfg, "koharu_semantic_bubble_min_confidence", 0.70)
+    )
+    text_min = float(
+        text_min_confidence if text_min_confidence is not None
+        else getattr(cfg, "koharu_semantic_text_min_confidence", 0.75)
+    )
     change_min = float(getattr(cfg, "koharu_semantic_standalone_min_change_ratio", 0.18))
 
     bubbles = [x for x in list(getattr(evidence, "items", []) or []) if str(getattr(x, "label", "")) == "bubble"]
@@ -481,6 +873,39 @@ def transfer_koharu_semantic_regions(
     def overlap_ratio(mask: np.ndarray, other: np.ndarray) -> float:
         area = max(1, cv2.countNonZero(mask))
         return float(np.count_nonzero((mask > 0) & (other > 0)) / area)
+
+    def standalone_raw_group_mask(row: Any, polygon_gate: np.ndarray) -> tuple[np.ndarray | None, float]:
+        """Return a bounded TARGET raw-box rescue for severely undersegmented open text.
+
+        Koharu can emit a narrow polygon tracing only one stroke while ``raw_box``
+        spans the whole slanted letter/note.  This is analysis/clear authority only;
+        the renderer below still admits SOURCE pixels component-by-component on a
+        proven neutral paper surface.
+        """
+        meta = dict(getattr(row, "meta", {}) or {})
+        raw = list(meta.get("raw_box") or [])
+        if len(raw) != 4 or polygon_gate.shape != shape:
+            return None, 0.0
+        x0, y0, x1, y1 = [float(v) for v in raw]
+        ix0 = max(0, min(shape[1] - 1, int(np.floor(min(x0, x1)))))
+        iy0 = max(0, min(shape[0] - 1, int(np.floor(min(y0, y1)))))
+        ix1 = max(ix0 + 1, min(shape[1], int(np.ceil(max(x0, x1)))))
+        iy1 = max(iy0 + 1, min(shape[0], int(np.ceil(max(y0, y1)))))
+        raw_area = max(1, (ix1 - ix0) * (iy1 - iy0))
+        poly_area = max(1, cv2.countNonZero(polygon_gate))
+        ratio = float(raw_area / poly_area)
+        min_ratio = float(getattr(cfg, "koharu_semantic_paired_raw_group_min_underseg_ratio", 2.0))
+        max_page = float(getattr(cfg, "koharu_semantic_paired_raw_group_max_page_area_ratio", 0.22))
+        min_conf = float(getattr(cfg, "koharu_semantic_paired_raw_group_min_target_confidence", 0.35))
+        if float(getattr(row, "confidence", 0.0) or 0.0) < min_conf:
+            return None, ratio
+        if ratio < min_ratio or raw_area / max(1.0, float(shape[0] * shape[1])) > max_page:
+            return None, ratio
+        if (ix1 - ix0) < 40 or (iy1 - iy0) < 40:
+            return None, ratio
+        out = np.zeros(shape, np.uint8)
+        out[iy0:iy1, ix0:ix1] = 255
+        return out, ratio
 
     # First recover missed semantic containers. A text child or a saturated
     # target fill is sufficient evidence that this is a text-bearing region.
@@ -511,6 +936,8 @@ def transfer_koharu_semantic_regions(
             continue
         if any(overlap_ratio(gate, np.asarray(b.mask, dtype=np.uint8)) >= 0.55 for b in bubbles if getattr(b, "mask", None) is not None):
             continue
+        if _semantic_page_furniture_gate(gate, shape, cfg):
+            continue
         if source_ink_cache is None:
             source_ink_cache = _complex_text_ink_map(aligned_source)
         if semantic_target_ink_cache is None:
@@ -520,7 +947,8 @@ def transfer_koharu_semantic_regions(
             source_ink_map=source_ink_cache,
             target_ink_map=semantic_target_ink_cache,
         )
-        if local_change_ratio < change_min:
+        raw_group_gate, _raw_underseg = standalone_raw_group_mask(row, gate)
+        if local_change_ratio < change_min and raw_group_gate is None:
             continue
         candidates.append((str(getattr(row, "label", "text") or "text"), row, gate, True, local_change_ratio))
 
@@ -532,27 +960,58 @@ def transfer_koharu_semantic_regions(
             source_ink_cache = _complex_text_ink_map(aligned_source)
         if rendered_target_ink_cache is None:
             rendered_target_ink_cache = _complex_text_ink_map(rendered)
-        text_img, write_mask, source_ink_mask, diag = _transfer_open_complex_text_region(
-            aligned_source, rendered, gate, cfg,
-            source_ink_map=source_ink_cache,
-            target_ink_map=rendered_target_ink_cache,
-        )
+        raw_group_gate, raw_underseg_ratio = (standalone_raw_group_mask(row, gate) if standalone else (None, 0.0))
+        raw_group_used = False
+        effective_gate = gate
+        text_img = None
+        write_mask = np.zeros(shape, np.uint8)
+        source_ink_mask = np.zeros(shape, np.uint8)
+        diag: dict[str, object] = {"reason": "not_attempted"}
+        empty_source_clear_used = False
+        if kind == "bubble" and not standalone:
+            text_img, write_mask, source_ink_mask, diag = _clear_empty_source_semantic_bubble(
+                aligned_source, rendered, gate, cfg
+            )
+            empty_source_clear_used = bool(
+                text_img is not None and str(diag.get("reason") or "") == "ok_empty_source_bubble_clear"
+            )
+        if raw_group_gate is not None and not empty_source_clear_used:
+            # A late expanded raw group must never overwrite a region already
+            # claimed by an earlier bubble/caption transfer (p-203 ownership).
+            raw_group_gate = raw_group_gate.copy()
+            raw_group_gate[active_exclude > 0] = 0
+            if cv2.countNonZero(raw_group_gate) > 0:
+                text_img, write_mask, source_ink_mask, diag = _strict_raw_group_plain_paper_text_transfer(
+                    aligned_source, rendered, raw_group_gate, cfg
+                )
+                if text_img is not None and cv2.countNonZero(write_mask) > 0:
+                    raw_group_used = True
+                    effective_gate = raw_group_gate
+        if not raw_group_used and not empty_source_clear_used:
+            text_img, write_mask, source_ink_mask, diag = _transfer_open_complex_text_region(
+                aligned_source, rendered, gate, cfg,
+                source_ink_map=source_ink_cache,
+                target_ink_map=rendered_target_ink_cache,
+            )
         rid = str((getattr(row, "meta", {}) or {}).get("item_index", index))
         source_id = f"koharu-semantic-src-{kind}-{rid}"
         target_id = f"koharu-semantic-dst-{kind}-{rid}"
         conf = float(getattr(row, "confidence", 0.0))
         rec = MaskTransferRecord(source_id, target_id, conf, False, "not_applied")
         rec.geometry_mode = "free_text" if standalone else "complex_text"
-        box = _bbox_from_mask(gate) or (0, 0, 0, 0)
+        box = _bbox_from_mask(effective_gate) or (0, 0, 0, 0)
         rec.source_bbox = tuple(int(v) for v in box)
         rec.target_bbox = tuple(int(v) for v in box)
-        rec.sr_backend = "koharu-semantic-registered-ink"
+        rec.sr_backend = str(diag.get("clear_backend") or "koharu-semantic-registered-ink")
         rec.meta = {
             "layout_label": str(getattr(row, "label", kind)),
             "layout_confidence": conf,
             "semantic_completion": True,
             "standalone": bool(standalone),
             "local_change_ratio": round(float(local_change_ratio), 4),
+            "raw_group_plain_paper": bool(raw_group_used),
+            "raw_group_underseg_ratio": round(float(raw_underseg_ratio), 4),
+            "raw_group_reason": str(diag.get("reason") or ""),
         }
         patch_matches.append(BubblePatchMatch(
             source_id, target_id, conf, 0.0, 1.0, 0.0, 1.0,
@@ -576,6 +1035,14 @@ def transfer_koharu_semantic_regions(
         diag_clear = diag.get("clear_mask")
         if isinstance(diag_clear, np.ndarray) and diag_clear.shape == shape:
             clear_all = np.maximum(clear_all, diag_clear)
+        if raw_group_used:
+            # The TARGET Koharu polygon can under-segment a whole letter into a
+            # tiny stroke while its raw_box spans the real typography.  Grant
+            # explicit ALLOW only to pixels that the strict plain-paper changed-
+            # glyph transfer actually cleared/wrote; never to the raw rectangle.
+            authority_allow = np.maximum(authority_allow, write_mask)
+            if isinstance(diag_clear, np.ndarray) and diag_clear.shape == shape:
+                authority_allow = np.maximum(authority_allow, diag_clear)
         use = write_mask > 0
         rgb = cv2.cvtColor(rendered, cv2.COLOR_BGR2RGB)
         layer[use, :3] = rgb[use]
@@ -586,11 +1053,43 @@ def transfer_koharu_semantic_regions(
         rec.spill_ratio = 0.0
         rec.ink_ratio = float(cv2.countNonZero(source_ink_mask) / max(1, cv2.countNonZero(gate)))
         rec.clarity_mode = "koharu-semantic-open-text-ink-transfer"
-        _evaluate_content_completeness(
-            rec, source_ink_mask, diag.get("target_ink_mask"), rendered, cfg
-        )
+        if bool(diag.get("empty_source_clear", False)):
+            rec.source_ink_coverage = 1.0
+            rec.target_residual_ratio = float(diag.get("target_residual_ratio", 1.0))
+            rec.content_check = "checked_empty_source"
+            rec.content_complete = bool(diag.get("content_complete", False))
+            rec.meta["empty_source_clear"] = {
+                k: v for k, v in diag.items()
+                if k not in {"clear_mask", "target_ink_mask"}
+            }
+        else:
+            _evaluate_content_completeness(
+                rec, source_ink_mask, diag.get("target_ink_mask"), rendered, cfg,
+                target_invalidation_mask=write_mask,
+            )
+        if not bool(getattr(rec, "content_complete", False)) and not bool(diag.get("empty_source_clear", False)):
+            repaired, repaired_mask, repair_diag = _repair_content_region(
+                rec, rendered, aligned_source, target, write_mask, gate,
+                source_ink_mask, diag.get("target_ink_mask"), cfg,
+            )
+            rec.meta["content_auto_repair"] = repair_diag
+            if bool(repair_diag.get("improved", False)):
+                rendered = repaired
+                write_mask = np.maximum(write_mask, repaired_mask)
+                composite = np.maximum(composite, write_mask)
+                clear_all = np.maximum(clear_all, repaired_mask)
+                use = write_mask > 0
+                rgb = cv2.cvtColor(rendered, cv2.COLOR_BGR2RGB)
+                layer[use, :3] = rgb[use]
+                layer[..., 3] = np.maximum(layer[..., 3], write_mask)
         boundary_touch = bool(diag.get("boundary_touch", False))
-        if standalone or boundary_touch or not bool(getattr(rec, "content_complete", False)):
+        strict_raw_group_safe = bool(
+            raw_group_used
+            and bool(getattr(rec, "content_complete", False))
+            and float(getattr(rec, "source_ink_coverage", 0.0) or 0.0) >= 0.98
+            and float(getattr(rec, "target_residual_ratio", 1.0)) <= 0.01
+        )
+        if (standalone and not strict_raw_group_safe) or boundary_touch or not bool(getattr(rec, "content_complete", False)):
             rec.reason = "applied_koharu_semantic_review_candidate"
             rec.candidate = True
             rec.review_required = True
@@ -605,7 +1104,10 @@ def transfer_koharu_semantic_regions(
             rec.reason = "applied_koharu_semantic_registered_components"
         records.append(rec)
 
-    return MaskTransferResult(rendered, layer, composite, patch_matches, records, clear_all)
+    result = MaskTransferResult(rendered, layer, composite, patch_matches, records, clear_all)
+    if cv2.countNonZero(authority_allow) > 0:
+        result.authority_allow_mask = authority_allow
+    return result
 
 
 
@@ -1166,6 +1668,963 @@ def _mask_replace_target_structure_guard(
     })
     return out, diag
 
+
+def _rigid_changed_text_write_gate(
+    source: np.ndarray,
+    target_reference: np.ndarray,
+    source_mask: np.ndarray,
+    target_mask: np.ndarray,
+    cfg: MaskReplaceConfig,
+) -> tuple[np.ndarray | None, dict[str, object]]:
+    """Return SOURCE-crop changed-text authority for rigid raster writes.
+
+    The admission path already proves edition-exclusive compact SOURCE text.
+    Preserve that proof at render time so shared illustration ink inside a speech
+    container is never reintroduced into a colour TARGET.  The mask is mapped
+    back into SOURCE-crop coordinates and slightly dilated for antialiasing.
+    """
+    diag: dict[str, object] = {"enabled": bool(getattr(cfg, "rigid_container_changed_text_gate_enabled", True)), "applied": False}
+    if not bool(diag["enabled"]):
+        diag["reason"] = "disabled"
+        return None, diag
+    sbox = _bbox_from_mask(source_mask); tbox = _bbox_from_mask(target_mask)
+    if sbox is None or tbox is None:
+        diag["reason"] = "empty_mask"
+        return None, diag
+    sx0, sy0, sx1, sy1 = [int(v) for v in sbox]
+    tx0, ty0, tx1, ty1 = [int(v) for v in tbox]
+    source_crop = source[sy0:sy1, sx0:sx1]
+    target_crop = target_reference[ty0:ty1, tx0:tx1]
+    source_mask_crop = source_mask[sy0:sy1, sx0:sx1]
+    target_mask_crop = target_mask[ty0:ty1, tx0:tx1]
+    if source_crop.size == 0 or target_crop.size == 0:
+        diag["reason"] = "empty_crop"
+        return None, diag
+    th, tw = target_crop.shape[:2]
+    source_to_target = cv2.resize(source_crop, (tw, th), interpolation=cv2.INTER_LINEAR)
+    source_mask_to_target = cv2.resize(source_mask_crop, (tw, th), interpolation=cv2.INTER_NEAREST)
+    region_mask = np.maximum((source_mask_to_target > 0).astype(np.uint8), (target_mask_crop > 0).astype(np.uint8)) * 255
+    source_text, _target_text, text_diag = changed_text_masks(
+        source_to_target, target_crop, region_mask,
+        tolerance_px=max(1, int(getattr(cfg, "rigid_container_source_text_tolerance_px", 2))),
+        min_unique_ratio=float(getattr(cfg, "rigid_container_source_text_unique_ratio", 0.055)),
+        max_component_fraction=float(getattr(cfg, "rigid_container_source_text_max_component_fraction", 0.10)),
+    )
+    if cv2.countNonZero(source_text) <= 0:
+        diag.update({"reason": "no_changed_text", "text_diag": text_diag})
+        return None, diag
+    seed = cv2.resize(source_text, (source_crop.shape[1], source_crop.shape[0]), interpolation=cv2.INTER_NEAREST)
+    dilate_px = max(0, int(getattr(cfg, "rigid_container_changed_text_gate_dilate_px", 1)))
+    if dilate_px > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_px * 2 + 1, dilate_px * 2 + 1))
+        seed = cv2.dilate(seed, k, iterations=1)
+    seed = cv2.bitwise_and(seed, source_mask_crop)
+
+    # `changed_text_masks` proves edition-exclusive lettering but is deliberately
+    # subtractive; coincident SOURCE/TARGET strokes are absent from that mask.  Do
+    # not render the unique seed itself.  Instead use it to select whole SOURCE
+    # text components from the conservative text selector.  This keeps complete
+    # Chinese glyphs while still excluding shared illustration ink (p-194 class).
+    full_text = target_text_mask_in_container(source_crop, source_mask_crop)
+    gate = np.zeros_like(seed)
+    selected_components = 0
+    total_components = 0
+    if cv2.countNonZero(full_text) > 0:
+        n, labels, stats, _ = cv2.connectedComponentsWithStats((full_text > 0).astype(np.uint8), 8)
+        total_components = max(0, int(n - 1))
+        # Seed proximity is slightly more forgiving than the final write fringe: a
+        # glyph can share most strokes with JP but still contain one unique radical.
+        sk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        select_seed = cv2.dilate(seed, sk, iterations=1)
+        for idx in range(1, n):
+            comp = labels == idx
+            if np.any(comp & (select_seed > 0)):
+                gate[comp] = 255
+                selected_components += 1
+    if cv2.countNonZero(gate) <= 0:
+        gate = seed
+    # Preserve antialiasing around the selected full glyphs without reconnecting
+    # unrelated artwork.
+    if dilate_px > 0 and cv2.countNonZero(gate) > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_px * 2 + 1, dilate_px * 2 + 1))
+        gate = cv2.dilate(gate, k, iterations=1)
+    gate = cv2.bitwise_and(gate, source_mask_crop)
+    diag.update({
+        "reason": "ok",
+        "authority": "changed_text_seeded_full_source_text_components",
+        "changed_text_pixels_target_space": int(cv2.countNonZero(source_text)),
+        "seed_pixels_source_space": int(cv2.countNonZero(seed)),
+        "gate_pixels_source_space": int(cv2.countNonZero(gate)),
+        "full_text_pixels_source_space": int(cv2.countNonZero(full_text)),
+        "selected_components": int(selected_components),
+        "total_components": int(total_components),
+        "dilate_px": int(dilate_px),
+        "text_diag": text_diag,
+    })
+    return gate, diag
+
+
+def _rigid_target_changed_text_relief(
+    source: np.ndarray,
+    target_reference: np.ndarray,
+    source_mask: np.ndarray,
+    target_mask: np.ndarray,
+    cfg: MaskReplaceConfig,
+    *,
+    target_bubble: BubbleInstance | None = None,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Return TARGET-space edition-exclusive text that may be cleared safely."""
+    shape = target_reference.shape[:2]
+    empty = np.zeros(shape, np.uint8)
+    diag: dict[str, object] = {"enabled": bool(getattr(cfg, "rigid_container_target_changed_text_relief_enabled", True)), "pixels": 0}
+    if not bool(diag["enabled"]):
+        diag["reason"] = "disabled"
+        return empty, diag
+    sbox = _bbox_from_mask(source_mask); tbox = _bbox_from_mask(target_mask)
+    if sbox is None or tbox is None:
+        diag["reason"] = "empty_mask"
+        return empty, diag
+    sx0, sy0, sx1, sy1 = [int(v) for v in sbox]
+    tx0, ty0, tx1, ty1 = [int(v) for v in tbox]
+    source_crop = source[sy0:sy1, sx0:sx1]
+    target_crop = target_reference[ty0:ty1, tx0:tx1]
+    source_mask_crop = source_mask[sy0:sy1, sx0:sx1]
+    target_mask_crop = target_mask[ty0:ty1, tx0:tx1]
+    if source_crop.size == 0 or target_crop.size == 0:
+        diag["reason"] = "empty_crop"
+        return empty, diag
+    th, tw = target_crop.shape[:2]
+    source_to_target = cv2.resize(source_crop, (tw, th), interpolation=cv2.INTER_LINEAR)
+    source_mask_to_target = cv2.resize(source_mask_crop, (tw, th), interpolation=cv2.INTER_NEAREST)
+    region_mask = np.maximum((source_mask_to_target > 0).astype(np.uint8), (target_mask_crop > 0).astype(np.uint8)) * 255
+    _source_text, target_text, text_diag = changed_text_masks(
+        source_to_target, target_crop, region_mask,
+        tolerance_px=max(1, int(getattr(cfg, "rigid_container_source_text_tolerance_px", 2))),
+        min_unique_ratio=float(getattr(cfg, "rigid_container_source_text_unique_ratio", 0.055)),
+        max_component_fraction=float(getattr(cfg, "rigid_container_source_text_max_component_fraction", 0.10)),
+    )
+    relief = np.zeros(shape, np.uint8)
+    # `changed_text_masks` is subtractive: TARGET strokes that overlap SOURCE
+    # disappear from the edition-exclusive mask. Treat those unique TARGET
+    # pixels only as a semantic seed, then recover the *whole* TARGET text
+    # components touched by the seed. This clears complete Japanese glyphs while
+    # shared illustration components remain outside the clear authority.
+    unique_seed = cv2.bitwise_and(target_text, target_mask_crop)
+    full_target_text = target_text_mask_in_container(target_crop, target_mask_crop)
+    local = np.zeros_like(unique_seed)
+    selected_components = 0
+    total_components = 0
+    if cv2.countNonZero(full_target_text) > 0 and cv2.countNonZero(unique_seed) > 0:
+        n, labels, stats, _ = cv2.connectedComponentsWithStats((full_target_text > 0).astype(np.uint8), 8)
+        total_components = max(0, int(n - 1))
+        select_seed = cv2.dilate(
+            unique_seed, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), iterations=1
+        )
+        for idx in range(1, n):
+            comp = labels == idx
+            if np.any(comp & (select_seed > 0)):
+                local[comp] = 255
+                selected_components += 1
+    if cv2.countNonZero(local) <= 0:
+        local = unique_seed.copy()
+    dilate_px = max(0, int(getattr(cfg, "rigid_container_target_changed_text_relief_dilate_px", 2)))
+    if dilate_px > 0 and cv2.countNonZero(local) > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_px * 2 + 1, dilate_px * 2 + 1))
+        local = cv2.dilate(local, k, iterations=1)
+        local = cv2.bitwise_and(local, target_mask_crop)
+    relief[ty0:ty1, tx0:tx1] = local
+
+    # Recover complete TARGET glyph support from Koharu's original semantic text
+    # boxes. The postprocessed polygon can collapse to a small core on large bold
+    # vertical text; `raw_box` is therefore used only to *clear* dark ink inside
+    # the already-verified container. It never enlarges SOURCE write authority.
+    raw_relief = np.zeros(shape, np.uint8)
+    raw_domain_union = np.zeros(shape, np.uint8)
+    raw_diag: dict[str, object] = {"enabled": bool(getattr(cfg, "rigid_container_target_raw_text_clear_enabled", True)), "accepted_boxes": 0}
+    bubble_meta = dict((getattr(target_bubble, "meta", {}) or {})) if target_bubble is not None else {}
+    hints = list(bubble_meta.get("koharu_layout_text_hints") or [])
+    bubble_hints = list(bubble_meta.get("koharu_layout_bubble_hints") or [])
+    region_kind = str(bubble_meta.get("paired_region_kind") or "")
+    if bool(raw_diag["enabled"]) and hints:
+        gray = cv2.cvtColor(target_reference, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(target_reference, cv2.COLOR_BGR2HSV)
+        container_area = max(1, int(cv2.countNonZero(target_mask)))
+        min_conf = float(getattr(cfg, "rigid_container_target_raw_text_min_confidence", 0.50))
+        min_overlap = float(getattr(cfg, "rigid_container_target_raw_text_min_overlap", 0.20))
+        max_fraction = float(getattr(cfg, "rigid_container_target_raw_text_max_area_fraction", 0.48))
+        min_bright = float(getattr(cfg, "rigid_container_target_raw_text_min_bright_ratio", 0.42))
+        max_sat = float(getattr(cfg, "rigid_container_target_raw_text_max_saturation_median", 80.0))
+        gray_thr = int(getattr(cfg, "rigid_container_target_raw_text_gray_threshold", 228))
+        inset = max(0, int(getattr(cfg, "rigid_container_target_raw_text_inset_px", 1)))
+        accepted = []
+
+        # Strongest overlapping semantic bubble.  It is deliberately used only
+        # for TARGET cleanup on large complex/free text; SOURCE write authority
+        # remains the paired-diff changed-text gate.
+        semantic_bubble_mask = None
+        semantic_bubble_hint = None
+        if region_kind in {"complex_text", "free_text"} and bubble_hints:
+            for bh in bubble_hints:
+                if float(bh.get("confidence", 0.0) or 0.0) < min_conf:
+                    continue
+                if float(bh.get("overlap", 0.0) or 0.0) < min_overlap:
+                    continue
+                poly = list(bh.get("polygon") or [])
+                if len(poly) < 3:
+                    continue
+                candidate = (rasterize_polygon(poly, shape) > 0).astype(np.uint8) * 255
+                if cv2.countNonZero(candidate) <= 0:
+                    continue
+                semantic_bubble_mask = candidate
+                semantic_bubble_hint = bh
+                break
+
+        semantic_bubble_distance = (
+            cv2.distanceTransform((semantic_bubble_mask > 0).astype(np.uint8), cv2.DIST_L2, 5)
+            if semantic_bubble_mask is not None else None
+        )
+
+        for hint in hints:
+            if float(hint.get("confidence", 0.0) or 0.0) < min_conf or float(hint.get("overlap", 0.0) or 0.0) < min_overlap:
+                continue
+            box = list(hint.get("raw_box") or [])
+            if len(box) != 4:
+                continue
+            x0, y0, x1, y1 = [int(round(float(v))) for v in box]
+            x0 = max(0, min(shape[1], x0 + inset)); y0 = max(0, min(shape[0], y0 + inset))
+            x1 = max(0, min(shape[1], x1 - inset)); y1 = max(0, min(shape[0], y1 - inset))
+            if x1 <= x0 or y1 <= y0:
+                continue
+            raw_rect = np.zeros(shape, np.uint8); raw_rect[y0:y1, x0:x1] = 255
+            base_roi = cv2.bitwise_and(raw_rect, target_mask)
+            base_area = int(cv2.countNonZero(base_roi))
+            if base_area <= 0:
+                continue
+            area_fraction = float(base_area / container_area)
+
+            # Ordinary semantic boxes stay strictly clipped to paired-diff.  For
+            # a large text box inside complex/free text, the paired polygon may be
+            # just a notched changed-text lane.  Widen the *clear-only* domain to
+            # the verified Koharu bubble polygon, still intersected with raw_box.
+            roi = base_roi
+            clear_domain = "paired_diff"
+            if area_fraction > max_fraction and semantic_bubble_mask is not None:
+                expanded = cv2.bitwise_and(raw_rect, semantic_bubble_mask)
+                if cv2.countNonZero(expanded) > base_area:
+                    roi = expanded
+                    clear_domain = "koharu_bubble_polygon"
+
+            pix = roi > 0
+            area = int(np.count_nonzero(pix))
+            if area <= 0:
+                continue
+            bright_ratio = float(np.mean(gray[pix] >= 220))
+            sat_median = float(np.median(hsv[..., 1][pix]))
+            if bright_ratio < min_bright or sat_median > max_sat:
+                continue
+            dark = ((gray < gray_thr) & pix).astype(np.uint8) * 255
+            if cv2.countNonZero(dark) <= 0:
+                continue
+
+            # Large raw boxes never authorize rectangle clearing.  Changed-text
+            # relief is only a seed; we recover whole TARGET dark components that
+            # touch that seed inside the semantic domain.  Unseeded artwork and
+            # burst boundaries remain protected.
+            raw_policy = "bounded_raw_box"
+            selected_dark = dark
+            seeded_components = 0
+            total_components = 0
+            semantic_unseeded = 0
+            semantic_unseeded_pixels = 0
+            completion_components = 0
+            completion_pixels = 0
+            semantic_full_components = 0
+            semantic_full_pixels = 0
+            edge_spill_components = 0
+            edge_spill_pixels = 0
+            edge_spill_seeded_components = 0
+            edge_spill_neighbor_components = 0
+            edge_spill_padding_px = 0
+            if area_fraction > max_fraction:
+                raw_policy = "large_raw_box_seeded_components"
+                seed = cv2.bitwise_and(relief, roi)
+                seed_dilate = max(1, int(getattr(cfg, "rigid_container_target_raw_text_seed_dilate_px", 3)))
+                sk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (seed_dilate * 2 + 1, seed_dilate * 2 + 1))
+                seed_support = cv2.dilate((seed > 0).astype(np.uint8) * 255, sk, iterations=1) > 0
+                selected_dark = np.zeros_like(dark)
+                n, labels, stats, _ = cv2.connectedComponentsWithStats((dark > 0).astype(np.uint8), 8)
+                total_components = max(0, int(n - 1))
+                max_component_fraction = float(getattr(cfg, "rigid_container_target_raw_text_component_max_fraction", 0.12))
+                min_seed_pixels = max(2, int(getattr(cfg, "rigid_container_target_raw_text_component_min_seed_pixels", 3)))
+                min_seed_fraction = max(0.0, float(getattr(cfg, "rigid_container_target_raw_text_component_min_seed_fraction", 0.006)))
+                rx0, ry0, rw, rh = cv2.boundingRect((roi > 0).astype(np.uint8))
+                rw = max(1, int(rw)); rh = max(1, int(rh))
+                selected_labels: set[int] = set()
+                selected_boxes: list[tuple[int, int, int, int]] = []
+                component_limit = max(48, int(round(max(container_area, area) * max_component_fraction)))
+                for lab in range(1, n):
+                    cx, cy, cw, ch, comp_area = [int(v) for v in stats[lab]]
+                    if comp_area < 2 or comp_area > component_limit:
+                        continue
+                    comp = labels == lab
+                    evidence = int(np.count_nonzero(comp & seed_support))
+                    if evidence < min_seed_pixels or float(evidence / max(1, comp_area)) < min_seed_fraction:
+                        continue
+                    span_x = float(cw / rw); span_y = float(ch / rh)
+                    if span_x > 0.72 and span_y > 0.38:
+                        continue
+                    if span_y > 0.82 and span_x > 0.34:
+                        continue
+                    selected_dark[comp] = 255
+                    selected_labels.add(lab)
+                    selected_boxes.append((cx, cy, cx + cw, cy + ch))
+                    seeded_components += 1
+
+                # High-confidence raw text boxes can contain complete glyphs or
+                # punctuation that are spatially separate from every changed-text
+                # seed.  On a verified bright Koharu bubble, admit only compact
+                # components whose local halo is paper-like and which form a short
+                # spatial chain from already seeded text.  This recovers disconnected
+                # TARGET Japanese without granting rectangle-level clear authority.
+                allow_unseeded = bool(getattr(cfg, "rigid_container_target_raw_text_unseeded_semantic_enabled", True))
+                allow_unseeded = bool(
+                    allow_unseeded
+                    and clear_domain == "koharu_bubble_polygon"
+                    and float(hint.get("confidence", 0.0) or 0.0) >= float(getattr(cfg, "rigid_container_target_raw_text_unseeded_min_confidence", 0.80))
+                    and bright_ratio >= float(getattr(cfg, "rigid_container_target_raw_text_unseeded_min_bright_ratio", 0.60))
+                    and selected_boxes
+                )
+                if allow_unseeded:
+                    max_span_x = float(getattr(cfg, "rigid_container_target_raw_text_unseeded_max_span_x", 0.58))
+                    max_span_y = float(getattr(cfg, "rigid_container_target_raw_text_unseeded_max_span_y", 0.35))
+                    halo_px = max(2, int(getattr(cfg, "rigid_container_target_raw_text_unseeded_halo_px", 7)))
+                    min_halo_bright = float(getattr(cfg, "rigid_container_target_raw_text_unseeded_min_halo_bright_ratio", 0.72))
+                    max_halo_sat = float(getattr(cfg, "rigid_container_target_raw_text_unseeded_max_halo_saturation_median", 45.0))
+                    max_gap = max(
+                        int(getattr(cfg, "rigid_container_target_raw_text_unseeded_neighbor_gap_min_px", 10)),
+                        int(round(min(rw, rh) * float(getattr(cfg, "rigid_container_target_raw_text_unseeded_neighbor_gap_ratio", 0.38)))),
+                    )
+
+                    def _box_gap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+                        ax0, ay0, ax1, ay1 = a; bx0, by0, bx1, by1 = b
+                        dx = max(0, max(ax0, bx0) - min(ax1, bx1))
+                        dy = max(0, max(ay0, by0) - min(ay1, by1))
+                        return float((dx * dx + dy * dy) ** 0.5)
+
+                    # Iterate so separated punctuation can be reached through the
+                    # preceding character, but cannot jump arbitrarily across art.
+                    changed = True
+                    while changed:
+                        changed = False
+                        for lab in range(1, n):
+                            if lab in selected_labels:
+                                continue
+                            cx, cy, cw, ch, comp_area = [int(v) for v in stats[lab]]
+                            if comp_area < 3 or comp_area > component_limit:
+                                continue
+                            span_x = float(cw / rw); span_y = float(ch / rh)
+                            if span_x > max_span_x or span_y > max_span_y:
+                                continue
+                            bbox = (cx, cy, cx + cw, cy + ch)
+                            if min((_box_gap(bbox, sbx) for sbx in selected_boxes), default=float("inf")) > max_gap:
+                                continue
+                            comp = (labels == lab)
+                            min_boundary_dist = float(getattr(cfg, "rigid_container_target_raw_text_unseeded_min_boundary_distance_px", 8.0))
+                            if semantic_bubble_distance is not None and float(np.min(semantic_bubble_distance[comp])) < min_boundary_dist:
+                                continue
+                            lx0 = max(0, cx - halo_px); ly0 = max(0, cy - halo_px)
+                            lx1 = min(shape[1], cx + cw + halo_px); ly1 = min(shape[0], cy + ch + halo_px)
+                            local_comp = comp[ly0:ly1, lx0:lx1].astype(np.uint8)
+                            hk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (halo_px * 2 + 1, halo_px * 2 + 1))
+                            halo = (cv2.dilate(local_comp, hk, iterations=1) > 0) & (local_comp == 0)
+                            halo &= (roi[ly0:ly1, lx0:lx1] > 0)
+                            halo_pixels = int(np.count_nonzero(halo))
+                            if halo_pixels < 8:
+                                continue
+                            halo_bright = float(np.mean(gray[ly0:ly1, lx0:lx1][halo] >= 220))
+                            halo_sat_values = hsv[ly0:ly1, lx0:lx1, 1][halo]
+                            halo_sat = float(np.median(halo_sat_values))
+                            halo_high_sat = float(np.mean(halo_sat_values > 70))
+                            max_halo_high_sat = float(getattr(cfg, "rigid_container_target_raw_text_unseeded_max_halo_high_saturation_ratio", 0.08))
+                            if halo_bright < min_halo_bright or halo_sat > max_halo_sat or halo_high_sat > max_halo_high_sat:
+                                continue
+                            selected_dark[comp] = 255
+                            selected_labels.add(lab)
+                            selected_boxes.append(bbox)
+                            semantic_unseeded += 1
+                            semantic_unseeded_pixels += comp_area
+                            changed = True
+
+                # High-confidence semantic completion for raw-box edge spill.
+                # Koharu raw text boxes can stop a few pixels inside a bold glyph;
+                # requiring every disconnected edge fragment to chain from the
+                # changed-text seed leaves visible JP slivers (p-194 class).  Under
+                # a verified bright/neutral bubble, admit only compact text-like
+                # components that intersect the original raw box and remain near
+                # already seeded text.  This is TARGET-clear authority only.
+                strict_completion = bool(
+                    getattr(cfg, "rigid_container_target_raw_text_completion_enabled", True)
+                    and clear_domain == "koharu_bubble_polygon"
+                    and selected_boxes
+                    and float(hint.get("confidence", 0.0) or 0.0) >= float(getattr(cfg, "rigid_container_target_raw_text_completion_min_confidence", 0.90))
+                    and float((semantic_bubble_hint or {}).get("overlap", 0.0) or 0.0) >= float(getattr(cfg, "rigid_container_target_raw_text_completion_min_bubble_overlap", 0.90))
+                    and bright_ratio >= float(getattr(cfg, "rigid_container_target_raw_text_completion_min_bright_ratio", 0.62))
+                    and sat_median <= float(getattr(cfg, "rigid_container_target_raw_text_completion_max_saturation_median", 35.0))
+                )
+                if strict_completion:
+                    pad = max(0, int(getattr(cfg, "rigid_container_target_raw_text_completion_padding_px", 10)))
+                    padded_rect = np.zeros(shape, np.uint8)
+                    px0 = max(0, x0 - pad); py0 = max(0, y0 - pad)
+                    px1 = min(shape[1], x1 + pad); py1 = min(shape[0], y1 + pad)
+                    padded_rect[py0:py1, px0:px1] = 255
+                    completion_roi = cv2.bitwise_and(padded_rect, semantic_bubble_mask)
+                    completion_dark = ((gray < gray_thr) & (completion_roi > 0)).astype(np.uint8) * 255
+                    cn, clabels, cstats, _ = cv2.connectedComponentsWithStats((completion_dark > 0).astype(np.uint8), 8)
+                    crx, cry, crw, crh = cv2.boundingRect((completion_roi > 0).astype(np.uint8))
+                    crw = max(1, int(crw)); crh = max(1, int(crh))
+                    c_limit = max(48, int(round(max(container_area, int(cv2.countNonZero(completion_roi))) * max_component_fraction)))
+                    c_halo_px = max(2, int(getattr(cfg, "rigid_container_target_raw_text_completion_halo_px", 7)))
+                    c_min_halo_bright = float(getattr(cfg, "rigid_container_target_raw_text_completion_min_halo_bright_ratio", 0.72))
+                    c_max_halo_sat = float(getattr(cfg, "rigid_container_target_raw_text_completion_max_halo_saturation_median", 45.0))
+                    c_max_aspect = float(getattr(cfg, "rigid_container_target_raw_text_completion_max_aspect", 14.0))
+                    c_min_boundary = float(getattr(cfg, "rigid_container_target_raw_text_completion_min_boundary_distance_px", 4.0))
+                    c_gap = max(
+                        int(getattr(cfg, "rigid_container_target_raw_text_completion_neighbor_gap_min_px", 14)),
+                        int(round(min(crw, crh) * float(getattr(cfg, "rigid_container_target_raw_text_completion_neighbor_gap_ratio", 0.48)))),
+                    )
+                    for lab in range(1, cn):
+                        cx, cy, cw, ch, comp_area = [int(v) for v in cstats[lab]]
+                        if comp_area < 2 or comp_area > c_limit or cw < 1 or ch < 1:
+                            continue
+                        aspect = max(float(cw / max(1, ch)), float(ch / max(1, cw)))
+                        if aspect > c_max_aspect:
+                            continue
+                        span_x = float(cw / crw); span_y = float(ch / crh)
+                        if span_x > 0.68 and span_y > 0.34:
+                            continue
+                        if span_y > 0.72 and span_x > 0.28:
+                            continue
+                        comp = clabels == lab
+                        raw_overlap = int(np.count_nonzero(comp & (raw_rect > 0)))
+                        if raw_overlap < max(2, int(round(comp_area * 0.18))):
+                            continue
+                        bbox = (cx, cy, cx + cw, cy + ch)
+                        if min((_box_gap(bbox, sbx) for sbx in selected_boxes), default=float("inf")) > c_gap:
+                            continue
+                        if semantic_bubble_distance is not None and float(np.min(semantic_bubble_distance[comp])) < c_min_boundary:
+                            continue
+                        lx0 = max(0, cx - c_halo_px); ly0 = max(0, cy - c_halo_px)
+                        lx1 = min(shape[1], cx + cw + c_halo_px); ly1 = min(shape[0], cy + ch + c_halo_px)
+                        local_comp = comp[ly0:ly1, lx0:lx1].astype(np.uint8)
+                        hk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (c_halo_px * 2 + 1, c_halo_px * 2 + 1))
+                        halo = (cv2.dilate(local_comp, hk, iterations=1) > 0) & (local_comp == 0)
+                        halo &= (completion_roi[ly0:ly1, lx0:lx1] > 0)
+                        if int(np.count_nonzero(halo)) < 8:
+                            continue
+                        halo_bright = float(np.mean(gray[ly0:ly1, lx0:lx1][halo] >= 220))
+                        halo_sat_values = hsv[ly0:ly1, lx0:lx1, 1][halo]
+                        halo_sat = float(np.median(halo_sat_values))
+                        halo_high_sat = float(np.mean(halo_sat_values > 70))
+                        c_max_halo_high_sat = float(getattr(cfg, "rigid_container_target_raw_text_completion_max_halo_high_saturation_ratio", 0.08))
+                        if halo_bright < c_min_halo_bright or halo_sat > c_max_halo_sat or halo_high_sat > c_max_halo_high_sat:
+                            continue
+                        before = int(np.count_nonzero(selected_dark[comp]))
+                        selected_dark[comp] = 255
+                        if before < comp_area:
+                            completion_components += 1
+                            completion_pixels += int(comp_area - before)
+                    # Final high-confidence raw-box completion: once Koharu has
+                    # supplied a strong text raw_box inside a strong semantic bubble,
+                    # every compact dark component inside that raw_box is eligible for
+                    # TARGET-clear authority when its local halo is neutral/white paper
+                    # and it stays away from the bubble boundary.  This intentionally
+                    # does *not* require a proximity chain to changed-text seeds: bold
+                    # vertical Japanese columns and separated punctuation can be fully
+                    # disconnected in the subtractive diff (p-194 class).  The rule is
+                    # TARGET-clear-only; it never enlarges SOURCE write authority.
+                    allow_full_raw = bool(
+                        getattr(cfg, "rigid_container_target_raw_text_full_component_enabled", True)
+                        and clear_domain == "koharu_bubble_polygon"
+                        and float(hint.get("confidence", 0.0) or 0.0) >= float(getattr(cfg, "rigid_container_target_raw_text_full_component_min_confidence", 0.90))
+                        and float((semantic_bubble_hint or {}).get("overlap", 0.0) or 0.0) >= float(getattr(cfg, "rigid_container_target_raw_text_full_component_min_bubble_overlap", 0.90))
+                        and bright_ratio >= float(getattr(cfg, "rigid_container_target_raw_text_full_component_min_bright_ratio", 0.62))
+                        and sat_median <= float(getattr(cfg, "rigid_container_target_raw_text_full_component_max_saturation_median", 35.0))
+                    )
+                    if allow_full_raw:
+                        raw_overlap_fraction = float(getattr(cfg, "rigid_container_target_raw_text_full_component_min_raw_overlap_fraction", 0.55))
+                        full_min_boundary = float(getattr(cfg, "rigid_container_target_raw_text_full_component_min_boundary_distance_px", 8.0))
+                        full_min_halo_bright = float(getattr(cfg, "rigid_container_target_raw_text_full_component_min_halo_bright_ratio", 0.68))
+                        full_max_halo_sat = float(getattr(cfg, "rigid_container_target_raw_text_full_component_max_halo_saturation_median", 35.0))
+                        full_max_halo_high_sat = float(getattr(cfg, "rigid_container_target_raw_text_full_component_max_halo_high_saturation_ratio", 0.08))
+                        for lab in range(1, cn):
+                            cx, cy, cw, ch, comp_area = [int(v) for v in cstats[lab]]
+                            if comp_area < 2 or comp_area > c_limit or cw < 1 or ch < 1:
+                                continue
+                            comp = clabels == lab
+                            if int(np.count_nonzero(selected_dark[comp])) >= int(round(comp_area * 0.80)):
+                                continue
+                            raw_overlap = int(np.count_nonzero(comp & (raw_rect > 0)))
+                            if raw_overlap < max(2, int(round(comp_area * raw_overlap_fraction))):
+                                continue
+                            aspect = max(float(cw / max(1, ch)), float(ch / max(1, cw)))
+                            if aspect > c_max_aspect:
+                                continue
+                            span_x = float(cw / crw); span_y = float(ch / crh)
+                            if span_x > 0.68 and span_y > 0.34:
+                                continue
+                            if span_y > 0.72 and span_x > 0.28:
+                                continue
+                            if semantic_bubble_distance is not None and float(np.min(semantic_bubble_distance[comp])) < full_min_boundary:
+                                continue
+                            lx0 = max(0, cx - c_halo_px); ly0 = max(0, cy - c_halo_px)
+                            lx1 = min(shape[1], cx + cw + c_halo_px); ly1 = min(shape[0], cy + ch + c_halo_px)
+                            local_comp = comp[ly0:ly1, lx0:lx1].astype(np.uint8)
+                            hk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (c_halo_px * 2 + 1, c_halo_px * 2 + 1))
+                            halo = (cv2.dilate(local_comp, hk, iterations=1) > 0) & (local_comp == 0)
+                            halo &= (completion_roi[ly0:ly1, lx0:lx1] > 0)
+                            halo_pixels = int(np.count_nonzero(halo))
+                            if halo_pixels < 8:
+                                continue
+                            halo_gray = gray[ly0:ly1, lx0:lx1][halo]
+                            halo_sat_values = hsv[ly0:ly1, lx0:lx1, 1][halo]
+                            halo_bright = float(np.mean(halo_gray >= 220))
+                            halo_sat = float(np.median(halo_sat_values))
+                            halo_high_sat = float(np.mean(halo_sat_values > 70))
+                            if halo_bright < full_min_halo_bright or halo_sat > full_max_halo_sat or halo_high_sat > full_max_halo_high_sat:
+                                continue
+                            before = int(np.count_nonzero(selected_dark[comp]))
+                            selected_dark[comp] = 255
+                            added = max(0, int(comp_area - before))
+                            if added > 0:
+                                semantic_full_components += 1
+                                semantic_full_pixels += added
+                        if semantic_full_pixels > 0:
+                            raw_domain_union = np.maximum(raw_domain_union, completion_roi)
+
+                    if completion_pixels > 0:
+                        raw_domain_union = np.maximum(raw_domain_union, completion_roi)
+                if cv2.countNonZero(selected_dark) <= 0:
+                    continue
+
+            # v2.3.89: raw-box edge spill completion.  A Koharu text raw_box can
+            # terminate *inside* the last punctuation/glyph component.  In that
+            # case the existing clear mask contains only the few pixels that lie
+            # inside raw_box and leaves the rest of the TARGET glyph visible.
+            # Follow only the same compact dark component across the raw-box edge,
+            # then allow a very short chain of adjacent punctuation components.
+            # This authority is TARGET-clear-only and stays inside a verified
+            # semantic bubble; SOURCE write geometry is untouched.
+            allow_edge_spill = bool(
+                getattr(cfg, "rigid_container_target_raw_text_edge_spill_enabled", True)
+                and semantic_bubble_mask is not None
+                and cv2.countNonZero(selected_dark) > 0
+                and float(hint.get("confidence", 0.0) or 0.0) >= float(getattr(cfg, "rigid_container_target_raw_text_edge_spill_min_confidence", 0.90))
+                and float((semantic_bubble_hint or {}).get("overlap", 0.0) or 0.0) >= float(getattr(cfg, "rigid_container_target_raw_text_edge_spill_min_bubble_overlap", 0.90))
+                and bright_ratio >= float(getattr(cfg, "rigid_container_target_raw_text_completion_min_bright_ratio", 0.62))
+                and sat_median <= float(getattr(cfg, "rigid_container_target_raw_text_completion_max_saturation_median", 35.0))
+            )
+            if allow_edge_spill:
+                raw_w = max(1, x1 - x0); raw_h = max(1, y1 - y0)
+                edge_spill_padding_px = int(np.clip(
+                    round(min(raw_w, raw_h) * float(getattr(cfg, "rigid_container_target_raw_text_edge_spill_padding_ratio", 0.45))),
+                    int(getattr(cfg, "rigid_container_target_raw_text_edge_spill_padding_min_px", 28)),
+                    int(getattr(cfg, "rigid_container_target_raw_text_edge_spill_padding_max_px", 112)),
+                ))
+                ex0 = max(0, x0 - edge_spill_padding_px); ey0 = max(0, y0 - edge_spill_padding_px)
+                ex1 = min(shape[1], x1 + edge_spill_padding_px); ey1 = min(shape[0], y1 + edge_spill_padding_px)
+                spill_rect = np.zeros(shape, np.uint8)
+                spill_rect[ey0:ey1, ex0:ex1] = 255
+                spill_roi = cv2.bitwise_and(spill_rect, semantic_bubble_mask)
+                spill_dark = ((gray < gray_thr) & (spill_roi > 0)).astype(np.uint8) * 255
+                sn, slabels, sstats, _ = cv2.connectedComponentsWithStats((spill_dark > 0).astype(np.uint8), 8)
+                spill_area = max(1, int(cv2.countNonZero(spill_roi)))
+                spill_component_limit = max(
+                    48,
+                    int(round(spill_area * float(getattr(cfg, "rigid_container_target_raw_text_component_max_fraction", 0.12)))),
+                )
+                spill_seed_dilate = max(1, int(getattr(cfg, "rigid_container_target_raw_text_edge_spill_seed_dilate_px", 3)))
+                spill_seed = cv2.dilate(
+                    (selected_dark > 0).astype(np.uint8) * 255,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (spill_seed_dilate * 2 + 1, spill_seed_dilate * 2 + 1)),
+                    iterations=1,
+                ) > 0
+                selected_spill_labels: set[int] = set()
+                selected_spill_boxes: list[tuple[int, int, int, int]] = []
+                # Existing selected text boxes are anchors for punctuation that is
+                # split into a bar/dot or dakuten-like disconnected component.
+                an, alabels, astats, _ = cv2.connectedComponentsWithStats((selected_dark > 0).astype(np.uint8), 8)
+                for alab in range(1, an):
+                    ax, ay, aw, ah, aa = [int(v) for v in astats[alab]]
+                    if aa >= 2:
+                        selected_spill_boxes.append((ax, ay, ax + aw, ay + ah))
+
+                def _edge_box_gap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+                    ax0, ay0, ax1, ay1 = a; bx0, by0, bx1, by1 = b
+                    dx = max(0, max(ax0, bx0) - min(ax1, bx1))
+                    dy = max(0, max(ay0, by0) - min(ay1, by1))
+                    return float((dx * dx + dy * dy) ** 0.5)
+
+                spill_halo_px = max(2, int(getattr(cfg, "rigid_container_target_raw_text_completion_halo_px", 7)))
+                spill_min_halo_bright = float(getattr(cfg, "rigid_container_target_raw_text_completion_min_halo_bright_ratio", 0.72))
+                spill_max_halo_sat = float(getattr(cfg, "rigid_container_target_raw_text_completion_max_halo_saturation_median", 45.0))
+                spill_max_halo_high_sat = float(getattr(cfg, "rigid_container_target_raw_text_completion_max_halo_high_saturation_ratio", 0.08))
+                spill_max_aspect = float(getattr(cfg, "rigid_container_target_raw_text_completion_max_aspect", 14.0))
+                spill_min_boundary = float(getattr(cfg, "rigid_container_target_raw_text_edge_spill_min_boundary_distance_px", 8.0))
+                spill_neighbor_gap = max(1, int(getattr(cfg, "rigid_container_target_raw_text_edge_spill_neighbor_gap_px", 18)))
+
+                def _spill_component_safe(lab: int) -> tuple[bool, tuple[int, int, int, int] | None, np.ndarray | None]:
+                    cx, cy, cw, ch, comp_area = [int(v) for v in sstats[lab]]
+                    if comp_area < 2 or comp_area > spill_component_limit or cw < 1 or ch < 1:
+                        return False, None, None
+                    aspect = max(float(cw / max(1, ch)), float(ch / max(1, cw)))
+                    if aspect > spill_max_aspect:
+                        return False, None, None
+                    span_x = float(cw / max(1, ex1 - ex0)); span_y = float(ch / max(1, ey1 - ey0))
+                    if span_x > 0.68 and span_y > 0.34:
+                        return False, None, None
+                    if span_y > 0.72 and span_x > 0.28:
+                        return False, None, None
+                    comp = slabels == lab
+                    # Only an actual spill may extend authority: at least some of
+                    # the component must lie outside the detector raw_box.
+                    outside = int(np.count_nonzero(comp & (raw_rect == 0)))
+                    if outside <= 0:
+                        return False, None, None
+                    if semantic_bubble_distance is not None and float(np.min(semantic_bubble_distance[comp])) < spill_min_boundary:
+                        return False, None, None
+                    lx0 = max(0, cx - spill_halo_px); ly0 = max(0, cy - spill_halo_px)
+                    lx1 = min(shape[1], cx + cw + spill_halo_px); ly1 = min(shape[0], cy + ch + spill_halo_px)
+                    local_comp = comp[ly0:ly1, lx0:lx1].astype(np.uint8)
+                    hk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (spill_halo_px * 2 + 1, spill_halo_px * 2 + 1))
+                    halo = (cv2.dilate(local_comp, hk, iterations=1) > 0) & (local_comp == 0)
+                    halo &= (spill_roi[ly0:ly1, lx0:lx1] > 0)
+                    if int(np.count_nonzero(halo)) < 8:
+                        return False, None, None
+                    halo_gray = gray[ly0:ly1, lx0:lx1][halo]
+                    halo_sat_values = hsv[ly0:ly1, lx0:lx1, 1][halo]
+                    halo_bright = float(np.mean(halo_gray >= 220))
+                    halo_sat = float(np.median(halo_sat_values))
+                    halo_high_sat = float(np.mean(halo_sat_values > 70))
+                    if halo_bright < spill_min_halo_bright or halo_sat > spill_max_halo_sat or halo_high_sat > spill_max_halo_high_sat:
+                        return False, None, None
+                    return True, (cx, cy, cx + cw, cy + ch), comp
+
+                # Pass 1: recover complete components that are already clipped by
+                # raw_box.  This is the strongest and safest p-194 signal.
+                for lab in range(1, sn):
+                    comp = slabels == lab
+                    if int(np.count_nonzero(comp & spill_seed)) < 2:
+                        continue
+                    ok, bbox, safe_comp = _spill_component_safe(lab)
+                    if not ok or bbox is None or safe_comp is None:
+                        continue
+                    before = int(np.count_nonzero(selected_dark[safe_comp]))
+                    selected_dark[safe_comp] = 255
+                    added = max(0, int(np.count_nonzero(safe_comp) - before))
+                    if added > 0:
+                        selected_spill_labels.add(lab)
+                        selected_spill_boxes.append(bbox)
+                        edge_spill_components += 1
+                        edge_spill_seeded_components += 1
+                        edge_spill_pixels += added
+
+                # Pass 2: short punctuation chain (e.g. the detached dot of '!').
+                # Iterate only inside the bounded spill ROI and only over neutral
+                # compact components, preventing jumps to nearby coloured artwork.
+                changed_spill = True
+                while changed_spill:
+                    changed_spill = False
+                    for lab in range(1, sn):
+                        if lab in selected_spill_labels:
+                            continue
+                        ok, bbox, safe_comp = _spill_component_safe(lab)
+                        if not ok or bbox is None or safe_comp is None:
+                            continue
+                        if int(np.count_nonzero(selected_dark[safe_comp])) >= int(round(np.count_nonzero(safe_comp) * 0.80)):
+                            continue
+                        if min((_edge_box_gap(bbox, anchor) for anchor in selected_spill_boxes), default=float("inf")) > spill_neighbor_gap:
+                            continue
+                        before = int(np.count_nonzero(selected_dark[safe_comp]))
+                        selected_dark[safe_comp] = 255
+                        added = max(0, int(np.count_nonzero(safe_comp) - before))
+                        if added <= 0:
+                            continue
+                        selected_spill_labels.add(lab)
+                        selected_spill_boxes.append(bbox)
+                        edge_spill_components += 1
+                        edge_spill_neighbor_components += 1
+                        edge_spill_pixels += added
+                        changed_spill = True
+                if edge_spill_pixels > 0:
+                    raw_domain_union = np.maximum(raw_domain_union, spill_roi)
+            raw_relief = np.maximum(raw_relief, selected_dark)
+            raw_domain_union = np.maximum(raw_domain_union, roi)
+            accepted.append({
+                "raw_box": [x0, y0, x1, y1],
+                "confidence": float(hint.get("confidence", 0.0) or 0.0),
+                "overlap": float(hint.get("overlap", 0.0) or 0.0),
+                "bright_ratio": round(bright_ratio, 4),
+                "saturation_median": round(sat_median, 3),
+                "area_fraction": round(area_fraction, 4),
+                "clear_domain": clear_domain,
+                "semantic_bubble_overlap": round(float((semantic_bubble_hint or {}).get("overlap", 0.0) or 0.0), 4),
+                "policy": raw_policy,
+                "dark_pixels": int(cv2.countNonZero(dark)),
+                "selected_dark_pixels": int(cv2.countNonZero(selected_dark)),
+                "seeded_components": int(seeded_components),
+                "semantic_unseeded_components": int(semantic_unseeded),
+                "semantic_unseeded_pixels": int(semantic_unseeded_pixels),
+                "semantic_completion_components": int(completion_components),
+                "semantic_completion_pixels": int(completion_pixels),
+                "semantic_full_components": int(semantic_full_components),
+                "semantic_full_pixels": int(semantic_full_pixels),
+                "semantic_edge_spill_components": int(edge_spill_components),
+                "semantic_edge_spill_seeded_components": int(edge_spill_seeded_components),
+                "semantic_edge_spill_neighbor_components": int(edge_spill_neighbor_components),
+                "semantic_edge_spill_pixels": int(edge_spill_pixels),
+                "semantic_edge_spill_padding_px": int(edge_spill_padding_px),
+                "total_components": int(total_components),
+            })
+        raw_dilate = max(0, int(getattr(cfg, "rigid_container_target_raw_text_dilate_px", 2)))
+        if raw_dilate > 0 and cv2.countNonZero(raw_relief) > 0:
+            rk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (raw_dilate * 2 + 1, raw_dilate * 2 + 1))
+            raw_relief = cv2.dilate(raw_relief, rk, iterations=1)
+            if cv2.countNonZero(raw_domain_union) > 0:
+                raw_relief = cv2.bitwise_and(raw_relief, raw_domain_union)
+            else:
+                raw_relief = cv2.bitwise_and(raw_relief, target_mask)
+        raw_diag.update({"accepted_boxes": len(accepted), "boxes": accepted, "pixels": int(cv2.countNonZero(raw_relief)), "dilate_px": int(raw_dilate)})
+        relief = np.maximum(relief, raw_relief)
+    elif not hints:
+        raw_diag["reason"] = "no_koharu_text_hints"
+    diag.update({
+        "reason": "ok" if cv2.countNonZero(relief) > 0 else "no_changed_target_text",
+        "authority": "changed_text_seeded_full_target_text_components",
+        "pixels": int(cv2.countNonZero(relief)),
+        "unique_seed_pixels": int(cv2.countNonZero(unique_seed)),
+        "full_target_text_pixels": int(cv2.countNonZero(full_target_text)),
+        "selected_components": int(selected_components),
+        "total_components": int(total_components),
+        "dilate_px": int(dilate_px),
+        "text_diag": text_diag,
+        "raw_text_clear": raw_diag,
+    })
+    return relief, diag
+
+
+def _rigid_source_semantic_text_extension(
+    source: np.ndarray,
+    target_shape: tuple[int, int],
+    cfg: MaskReplaceConfig,
+    *,
+    source_bubble: BubbleInstance | None,
+    target_bubble: BubbleInstance | None,
+    scale: float,
+    source_pair_origin: tuple[int, int],
+    target_pair_origin: tuple[float, float],
+    paper: float,
+    alpha_floor: float,
+    source_gray: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
+    """Extrapolate verified SOURCE text pixels clipped by a narrow paired lane.
+
+    This is intentionally SOURCE-text-only.  Koharu raw text geometry chooses the
+    candidate zone, a Koharu bubble polygon supplies a semantic container, and
+    compact white-paper components away from the bubble boundary become glyph
+    authority.  The already-selected rigid scale/translation is merely extended to
+    those glyph coordinates; no SOURCE paper/artwork is copied.
+    """
+    th, tw = [int(v) for v in target_shape]
+    empty_alpha = np.zeros((th, tw), np.float32)
+    empty_mask = np.zeros((th, tw), np.uint8)
+    diag: dict[str, object] = {
+        "enabled": bool(getattr(cfg, "rigid_container_source_raw_text_write_enabled", True)),
+        "applied": False,
+        "selected_components": 0,
+        "selected_pixels_source": 0,
+        "write_pixels_target": 0,
+    }
+    if not bool(diag["enabled"]) or source_bubble is None or target_bubble is None:
+        diag["reason"] = "disabled_or_missing_pair"
+        return empty_alpha, empty_mask, diag
+    smeta = dict(getattr(source_bubble, "meta", {}) or {})
+    tmeta = dict(getattr(target_bubble, "meta", {}) or {})
+    text_hints = list(smeta.get("koharu_layout_text_hints") or [])
+    source_bubble_hints = list(smeta.get("koharu_layout_bubble_hints") or [])
+    target_bubble_hints = list(tmeta.get("koharu_layout_bubble_hints") or [])
+    min_conf = float(getattr(cfg, "rigid_container_source_raw_text_write_min_confidence", 0.80))
+    min_overlap = float(getattr(cfg, "rigid_container_source_raw_text_write_min_overlap", 0.20))
+    text_hint = next((h for h in text_hints if float(h.get("confidence", 0.0) or 0.0) >= min_conf and float(h.get("overlap", 0.0) or 0.0) >= min_overlap and len(h.get("raw_box") or []) == 4), None)
+    sb_hint = next((h for h in source_bubble_hints if float(h.get("confidence", 0.0) or 0.0) >= 0.50 and float(h.get("overlap", 0.0) or 0.0) >= min_overlap and len(h.get("polygon") or []) >= 3), None)
+    tb_hint = next((h for h in target_bubble_hints if float(h.get("confidence", 0.0) or 0.0) >= 0.50 and float(h.get("overlap", 0.0) or 0.0) >= min_overlap and len(h.get("polygon") or []) >= 3), None)
+    # SOURCE Koharu can miss a burst-balloon polygon even when its high-confidence
+    # raw text box is excellent (p-194 class).  Requiring a SOURCE bubble hint here
+    # clips punctuation that extends beyond the paired diff lane.  The raw text box
+    # itself is already a semantic *text* authority, so allow it to define the SOURCE
+    # domain when the bubble polygon is absent.  TARGET still requires a Koharu bubble
+    # polygon, which keeps the projected write inside the colour edition's container.
+    if text_hint is None or tb_hint is None:
+        diag["reason"] = "missing_high_confidence_semantic_geometry"
+        return empty_alpha, empty_mask, diag
+
+    sh, sw = source.shape[:2]
+    target_domain = (rasterize_polygon(tb_hint["polygon"], (th, tw)) > 0).astype(np.uint8) * 255
+    if cv2.countNonZero(target_domain) <= 0:
+        diag["reason"] = "empty_target_semantic_domain"
+        return empty_alpha, empty_mask, diag
+    x0, y0, x1, y1 = [int(round(float(v))) for v in text_hint["raw_box"]]
+    x0 = max(0, min(sw, x0)); x1 = max(0, min(sw, x1))
+    y0 = max(0, min(sh, y0)); y1 = max(0, min(sh, y1))
+    if x1 <= x0 or y1 <= y0:
+        diag["reason"] = "invalid_raw_box"
+        return empty_alpha, empty_mask, diag
+    raw_roi = np.zeros((sh, sw), np.uint8); raw_roi[y0:y1, x0:x1] = 255
+    if sb_hint is not None:
+        source_domain = (rasterize_polygon(sb_hint["polygon"], (sh, sw)) > 0).astype(np.uint8) * 255
+        if cv2.countNonZero(source_domain) <= 0:
+            diag["reason"] = "empty_source_semantic_domain"
+            return empty_alpha, empty_mask, diag
+        raw_roi = cv2.bitwise_and(raw_roi, source_domain)
+        source_domain_authority = "koharu_source_bubble_polygon"
+    else:
+        # Safe fallback: never broaden beyond the high-confidence SOURCE raw text box.
+        # This deliberately excludes nearby illustration ink (the p-194 chibi is
+        # outside the raw text box) while recovering bottom punctuation clipped by
+        # the narrower paired lane.
+        source_domain = raw_roi.copy()
+        source_domain_authority = "koharu_source_raw_text_box"
+    pix = raw_roi > 0
+    if not np.any(pix):
+        diag["reason"] = "raw_box_outside_semantic_bubble"
+        return empty_alpha, empty_mask, diag
+    gray_u8 = np.clip(source_gray, 0, 255).astype(np.uint8)
+    hsv = cv2.cvtColor(source, cv2.COLOR_BGR2HSV)
+    bright_ratio = float(np.mean(gray_u8[pix] >= 220))
+    sat_median = float(np.median(hsv[..., 1][pix]))
+    if bright_ratio < float(getattr(cfg, "rigid_container_source_raw_text_write_min_bright_ratio", 0.60)) or sat_median > float(getattr(cfg, "rigid_container_source_raw_text_write_max_saturation_median", 80.0)):
+        diag.update({"reason": "not_white_low_saturation_text_zone", "bright_ratio": bright_ratio, "saturation_median": sat_median})
+        return empty_alpha, empty_mask, diag
+
+    gray_thr = int(getattr(cfg, "rigid_container_source_raw_text_write_gray_threshold", 228))
+    dark = ((gray_u8 < gray_thr) & pix).astype(np.uint8)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(dark, 8)
+    semantic = np.zeros((sh, sw), np.uint8)
+    bubble_dist = cv2.distanceTransform((source_domain > 0).astype(np.uint8), cv2.DIST_L2, 5)
+    rw, rh = max(1, x1 - x0), max(1, y1 - y0)
+    max_component = max(48, int(round(max(1, int(np.count_nonzero(pix))) * float(getattr(cfg, "rigid_container_source_raw_text_write_max_component_fraction", 0.12)))))
+    max_span_x = float(getattr(cfg, "rigid_container_source_raw_text_write_max_span_x", 0.65))
+    max_span_y = float(getattr(cfg, "rigid_container_source_raw_text_write_max_span_y", 0.35))
+    halo_px = max(2, int(getattr(cfg, "rigid_container_source_raw_text_write_halo_px", 7)))
+    min_halo_bright = float(getattr(cfg, "rigid_container_source_raw_text_write_min_halo_bright_ratio", 0.72))
+    max_halo_sat = float(getattr(cfg, "rigid_container_source_raw_text_write_max_halo_saturation_median", 45.0))
+    min_boundary_dist = float(getattr(cfg, "rigid_container_source_raw_text_write_min_boundary_distance_px", 8.0))
+    selected = 0
+    accepted_boxes: list[tuple[int, int, int, int]] = []
+    boundary_candidates: list[tuple[int, int, int, int, int, np.ndarray]] = []
+    for lab in range(1, n):
+        cx, cy, cw, ch, area = [int(v) for v in stats[lab]]
+        if area < 3 or area > max_component:
+            continue
+        if float(cw / rw) > max_span_x or float(ch / rh) > max_span_y:
+            continue
+        comp = labels == lab
+        lx0 = max(0, cx - halo_px); ly0 = max(0, cy - halo_px)
+        lx1 = min(sw, cx + cw + halo_px); ly1 = min(sh, cy + ch + halo_px)
+        local_comp = comp[ly0:ly1, lx0:lx1].astype(np.uint8)
+        hk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (halo_px * 2 + 1, halo_px * 2 + 1))
+        halo = (cv2.dilate(local_comp, hk, iterations=1) > 0) & (local_comp == 0)
+        halo &= (raw_roi[ly0:ly1, lx0:lx1] > 0)
+        if int(np.count_nonzero(halo)) < 8:
+            continue
+        halo_bright = float(np.mean(gray_u8[ly0:ly1, lx0:lx1][halo] >= 220))
+        halo_sat = float(np.median(hsv[ly0:ly1, lx0:lx1, 1][halo]))
+        if halo_bright < min_halo_bright or halo_sat > max_halo_sat:
+            continue
+        boundary_dist = float(np.min(bubble_dist[comp]))
+        if boundary_dist < min_boundary_dist:
+            # Do not immediately admit edge-touching dark components: burst rays
+            # and panel lines live there too.  Keep only text-like compact candidates
+            # for a second pass against already accepted text-column geometry.
+            boundary_candidates.append((lab, cx, cy, cw, ch, comp))
+            continue
+        semantic[comp] = 255
+        accepted_boxes.append((cx, cy, cw, ch))
+        selected += 1
+
+    edge_recovered = 0
+    if (
+        bool(getattr(cfg, "rigid_container_source_raw_text_edge_recovery_enabled", True))
+        and accepted_boxes and boundary_candidates
+    ):
+        max_gap = max(12, int(round(rh * float(getattr(cfg, "rigid_container_source_raw_text_edge_recovery_max_gap_ratio", 0.12)))))
+        min_overlap = float(getattr(cfg, "rigid_container_source_raw_text_edge_recovery_min_axis_overlap", 0.55))
+        max_wr = float(getattr(cfg, "rigid_container_source_raw_text_edge_recovery_max_width_ratio", 0.52))
+        max_hr = float(getattr(cfg, "rigid_container_source_raw_text_edge_recovery_max_height_ratio", 0.12))
+        for _lab, cx, cy, cw, ch, comp in boundary_candidates:
+            if float(cw / rw) > max_wr or float(ch / rh) > max_hr:
+                continue
+            safe_neighbor = False
+            for ax, ay, aw, ah in accepted_boxes:
+                overlap_x = max(0, min(cx + cw, ax + aw) - max(cx, ax))
+                overlap_ratio = float(overlap_x / max(1, min(cw, aw)))
+                vertical_gap = max(0, cy - (ay + ah), ay - (cy + ch))
+                if overlap_ratio >= min_overlap and vertical_gap <= max_gap:
+                    safe_neighbor = True
+                    break
+            if not safe_neighbor:
+                continue
+            semantic[comp] = 255
+            accepted_boxes.append((cx, cy, cw, ch))
+            selected += 1
+            edge_recovered += 1
+    if cv2.countNonZero(semantic) <= 0:
+        diag["reason"] = "no_safe_source_text_components"
+        return empty_alpha, empty_mask, diag
+
+    # Preserve SOURCE antialiasing, but only under the semantic component mask.
+    sem_alpha_src = np.clip((float(paper) - source_gray.astype(np.float32)) / max(1.0, float(paper)), 0.0, 1.0)
+    sem_alpha_src[sem_alpha_src < float(alpha_floor)] = 0.0
+    sem_alpha_src *= (semantic.astype(np.float32) / 255.0)
+    ys, xs = np.where(semantic > 0)
+    ex0, ey0, ex1, ey1 = int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+    crop = sem_alpha_src[ey0:ey1, ex0:ex1]
+    nw = max(1, int(round((ex1 - ex0) * float(scale))))
+    nh = max(1, int(round((ey1 - ey0) * float(scale))))
+    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+    warped = cv2.resize(crop, (nw, nh), interpolation=interp)
+    sx0, sy0 = [int(v) for v in source_pair_origin]
+    px, py = [float(v) for v in target_pair_origin]
+    qx = int(round(px + (ex0 - sx0) * float(scale)))
+    qy = int(round(py + (ey0 - sy0) * float(scale)))
+    xa, ya = max(0, qx), max(0, qy); xb, yb = min(tw, qx + nw), min(th, qy + nh)
+    if xb <= xa or yb <= ya:
+        diag["reason"] = "semantic_text_maps_outside_target"
+        return empty_alpha, empty_mask, diag
+    local = warped[ya - qy:yb - qy, xa - qx:xb - qx].copy()
+    local *= (target_domain[ya:yb, xa:xb].astype(np.float32) / 255.0)
+    out = np.zeros((th, tw), np.float32)
+    out[ya:yb, xa:xb] = local
+    write_mask = (out >= max(0.08, float(alpha_floor))).astype(np.uint8) * 255
+    diag.update({
+        "applied": bool(cv2.countNonZero(write_mask) > 0),
+        "reason": "semantic_source_text_extrapolated" if cv2.countNonZero(write_mask) > 0 else "no_target_write_pixels",
+        "authority": "koharu_source_raw_text_components_inside_semantic_domain",
+        "source_domain_authority": source_domain_authority,
+        "source_bubble_hint_present": bool(sb_hint is not None),
+        "bright_ratio": round(bright_ratio, 4),
+        "saturation_median": round(sat_median, 3),
+        "selected_components": int(selected),
+        "edge_recovered_components": int(edge_recovered),
+        "selected_pixels_source": int(cv2.countNonZero(semantic)),
+        "write_pixels_target": int(cv2.countNonZero(write_mask)),
+        "source_raw_box": [x0, y0, x1, y1],
+        "target_origin": [qx, qy],
+        "scale": float(scale),
+        "min_boundary_distance_px": float(min_boundary_dist),
+    })
+    return out, write_mask, diag
+
+
 def _rigid_source_raster(
     source: np.ndarray,
     target_reference: np.ndarray,
@@ -1177,7 +2636,9 @@ def _rigid_source_raster(
     *,
     source_gray: np.ndarray | None = None,
     source_structure_mask: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray, float, float, float, float, float, dict[str, object]] | None:
+    source_bubble: BubbleInstance | None = None,
+    target_bubble: BubbleInstance | None = None,
+) -> tuple[np.ndarray, np.ndarray, float, float, float, float, float, dict[str, object], np.ndarray] | None:
     """Place the complete source lettering raster with uniform scale only.
 
     Returns ``(soft_alpha, ink_mask, scale, dx, dy, ink_coverage, mask_containment, clarity_diag)``
@@ -1223,6 +2684,30 @@ def _rigid_source_raster(
     floor = float(np.clip(getattr(cfg, "rigid_container_alpha_floor", 0.055), 0.0, 0.30))
     alpha[alpha < floor] = 0.0
     alpha *= (crop_mask.astype(np.float32) / 255.0)
+    # Preserve the admission-time SOURCE-only changed-text authority at render
+    # time. This filters shared illustration ink while retaining antialiased
+    # translated glyph raster.
+    changed_gate, changed_gate_diag = _rigid_changed_text_write_gate(
+        source, target_reference, source_mask, target_mask, cfg
+    )
+    if isinstance(changed_gate, np.ndarray) and changed_gate.shape == alpha.shape:
+        raw_ink = alpha >= max(0.08, floor)
+        raw_n = int(np.count_nonzero(raw_ink))
+        kept_n = int(np.count_nonzero(raw_ink & (changed_gate > 0)))
+        retained = float(kept_n / max(1, raw_n))
+        min_retained = float(getattr(cfg, "rigid_container_changed_text_gate_min_retained_ratio", 0.65))
+        changed_gate_diag["raw_ink_pixels"] = int(raw_n)
+        changed_gate_diag["kept_ink_pixels"] = int(kept_n)
+        changed_gate_diag["retained_ratio"] = float(retained)
+        changed_gate_diag["min_retained_ratio"] = float(min_retained)
+        if kept_n >= int(getattr(cfg, "content_completeness_min_ink_pixels", 18)) and retained >= min_retained:
+            alpha[changed_gate == 0] = 0.0
+            changed_gate_diag["applied"] = True
+            changed_gate_diag["reason"] = "applied_changed_text_authority"
+        else:
+            changed_gate_diag["reason"] = "retention_too_low_fail_open"
+    if isinstance(clarity_diag, dict):
+        clarity_diag["changed_text_write_gate"] = changed_gate_diag
     # Preserve an audit authority before any SOURCE structure suppression. This is
     # not rendered directly; it exists so a boundary guard can never silently
     # redefine "complete SOURCE text" after it has already deleted pixels.
@@ -1320,10 +2805,20 @@ def _rigid_source_raster(
     local = ra[ya - py:yb - py, xa - px:xb - px].copy()
     local *= (target_mask[ya:yb, xa:xb].astype(np.float32) / 255.0)
     full_alpha[ya:yb, xa:xb] = np.maximum(full_alpha[ya:yb, xa:xb], local)
+    semantic_alpha, semantic_write_extension, semantic_write_diag = _rigid_source_semantic_text_extension(
+        source, target_shape, cfg,
+        source_bubble=source_bubble, target_bubble=target_bubble, scale=scale,
+        source_pair_origin=(sx0, sy0), target_pair_origin=(px, py),
+        paper=paper, alpha_floor=floor, source_gray=gray,
+    )
+    if cv2.countNonZero(semantic_write_extension) > 0:
+        full_alpha = np.maximum(full_alpha, semantic_alpha)
+    if isinstance(clarity_diag, dict):
+        clarity_diag["source_semantic_text_extension"] = semantic_write_diag
     ink_mask = (full_alpha >= max(0.08, floor)).astype(np.uint8) * 255
     # dx/dy are reported relative to the pure centroid placement at the selected scale.
     base_x = tcx - rel_cx * scale; base_y = tcy - rel_cy * scale
-    return full_alpha, ink_mask, scale, float(px - base_x), float(py - base_y), float(ink_cov), float(mask_cov), clarity_diag
+    return full_alpha, ink_mask, scale, float(px - base_x), float(py - base_y), float(ink_cov), float(mask_cov), clarity_diag, semantic_write_extension
 
 
 
@@ -1628,10 +3123,11 @@ def transfer_rigid_container_rasters(
         placed = _rigid_source_raster(
             source, target_reference, sm, tm, shape, base_scale, placement_cfg,
             source_gray=source_gray_f32, source_structure_mask=sm_raw,
+            source_bubble=sb, target_bubble=tb,
         )
         if placed is None:
             continue
-        alpha, source_ink_mask, scale, dx, dy, ink_cov, mask_cov, white_clarity_diag = placed
+        alpha, source_ink_mask, scale, dx, dy, ink_cov, mask_cov, white_clarity_diag, source_semantic_write_extension = placed
         source_ink_mask, source_boundary_removed = remove_container_boundary_line_components(source_ink_mask, tm)
         if source_boundary_removed > 0:
             alpha[source_ink_mask == 0] = 0.0
@@ -1659,6 +3155,15 @@ def transfer_rigid_container_rasters(
         immutable_band, immutable_band_diag = _mask_replace_target_immutable_boundary_band(
             tm_raw, source_ink_mask, spiky=bool(spiky_profile.get("spiky", False)), cfg=cfg
         )
+        target_changed_text_relief, target_changed_text_relief_diag = _rigid_target_changed_text_relief(
+            source, target_reference, sm, tm, cfg, target_bubble=tb
+        )
+        if cv2.countNonZero(target_changed_text_relief) > 0:
+            target_structure_guard[target_changed_text_relief > 0] = 0
+            immutable_band[target_changed_text_relief > 0] = 0
+            if cv2.countNonZero(spiky_structure_guard) > 0:
+                spiky_structure_guard[target_changed_text_relief > 0] = 0
+        target_structure_diag["changed_text_relief"] = target_changed_text_relief_diag
         # v2.3.36: a wide immutable burst band must preserve TARGET rays/AA, but
         # it must not freeze Japanese glyphs that happen to sit close to a spike.
         # Relief only compact glyph-like TARGET components; long radial/outline
@@ -1785,10 +3290,23 @@ def transfer_rigid_container_rasters(
 
         if not bool(full_clear_diag.get("white_full_clear_applied", False)):
             clear = target_text_mask_in_container(target_reference, border_safe_envelope)
+            # Include clear-only Koharu semantic text authority.  This recovers
+            # large/bold punctuation omitted by the compact component selector.
+            if cv2.countNonZero(target_changed_text_relief) > 0:
+                clear = np.maximum(clear, target_changed_text_relief)
             if cv2.countNonZero(clear) > 0:
                 d = max(1, int(getattr(cfg, "paired_diff_complex_clear_dilate_px", 2)))
                 clear = cv2.dilate(clear, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d * 2 + 1, d * 2 + 1)))
-                clear = cv2.bitwise_and(clear, border_safe_envelope)
+                # TARGET cleanup and SOURCE write have deliberately different
+                # authority.  A semantic Koharu relief may extend beyond the
+                # narrow paired-diff/write envelope in order to erase the whole
+                # original-language glyph.  Do not clip that proven clear-only
+                # authority back to border_safe_envelope here.  SOURCE alpha is
+                # still clipped to border_safe_envelope below and is never widened.
+                clear_envelope = border_safe_envelope
+                if cv2.countNonZero(target_changed_text_relief) > 0:
+                    clear_envelope = np.maximum(border_safe_envelope, target_changed_text_relief)
+                clear = cv2.bitwise_and(clear, clear_envelope)
                 if cv2.countNonZero(target_structure_guard) > 0:
                     clear[target_structure_guard > 0] = 0
                 cleaned = cv2.inpaint(rendered, clear, 2.5, cv2.INPAINT_TELEA)
@@ -1806,7 +3324,10 @@ def transfer_rigid_container_rasters(
         gap_fill_diag = {"added_pixels": 0, "enabled": False}
         a = np.clip(alpha, 0.0, 1.0)
         source_authority_pixels = int(cv2.countNonZero(source_ink_mask))
-        a *= (border_safe_envelope.astype(np.float32) / 255.0)
+        source_write_envelope = border_safe_envelope
+        if cv2.countNonZero(source_semantic_write_extension) > 0:
+            source_write_envelope = np.maximum(border_safe_envelope, source_semantic_write_extension)
+        a *= (source_write_envelope.astype(np.float32) / 255.0)
         if cv2.countNonZero(target_structure_guard) > 0:
             a[target_structure_guard > 0] = 0.0
         retained_source_mask = ((a >= 0.08) & (source_ink_mask > 0)).astype(np.uint8) * 255
@@ -1914,6 +3435,13 @@ def transfer_rigid_container_rasters(
                 full_clear_diag["target_border_restore_fringe_px"]=int(fringe_px)
             else:
                 protected_ring = cv2.bitwise_and(tm, cv2.bitwise_not(border_safe_envelope))
+            # The paired-diff boundary ring can overlap original-language glyphs
+            # when its polygon is a narrow/notched text lane.  Koharu/changed-text
+            # relief is stronger semantic evidence for TARGET text and must not be
+            # resurrected by exact border restoration.  Real burst outline/rays
+            # remain protected because they are outside the semantic relief.
+            if cv2.countNonZero(target_changed_text_relief) > 0:
+                protected_ring[target_changed_text_relief > 0] = 0
             ring_sel = protected_ring > 0
             border_diag["protected_pixels"] = int(np.count_nonzero(ring_sel))
             if np.any(ring_sel):
@@ -1974,6 +3502,12 @@ def transfer_rigid_container_rasters(
             tolerance_px=3,
             min_source_coverage=min_cov,
             max_target_residual=max_res,
+            # The rigid route explicitly records every TARGET pixel it cleared
+            # or replaced. A dark SOURCE glyph can legitimately occupy the same
+            # coordinates as old Japanese; judge residual TARGET ink only outside
+            # this invalidation authority instead of treating new Chinese black as
+            # surviving Japanese.
+            target_invalidation_mask=write_alpha8,
         )
         if bool(raw_source_fidelity_diag.get("enabled", True)) and not bool(raw_source_fidelity_diag.get("complete", False)):
             rec.content_complete = False
@@ -2546,6 +4080,7 @@ def transfer_paired_diff_regions(
         _evaluate_content_completeness(
             rec, src_audit, tgt_audit, rendered, cfg,
             tolerance_px=audit_tol,
+            target_invalidation_mask=write_mask,
         )
         if region_kind == "bubble" and not rec.content_complete:
             repaired, repaired_mask, repair_diag = _repair_content_region(
@@ -3152,6 +4687,7 @@ def transfer_bubble_patches(
         _evaluate_content_completeness(
             rec, src_audit, tgt_audit, rendered, cfg,
             tolerance_px=max(3, 5 if is_photo_pair else 3),
+            target_invalidation_mask=paste_mask,
         )
         records.append(rec)
 

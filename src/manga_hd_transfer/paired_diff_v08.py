@@ -485,6 +485,71 @@ def _source_component_for_target(
     return best[0], float(best[1])
 
 
+def _source_components_for_targets(
+    source: np.ndarray,
+    target_masks: list[np.ndarray],
+    target_centroids: list[tuple[float, float]],
+    H: np.ndarray,
+    cfg: MaskReplaceConfig,
+) -> list[tuple[np.ndarray, float]]:
+    """Batch SOURCE container lookup with bounded component-label memory.
+
+    The legacy per-target helper caches one full-resolution connected-component
+    label map for every threshold/dilate combination so later target candidates
+    can reuse it. On 4K/5K scans that can retain well over a gigabyte of label
+    arrays and trigger swapping. This batched form keeps the exact same search
+    grid and scoring, but processes all target centroids for one parameter pair
+    before dropping that pair's label map. Peak memory is therefore bounded by
+    one SOURCE label map instead of the whole search grid.
+    """
+    if len(target_masks) != len(target_centroids):
+        raise ValueError("target_masks and target_centroids must have equal length")
+    Hinv = np.linalg.inv(H)
+    source_points = [_transform_xy(cx, cy, Hinv) for cx, cy in target_centroids]
+    best_masks: list[np.ndarray | None] = [None] * len(target_masks)
+    best_scores: list[float] = [-1.0] * len(target_masks)
+    base = int(cfg.paired_diff_barrier_dark_threshold)
+    thresholds = tuple(int(np.clip(v, 130, 225)) for v in (base - 20, base - 10, base, base + 10, base + 20))
+    dilates = tuple(sorted({1, max(1, int(cfg.paired_diff_barrier_dilate_px)), 2}))
+
+    for thr in thresholds:
+        for dp in dilates:
+            # One cache for this parameter pair only. The first seed builds the
+            # expensive full-resolution labels; all remaining seeds reuse them.
+            # Dropping the cache here keeps peak RSS bounded on cloud CPU hosts.
+            param_cache: dict = {}
+            for idx, ((sx, sy), target_mask) in enumerate(zip(source_points, target_masks)):
+                sm = _barrier_component_from_seed(
+                    source, sx, sy, cfg, thr, dp, cache=param_cache
+                )
+                if sm is None or cv2.countNonZero(sm) < cfg.paired_diff_min_component_area:
+                    continue
+                warped = _warp_mask(sm, H, target_mask.shape)
+                score = _iou(warped, target_mask)
+                if score > best_scores[idx]:
+                    best_masks[idx] = sm
+                    best_scores[idx] = score
+            param_cache.clear()
+
+    out: list[tuple[np.ndarray, float]] = []
+    for idx, ((sx, sy), target_mask) in enumerate(zip(source_points, target_masks)):
+        sm = best_masks[idx]
+        score = best_scores[idx]
+        if sm is None:
+            sm = _white_component_from_seed(
+                source, sx, sy, cfg.paired_diff_white_threshold, cfg.paired_diff_search_radius
+            )
+            if sm is not None:
+                score = _iou(_warp_mask(sm, H, target_mask.shape), target_mask)
+            else:
+                # Last-resort geometric proxy; this mask is debug/QA only in
+                # target-driven mode, matching _source_component_for_target.
+                sm = _warp_mask(target_mask, Hinv, source.shape[:2])
+                score = _iou(_warp_mask(sm, H, target_mask.shape), target_mask)
+        out.append((sm, float(score)))
+    return out
+
+
 def _find_enclosed_candidates(
     target: np.ndarray,
     raw_change: np.ndarray,
@@ -673,13 +738,18 @@ def extract_paired_diff_bubbles(
     free_text = _free_text_candidates(source_aligned, target, raw_change, [r[0] for r in enclosed], cfg)
 
     rows: list[tuple[np.ndarray, np.ndarray, dict, tuple[int, int, int, int], str, float]] = []
-    for tm, metrics, box in enclosed:
+    enclosed_centroids: list[tuple[float, float]] = []
+    for tm, _metrics, box in enclosed:
         moments = cv2.moments((tm > 0).astype(np.uint8))
         if moments["m00"]:
             cx, cy = moments["m10"] / moments["m00"], moments["m01"] / moments["m00"]
         else:
             cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
-        sm, mask_iou = _source_component_for_target(source, tm, (cx, cy), H, cfg, barrier_cache=source_barrier_cache)
+        enclosed_centroids.append((float(cx), float(cy)))
+    source_components = _source_components_for_targets(
+        source, [row[0] for row in enclosed], enclosed_centroids, H, cfg
+    ) if enclosed else []
+    for (tm, metrics, box), (sm, mask_iou) in zip(enclosed, source_components):
         rows.append((sm, tm, metrics, box, "bubble", mask_iou))
 
     Hinv = np.linalg.inv(H)

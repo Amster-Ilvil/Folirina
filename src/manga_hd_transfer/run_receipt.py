@@ -51,6 +51,15 @@ def write_run_receipt(page_root: str | Path, project: Any, *, requested_mode: st
         "project_mode": str(meta.get("transfer_mode") or "").strip().lower(),
         "selected_strategy": str(selected_strategy or "").strip().lower(),
         "mode_execution": dict(meta.get("mode_execution") or {}),
+        "degraded": dict(meta.get("degraded") or {}) if isinstance(meta.get("degraded"), dict) else {},
+        "stage_timings": dict(meta.get("stage_timings") or {}) if isinstance(meta.get("stage_timings"), dict) else {},
+        "host_performance": dict(meta.get("host_performance") or {}) if isinstance(meta.get("host_performance"), dict) else {},
+        "selective_replay": {
+            "generation": str((meta.get("selective_replay") or {}).get("generation") or ""),
+            "candidate_count": int((meta.get("selective_replay") or {}).get("candidate_count") or 0),
+            "error_count": int((meta.get("selective_replay") or {}).get("error_count") or 0),
+            "warning_count": int((meta.get("selective_replay") or {}).get("warning_count") or 0),
+        } if isinstance(meta.get("selective_replay"), dict) else {},
         "artifact_owners": artifact_ownership_snapshot(root),
         "artifacts": rows,
     }

@@ -9,6 +9,7 @@ composition, persistence algorithms, or renderer internals.
 
 from pathlib import Path
 from typing import Callable
+import time
 
 from .config import PipelineConfig
 from .layout_evidence import (
@@ -24,8 +25,10 @@ from .pipeline_page_prep import prepare_workspace, load_page_inputs
 from .pipeline_bubble_service import primary_bubbles_cached
 from .pipeline_route_stage import run_page_route_stage
 from .pipeline_content_gate import source_has_no_transferable_text
+from .ocr import NullOCRBackend
 from .modes.hybrid.admission import should_continue_hybrid_after_ocr_negative
 from .pipeline_registration_service import register_page_cached, verify_same_page
+from .page_pairing import refine_pairing_with_layout_evidence
 from .pipeline_paired_diff_service import run_paired_diff_stage
 from .pipeline_text_stage import run_text_stage
 from .pipeline_match_service import run_text_matching_stage
@@ -126,6 +129,24 @@ def run_page_flow(
     if check_cancel is None:
         check_cancel = lambda _cb, _stage="": None
 
+    flow_started = time.perf_counter()
+    stage_timings: dict[str, float] = {}
+
+    def _stage_done(name: str, started: float) -> None:
+        stage_timings[str(name)] = round(max(0.0, time.perf_counter() - started), 6)
+
+    def _attach_timings(project: PageProject) -> PageProject:
+        payload = {
+            "schema": "folirina.stage_timings.v1",
+            "seconds": dict(stage_timings),
+            "total_through_current_stage_seconds": round(max(0.0, time.perf_counter() - flow_started), 6),
+        }
+        if isinstance(getattr(project, "meta", None), dict):
+            project.meta["stage_timings"] = payload
+        if trace is not None:
+            trace.event("stage_timings", **payload)
+        return project
+
     def emit_progress(percent: int, stage: str, message: str) -> None:
         if progress_cb is None:
             return
@@ -136,6 +157,7 @@ def run_page_flow(
             pass
 
     mode = config.transfer.mode.lower().strip()
+    stage_started = time.perf_counter()
     emit_progress(2, "workspace", "准备页面工作区")
     mode_contract = get_mode_contract(mode)
     prepared = prepare_workspace(pair, page_root, page_mark, mode=mode)
@@ -152,7 +174,8 @@ def run_page_flow(
     check_cancel(cancel_cb, "before_page")
     if not mark.should_process:
         emit_progress(100, "skip", "页面已标记跳过")
-        return passthrough_page(pair, page_root, final_path, mark)
+        _stage_done("workspace_decode", stage_started)
+        return _attach_timings(passthrough_page(pair, page_root, final_path, mark))
 
     inputs = load_page_inputs(pair, page_root, config, prefetched_images=prefetched_images)
     authority_source_path = inputs.authority_source_path
@@ -172,7 +195,9 @@ def run_page_flow(
         )
     check_cancel(cancel_cb, "after_decode")
     emit_progress(9, "decode", "已读取 SOURCE / TARGET")
+    _stage_done("workspace_decode", stage_started)
 
+    stage_started = time.perf_counter()
     emit_progress(12, "registration", "正在配准 SOURCE / TARGET")
     registration = register_page_cached(
         pair, source, target, config.registration, cache=stage_cache,
@@ -186,6 +211,8 @@ def run_page_flow(
     check_cancel(cancel_cb, "after_registration")
     emit_progress(24, "registration", f"配准完成 · {registration.method} · {registration.confidence:.3f}")
     pair_check = verify_same_page(source, target, registration, config.pairing)
+    _stage_done("registration", stage_started)
+    stage_started = time.perf_counter()
     emit_progress(27, "layout", "正在运行主布局检测器")
 
     # v2.0.91: run the selected primary detector before any mode-specific
@@ -194,12 +221,17 @@ def run_page_flow(
     # geometry first; Koharu auxiliary evidence is never allowed to run before it.
     selected_primary = primary_detector(config.bubbles)
     if selected_primary == "koharu_layout":
-        prepare_page_layout_evidence(
+        layout_prefetch = prepare_page_layout_evidence(
             mode, source, target, source_path=source_path_local, target_path=target_path_local,
             bubble_cfg=config.bubbles, cache=stage_cache,
             cache_enabled=bool(config.cache.bubbles) and bool(getattr(config.bubbles, "koharu_layout_cache_enabled", True)),
             stats=cache_stats,
         )
+        pair_check = refine_pairing_with_layout_evidence(
+            pair_check, registration, layout_prefetch.get("source"), layout_prefetch.get("target"),
+        )
+        if bool((pair_check.diagnostics or {}).get("semantic_layout_rescue")):
+            cache_stats["same_page_semantic_rescue"] = "koharu_layout"
         # Also materialize the canonical primary-bubble cache so later generic
         # bubble stages do not need a second primary adapter call.
         primary_bubbles_cached(
@@ -242,7 +274,9 @@ def run_page_flow(
         )
     check_cancel(cancel_cb, "after_layout_evidence")
     emit_progress(42, "layout", "主布局检测完成")
+    _stage_done("layout", stage_started)
 
+    stage_started = time.perf_counter()
     emit_progress(45, "route", "正在规划当前模式路线")
     route = run_page_route_stage(
         config=config, mode=mode, mode_contract=mode_contract, pair=pair,
@@ -255,8 +289,13 @@ def run_page_flow(
         stage_cache=stage_cache,
     )
     if route.early_project is not None:
+        if trace is not None and mode == "aligned_overlay_reveal":
+            reveal_meta = route.early_project.meta.get("aligned_overlay_reveal", {})
+            decisions = (reveal_meta.get("diagnostics") or {}).get("candidate_decisions", [])
+            trace.event("aligned_hole_candidate_decisions", candidates=decisions)
         emit_progress(100, "route", "页面按模式策略直接完成")
-        return route.early_project
+        _stage_done("route", stage_started)
+        return _attach_timings(route.early_project)
     source = route.source
     registration = route.registration
     pair_check = route.pair_check
@@ -268,7 +307,9 @@ def run_page_flow(
     dual_source_arbitration = route.dual_source_arbitration
     selected_arbitration_evidence = route.selected_arbitration_evidence
     decision = route.decision
+    _stage_done("route", stage_started)
 
+    stage_started = time.perf_counter()
     emit_progress(50, "paired_diff", "正在分析 SOURCE / TARGET 差异")
     paired_stage = run_paired_diff_stage(
         pair, source, target, registration, mode=mode,
@@ -287,7 +328,9 @@ def run_page_flow(
         )
     check_cancel(cancel_cb, "after_paired_diff")
     emit_progress(60, "paired_diff", "版本差异分析完成")
+    _stage_done("paired_diff", stage_started)
 
+    stage_started = time.perf_counter()
     emit_progress(63, "text", "正在处理文字 / 气泡候选")
     text_stage = run_text_stage(
         config=config, mode=mode,
@@ -323,6 +366,24 @@ def run_page_flow(
             "OCR mode isolation violation: " + ", ".join(ocr_contract_violations)
         )
 
+    # Reletter is transcript-authoritative.  A missing SOURCE OCR runtime is not
+    # evidence that the source page contains no text; silently publishing an
+    # unchanged TARGET would look like a successful reletter run while no OCR
+    # ever happened.  Fail before the generic no-text passthrough gate so the
+    # lifecycle records a real failure and restores any previous published page.
+    if mode == "reletter" and isinstance(source_backend, NullOCRBackend):
+        configured_backend = str(config.ocr.source_backend or config.ocr.backend or "none")
+        detail = next((
+            str(x) for x in reversed(getattr(config, "_ocr_soft_failures", []) or [])
+            if "source" in str(x).lower() or configured_backend.lower() in str(x).lower()
+        ), "")
+        raise RuntimeError(
+            f"Reletter requires the configured SOURCE OCR backend '{configured_backend}', "
+            "but that backend is unavailable. OCR fallback is disabled for Reletter; "
+            "install/enable the selected OCR backend before processing."
+            + (f" Detail: {detail}" if detail else "")
+        )
+
     no_transferable_source_text = source_has_no_transferable_text(
         config=config, source_backend=source_backend, source_blocks=source_blocks,
         source_bubbles=source_bubbles, paired_diff=paired_diff, cache_stats=cache_stats,
@@ -351,10 +412,11 @@ def run_page_flow(
             source_name=Path(pair.source_path).name, target_name=Path(pair.target_path).name,
         )
         emit_progress(100, "content_gate", "SOURCE 无可迁移文字，保持 TARGET")
-        return passthrough_page(
+        _stage_done("text_ocr", stage_started)
+        return _attach_timings(passthrough_page(
             pair, page_root, final_path, no_text_mark, source=source, target=target,
             registration=registration, passthrough_reason="source_no_transferable_text",
-        )
+        ))
 
     if trace is not None:
         trace.event(
@@ -363,13 +425,15 @@ def run_page_flow(
             source_blocks=len(source_blocks), target_blocks=len(target_blocks),
             source_bubbles=len(source_bubbles), target_bubbles=len(target_bubbles),
             target_driven_regions=bool(target_driven_reletter_regions),
-            recognized_regions=int((target_driven_reletter_diagnostics or {}).get("recognized_regions") or 0),
+            recognized_regions=sum(bool(str(b.text or "").strip()) for b in source_blocks),
         )
     check_cancel(cancel_cb, "after_ocr_and_bubbles")
     emit_progress(73, "text", "文字 / 气泡候选完成")
+    _stage_done("text_ocr", stage_started)
     mask_source_bubbles = paired_diff.source_bubbles if use_paired_diff else source_bubbles
     mask_target_bubbles = paired_diff.target_bubbles if use_paired_diff else target_bubbles
 
+    stage_started = time.perf_counter()
     emit_progress(76, "matching", "正在建立 SOURCE / TARGET 文字对应")
     match_stage = run_text_matching_stage(
         pair, registration, source_blocks, target_blocks, source_bubbles, target_bubbles,
@@ -451,6 +515,8 @@ def run_page_flow(
             unmatched_target=len(getattr(match_result, "unmatched_target", []) or []),
         )
 
+    _stage_done("matching", stage_started)
+    stage_started = time.perf_counter()
     emit_progress(82, "transfer", "正在生成安全迁移 / 蒙版")
     transfer_stage = run_transfer_execution_stage(
         config=config, pair=pair, registration=registration, pair_check=pair_check,
@@ -482,6 +548,8 @@ def run_page_flow(
     target_layout_hint_units = transfer_stage.target_layout_hint_units
     qa = transfer_stage.qa
 
+    _stage_done("transfer", stage_started)
+    stage_started = time.perf_counter()
     emit_progress(91, "composition", "正在合成迁移结果")
     composition = compose_transfer_state(
         pair=pair, registration=registration, pair_check=pair_check, decision=decision,
@@ -524,7 +592,9 @@ def run_page_flow(
         replace_source_specs=replace_source_specs, composition=composition,
     )
 
+    _stage_done("composition_assembly", stage_started)
     check_cancel(cancel_cb, "before_export")
+    stage_started = time.perf_counter()
     emit_progress(96, "export", "正在写入页面结果与 QA")
     export_page_artifacts(
         config=config, project=project, pair=pair, page_root=page_root,
@@ -545,10 +615,15 @@ def run_page_flow(
         selected_arbitration_evidence=selected_arbitration_evidence,
         target_path_local=target_path_local, match_result=match_result,
     )
+    _stage_done("export", stage_started)
+    _attach_timings(project)
+    stage_started = time.perf_counter()
     finalized = finalize_page_project(
         config=config, project=project, page_root=page_root, mode=mode,
         decision=decision, direct_container_fast=direct_container_fast,
         mask_transfer=mask_transfer, lettering=lettering,
     )
+    _stage_done("finalize", stage_started)
+    _attach_timings(finalized)
     emit_progress(100, "done", "页面处理完成")
     return finalized

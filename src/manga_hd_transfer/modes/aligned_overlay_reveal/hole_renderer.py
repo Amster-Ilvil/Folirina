@@ -15,6 +15,8 @@ from ...bubbles import detect_target_colored_containers, detect_unseeded_white_c
 from ...config import AlignedOverlayRevealConfig, BubbleConfig
 from ...models import BubbleInstance, RegistrationResult
 from ...pipeline_bubble_service import primary_bubbles_cached
+from ...layout_evidence import collect_koharu_layout_evidence_cached, koharu_semantic_text_ink_mask
+from .source_text_render import source_text_render
 from ...run_status import classify_page_run_status
 from .container_detector import detect_text_barrier_containers
 
@@ -124,7 +126,17 @@ def _collect_target_container_candidates(
     def _add(rows: Sequence[BubbleInstance], *, source: str) -> None:
         for cand in rows:
             conf = float(getattr(cand, "confidence", 0.0))
-            if conf < (min_conf if source == "primary" else supplemental_min_conf):
+            # Koharu is the primary semantic authority.  Once its configured
+            # detector threshold accepted a bubble, a renderer-local legacy
+            # confidence floor must not silently discard it.  Other primary
+            # detectors retain the mode-specific floor; auxiliaries keep their
+            # supplemental floor.
+            backend = str((getattr(cand, "meta", {}) or {}).get("backend", "")).strip().lower()
+            if source == "primary" and backend == "koharu_layout":
+                primary_floor = float(getattr(bubble_cfg, "koharu_layout_bubble_threshold", 0.50))
+            else:
+                primary_floor = min_conf
+            if conf < (primary_floor if source == "primary" else supplemental_min_conf):
                 continue
             mask = _bubble_mask_from_instance(cand, target.shape[:2])
             if int(cv2.countNonZero(mask)) <= 0:
@@ -200,12 +212,14 @@ def _registered_translation_evidence(
     target: np.ndarray,
     region_mask: np.ndarray,
     cfg: AlignedOverlayRevealConfig,
+    *,
+    require_bidirectional_change: bool = False,
 ) -> dict[str, float | bool | str]:
     """Require real SOURCE/TARGET ink change for geometry-only supplements.
 
-    Primary semantic bubble detections remain authoritative.  Supplemental white
-    geometry must additionally behave like translated text after page registration,
-    otherwise white clothes/panels/windows can become accidental SOURCE holes.
+    All candidates need compact SOURCE and TARGET ink. Geometry-only candidates
+    additionally need novel ink in both directions: changed stroke width or
+    resampling of the same artwork is not evidence of a translation.
     """
     m=(region_mask>0).astype(np.uint8)*255
     pixels=int(cv2.countNonZero(m))
@@ -227,7 +241,12 @@ def _registered_translation_evidence(
     sd=cv2.dilate(s,k); td=cv2.dilate(t,k)
     smatch=float(np.count_nonzero((s>0)&(td>0))/max(1,sc)) if sc else 0.0
     tmatch=float(np.count_nonzero((t>0)&(sd>0))/max(1,tc)) if tc else 0.0
-    identity=float(np.clip(0.5*(smatch+tmatch),0.0,1.0))
+    # Use the weaker directional overlap as the identity score.  Averaging the
+    # two directions can hide a real translation when one short glyph set is
+    # almost contained by the other after tolerance dilation (notably with
+    # OpenCV 5 rasterisation).  The weaker direction still stays at 1.0 for
+    # genuinely unchanged ink, while preserving asymmetric CN/JP differences.
+    identity=float(np.clip(max(smatch,tmatch) if require_bidirectional_change else min(smatch,tmatch),0.0,1.0))
     change=float(np.clip(1.0-identity,0.0,1.0))
     min_sd=float(getattr(cfg,"supplemental_min_source_ink_density",0.012))
     min_td=float(getattr(cfg,"supplemental_min_target_ink_density",0.008))
@@ -251,6 +270,7 @@ def _registered_translation_evidence(
         "min_target_text_pixels":min_target_text,"min_source_text_pixels":min_source_text,
         "source_ink_match":smatch,"target_ink_match":tmatch,
         "ink_identity_overlap":identity,"change_score":change,
+        "bidirectional_change_required": bool(require_bidirectional_change),
         "min_source_ink_density":min_sd,"min_target_ink_density":min_td,"min_change_score":min_change,
     }
 
@@ -860,6 +880,40 @@ def build_production_aligned_hole_result(
     if not candidates:
         return _empty_production_result(source, target, registration, "no_target_container_candidates")
 
+    # Reuse the already-warmed Koharu TARGET layout as a semantic glyph mask.
+    # Bubble geometry answers WHERE changes are allowed; Koharu text segmentation
+    # answers WHICH Japanese pixels inside a coloured/effect container must be
+    # removed.  This is OCR-free and prevents shared CJK glyphs from surviving
+    # merely because SOURCE/TARGET raster-diff sees them as identical.
+    koharu_target_text_mask = np.zeros(shape, np.uint8)
+    koharu_source_text_mask = np.zeros(source.shape[:2], np.uint8)
+    koharu_source_text_warped = np.zeros(shape, np.uint8)
+    try:
+        evidence = collect_koharu_layout_evidence_cached(
+            target, bubble_cfg, role="aligned_overlay_target_text", image_path=target_path,
+            cache=stage_cache, cache_enabled=bool(stage_cache is not None), stats=stats, allow_missing=True,
+        )
+        if evidence.available:
+            koharu_target_text_mask = koharu_semantic_text_ink_mask(
+                target, evidence, labels=("text",), min_confidence=0.50, pad_px=3, dilate_px=1,
+            )
+        source_evidence = collect_koharu_layout_evidence_cached(
+            source, bubble_cfg, role="aligned_overlay_source_text", image_path=source_path,
+            cache=stage_cache, cache_enabled=bool(stage_cache is not None), stats=stats, allow_missing=True,
+        )
+        if source_evidence.available:
+            koharu_source_text_mask = koharu_semantic_text_ink_mask(
+                source, source_evidence, labels=("text",), min_confidence=0.50, pad_px=3, dilate_px=1,
+            )
+            koharu_source_text_warped = cv2.warpPerspective(
+                koharu_source_text_mask, np.asarray(registration.matrix, dtype=np.float64), (w, h),
+                flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+            )
+    except Exception:
+        koharu_target_text_mask = np.zeros(shape, np.uint8)
+        koharu_source_text_mask = np.zeros(source.shape[:2], np.uint8)
+        koharu_source_text_warped = np.zeros(shape, np.uint8)
+
     cleaned_target = target.copy()
     lower_rgba = np.zeros((h, w, 4), dtype=np.uint8)
     upper_alpha = np.full((h, w), 255, dtype=np.uint8)
@@ -871,6 +925,7 @@ def build_production_aligned_hole_result(
     regions: list[AlignedOverlayRegion] = []
     supplemental_filtered_count = 0
     supplemental_filter_reasons: dict[str, int] = {}
+    candidate_decisions: list[dict[str, Any]] = []
 
     for idx, bubble in enumerate(candidates):
         mask = _bubble_mask_from_instance(bubble, shape)
@@ -881,15 +936,26 @@ def build_production_aligned_hole_result(
         candidate_source = str((bubble.meta or {}).get("aligned_hole_candidate_source", "primary"))
         is_supplemental = candidate_source.startswith("supplemental_")
         supplemental_max_area = float(getattr(cfg, "supplemental_max_area_ratio", 0.04))
-        translation_diag = _registered_translation_evidence(aligned, target, mask, cfg) if is_supplemental else {"passed": True, "reason": "primary_semantic_authority"}
+        translation_diag = _registered_translation_evidence(
+            aligned, target, mask, cfg, require_bidirectional_change=is_supplemental
+        )
         if is_supplemental and area_ratio > supplemental_max_area:
             translation_diag = {**translation_diag, "passed": False, "reason": "supplemental_area_cap", "area_ratio": area_ratio, "max_area_ratio": supplemental_max_area}
-        if is_supplemental and not bool(translation_diag.get("passed", False)):
-            supplemental_filtered_count += 1
+        if not bool(translation_diag.get("passed", False)):
+            supplemental_filtered_count += int(is_supplemental)
             filter_reason = str(translation_diag.get("reason", "supplemental_translation_gate"))
             supplemental_filter_reasons[filter_reason] = int(supplemental_filter_reasons.get(filter_reason, 0)) + 1
+            candidate_decisions.append({
+                "id": f"aligned_hole_{idx:03d}", "target_bbox": list(map(int, bubble.bbox)),
+                "candidate_source": candidate_source, "applied": False,
+                "reason": filter_reason, "translation_evidence": translation_diag,
+            })
             continue
-        if area_ratio > float(cfg.max_single_region_area_ratio):
+        backend_name = str((bubble.meta or {}).get("backend", "")).strip().lower()
+        semantic_primary = bool(candidate_source == "primary" and backend_name == "koharu_layout")
+        semantic_area_cap = min(0.30, float(getattr(bubble_cfg, "max_area_ratio", 0.38)))
+        effective_area_cap = max(float(cfg.max_single_region_area_ratio), semantic_area_cap) if semantic_primary else float(cfg.max_single_region_area_ratio)
+        if area_ratio > effective_area_cap:
             regions.append(AlignedOverlayRegion(
                 id=f"aligned_hole_{idx:03d}", target_bbox=tuple(map(int, bubble.bbox)),
                 source_bbox=_inverse_bbox(tuple(map(int, bubble.bbox)), registration),
@@ -933,7 +999,16 @@ def build_production_aligned_hole_result(
             # Colored container: TARGET RGB stays authoritative.  JP glyphs are
             # inpainted in place; only CN glyph positions become transparent holes.
             jp_mask = _target_jp_text_mask(target, mask)
-            cn_mask = _source_glyph_mask(aligned, mask, colored=True)
+            semantic_jp = cv2.bitwise_and(koharu_target_text_mask, mask) if cv2.countNonZero(koharu_target_text_mask) > 0 else np.zeros(shape, np.uint8)
+            semantic_cn = cv2.bitwise_and(koharu_source_text_warped, mask) if cv2.countNonZero(koharu_source_text_warped) > 0 else np.zeros(shape, np.uint8)
+            # For a primary Koharu container, RF-DETR semantic boxes define the
+            # complete text corridor. Prefer those masks over generic thresholding
+            # so Japanese glyphs are fully erased and source artwork cannot leak in.
+            if semantic_primary and cv2.countNonZero(semantic_jp) >= 25:
+                jp_mask = semantic_jp
+            elif cv2.countNonZero(semantic_jp) > 0:
+                jp_mask = cv2.bitwise_or(jp_mask, semantic_jp)
+            cn_mask = semantic_cn if semantic_primary and cv2.countNonZero(semantic_cn) >= 25 else _source_glyph_mask(aligned, mask, colored=True)
             if int(cv2.countNonZero(jp_mask)) < 25 or int(cv2.countNonZero(cn_mask)) < 25:
                 reason = "insufficient_colored_text_masks"
                 if is_supplemental:
@@ -944,12 +1019,25 @@ def build_production_aligned_hole_result(
             else:
                 triage = "SAFE"
                 cleaned_target = cv2.inpaint(cleaned_target, jp_mask, 3, cv2.INPAINT_TELEA)
-                local_erase = cv2.bitwise_or(jp_mask, cn_mask)
-                local_hole = cn_mask.copy()
-                local_source_ink = cn_mask.copy()
-                upper_alpha[cn_mask > 0] = 0
-                lower_rgba[..., :3][cn_mask > 0] = aligned[cn_mask > 0]
-                lower_rgba[..., 3][cn_mask > 0] = 255
+                # Coloured/effect containers must not reveal SOURCE paper RGB.
+                # Render SOURCE glyph darkness as opacity instead: white SOURCE
+                # paper becomes fully transparent, black ink becomes opaque, and
+                # antialiased gray edges blend naturally into TARGET colour.
+                ink_alpha, source_gray = source_text_render(aligned, cn_mask)
+                ink_use = ink_alpha > 0.0
+                ink_mask = ink_use.astype(np.uint8) * 255
+                if int(cv2.countNonZero(ink_mask)) < 25:
+                    reason = "insufficient_colored_source_alpha"
+                    triage = "REJECT"
+                else:
+                    local_erase = cv2.bitwise_or(jp_mask, ink_mask)
+                    local_hole = ink_mask.copy()
+                    local_source_ink = ink_mask.copy()
+                    alpha_u8 = np.clip(np.rint(ink_alpha * 255.0), 0, 255).astype(np.uint8)
+                    upper_alpha[ink_use] = 255 - alpha_u8[ink_use]
+                    ink_rgb = np.repeat(source_gray[..., None], 3, axis=2).astype(np.uint8)
+                    lower_rgba[..., :3][ink_use] = ink_rgb[ink_use]
+                    lower_rgba[..., 3][ink_use] = 255
 
         if triage != "REJECT":
             hole_mask = cv2.bitwise_or(hole_mask, local_hole)
@@ -959,6 +1047,11 @@ def build_production_aligned_hole_result(
             color = (30, 190, 30) if not colored else (0, 165, 255)
         else:
             color = (40, 40, 220)
+        candidate_decisions.append({
+            "id": f"aligned_hole_{idx:03d}", "target_bbox": list(bbox),
+            "candidate_source": candidate_source, "applied": triage != "REJECT",
+            "reason": reason, "translation_evidence": translation_diag,
+        })
         x0, y0, x1, y1 = bbox
         cv2.rectangle(overlay, (x0, y0), (max(x0, x1 - 1), max(y0, y1 - 1)), color, 2)
         cv2.putText(overlay, f"H{idx + 1}:{composite_mode}", (x0, max(14, y0 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1, cv2.LINE_AA)
@@ -1022,6 +1115,7 @@ def build_production_aligned_hole_result(
             "supplemental_filtered_count": int(supplemental_filtered_count),
             "supplemental_filter_reasons": dict(supplemental_filter_reasons),
             "cache_primary_target": str(stats.get("primary_detector_target", "")),
+            "candidate_decisions": candidate_decisions,
         },
     )
     layer = np.zeros((h, w, 4), dtype=np.uint8)

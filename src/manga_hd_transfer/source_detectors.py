@@ -18,12 +18,14 @@ from .config import BubbleConfig, MaskReplaceConfig
 from .geometry import mask_to_largest_polygon
 from .models import BubbleInstance
 from .cache import PageStageCache, image_stage_signature
+from .m6_runtime_plan import m6_cache_token
 from .layout_evidence import collect_koharu_layout_evidence_cached, filter_candidates_by_layout_authority
 from .detector_policy import (
     primary_detector, source_auxiliary_providers, expensive_provider,
     detector_strategy, STRATEGY_PRIMARY_ONLY, koharu_is_primary,
 )
 from .model_downloads import discovered_model_path
+from .m6_runtime_plan import choose_detector_size
 from .plugins import REGISTRY, register_provider
 
 logger = logging.getLogger(__name__)
@@ -176,42 +178,68 @@ def _compact_character_components(gray: np.ndarray) -> list[tuple[int,int,int,in
 def _cluster_text_components(gray: np.ndarray, comps: list[tuple[int,int,int,int,int,tuple[float,float]]], min_components: int) -> list[dict]:
     if not comps:
         return []
-    # Build a glyph map and directional unions. Vertical CJK columns and short
-    # horizontal captions both become seed clusters, without requiring OCR.
+    # Build several *separate* directional unions instead of OR-ing vertical and
+    # horizontal dilations before connected-components.  The old union could
+    # bridge a compact narration box into neighbouring textbook/background text,
+    # producing one oversized seed that no longer fitted the real container.
+    # Keeping the directional passes independent gives us both the broad legacy
+    # group and tighter sub-groups.  This follows the detector/mask separation
+    # used by manga-translator style pipelines: detection may be generous, but a
+    # later container gate decides whether the candidate owns pixels.
     glyph=np.zeros_like(gray,np.uint8)
     for x,y,w,h,_a,_c in comps:
         glyph[y:y+h,x:x+w]=255
     widths=[c[2] for c in comps]; heights=[c[3] for c in comps]
     mw=float(np.median(widths)); mh=float(np.median(heights))
-    kernels=[
-        cv2.getStructuringElement(cv2.MORPH_RECT,(max(9,int(mw*1.35)),max(17,int(mh*2.2)))),
-        cv2.getStructuringElement(cv2.MORPH_RECT,(max(17,int(mw*2.2)),max(9,int(mh*1.35)))),
+    kernel_specs=[
+        # Legacy/broad passes.
+        (max(9,int(mw*1.35)), max(17,int(mh*2.2)), "vertical_broad"),
+        (max(17,int(mw*2.2)), max(9,int(mh*1.35)), "horizontal_broad"),
+        # Tighter passes recover text boxes/captions sitting close to unrelated
+        # printed material without hard-coding page coordinates.
+        (max(5,int(mw*0.75)), max(9,int(mh*1.25)), "vertical_tight"),
+        (max(9,int(mw*1.25)), max(5,int(mh*0.75)), "horizontal_tight"),
     ]
-    merged=np.zeros_like(glyph)
-    for k in kernels:
-        merged=cv2.bitwise_or(merged,cv2.dilate(glyph,k))
-    n,labels,stats,cents=cv2.connectedComponentsWithStats(merged,8)
     groups=[]
-    for i in range(1,n):
-        x,y,w,h,area=[int(v) for v in stats[i]]
-        if w>int(gray.shape[1]*0.55) or h>int(gray.shape[0]*0.38):
-            continue
-        inside=[c for c in comps if x <= c[5][0] < x+w and y <= c[5][1] < y+h]
-        if len(inside) < min_components:
-            continue
-        xs=[c[0] for c in inside]; ys=[c[1] for c in inside]
-        x2=[c[0]+c[2] for c in inside]; y2=[c[1]+c[3] for c in inside]
-        tb=(min(xs),min(ys),max(x2),max(y2))
-        tc=(0.5*(tb[0]+tb[2]),0.5*(tb[1]+tb[3]))
-        groups.append({"count":len(inside),"bbox":tb,"centroid":tc,"dilated_bbox":(x,y,x+w,y+h)})
-    groups.sort(key=lambda g:g["count"],reverse=True)
-    # remove near-identical/nested clusters
+    for kw,kh,route in kernel_specs:
+        merged=cv2.dilate(glyph,cv2.getStructuringElement(cv2.MORPH_RECT,(kw,kh)))
+        n,labels,stats,_=cv2.connectedComponentsWithStats(merged,8)
+        for i in range(1,n):
+            x,y,w,h,area=[int(v) for v in stats[i]]
+            if w>int(gray.shape[1]*0.55) or h>int(gray.shape[0]*0.38):
+                continue
+            inside=[c for c in comps if x <= c[5][0] < x+w and y <= c[5][1] < y+h]
+            if len(inside) < min_components:
+                continue
+            xs=[c[0] for c in inside]; ys=[c[1] for c in inside]
+            x2=[c[0]+c[2] for c in inside]; y2=[c[1]+c[3] for c in inside]
+            tb=(min(xs),min(ys),max(x2),max(y2))
+            tc=(0.5*(tb[0]+tb[2]),0.5*(tb[1]+tb[3]))
+            groups.append({"count":len(inside),"bbox":tb,"centroid":tc,
+                           "dilated_bbox":(x,y,x+w,y+h),"cluster_route":route})
+    # Prefer stronger groups, but for similar strength keep the smaller/tighter
+    # seed first.  A tight seed that recovers the same eventual container will be
+    # de-duplicated after the barrier flood, while a useful sub-cluster survives.
+    groups.sort(key=lambda g:(-g["count"],
+                              (g["bbox"][2]-g["bbox"][0])*(g["bbox"][3]-g["bbox"][1])))
     kept=[]
     for g in groups:
         gx0,gy0,gx1,gy1=g["bbox"]
-        if any(abs(gx0-k["bbox"][0])<12 and abs(gy0-k["bbox"][1])<12 and abs(gx1-k["bbox"][2])<12 and abs(gy1-k["bbox"][3])<12 for k in kept):
-            continue
-        kept.append(g)
+        ga=max(1,(gx1-gx0)*(gy1-gy0))
+        duplicate=False
+        for k in kept:
+            kx0,ky0,kx1,ky1=k["bbox"]
+            ix=max(0,min(gx1,kx1)-max(gx0,kx0)); iy=max(0,min(gy1,ky1)-max(gy0,ky0))
+            inter=ix*iy
+            ka=max(1,(kx1-kx0)*(ky1-ky0))
+            # Only collapse genuinely near-identical seeds.  Nested text subsets
+            # are intentionally retained because they can map to a distinct
+            # closed narration/speech container when the broad group spans two
+            # neighbouring printed areas.
+            if inter/max(1,min(ga,ka))>0.92 and max(ga,ka)/max(1,min(ga,ka))<1.25:
+                duplicate=True; break
+        if not duplicate:
+            kept.append(g)
     return kept
 
 
@@ -474,7 +502,7 @@ def detect_source_ysg_obb(source: np.ndarray, mask_cfg: MaskReplaceConfig, bubbl
             source, model_path=str(resolved),
             confidence=float(getattr(bubble_cfg, "ysg_obb_confidence", .25)),
             iou=float(getattr(bubble_cfg, "ysg_obb_iou", .50)),
-            imgsz=max(640, int(getattr(bubble_cfg, "ysg_obb_imgsz", 1600))),
+            imgsz=choose_detector_size("ysg_obb", max(640, int(getattr(bubble_cfg, "ysg_obb_imgsz", 1600))), source.shape[:2], config=bubble_cfg),
             device=str(getattr(bubble_cfg, "device", "auto")),
         )
     except Exception as exc:
@@ -527,11 +555,14 @@ def detect_source_rtdetr_v2(source: np.ndarray, mask_cfg: MaskReplaceConfig, bub
         payload=run_rtdetr(
             source, model_ref=source_ref, local_only=not allow,
             confidence=float(getattr(bubble_cfg,"rtdetr_confidence",0.30)),
-            imgsz=max(256,int(getattr(bubble_cfg,"rtdetr_imgsz",640))),
+            imgsz=choose_detector_size("rtdetr_v2", max(256,int(getattr(bubble_cfg,"rtdetr_imgsz",640))), source.shape[:2], config=bubble_cfg),
             device=str(getattr(bubble_cfg,"device","auto")),
         )
     except Exception as exc:
-        logger.warning("RT-DETR-v2 isolated source detector unavailable: %s",exc); return []
+        logger.warning("RT-DETR-v2 isolated source detector unavailable: %s", exc)
+        if bool(kwargs.get("strict_errors", False)):
+            raise RuntimeError(f"RT-DETR-v2 primary detector inference failed: {exc}") from exc
+        return []
     h,w=source.shape[:2]; out=[]; device=str(payload.get("device") or "isolated")
     for row in list(payload.get("items") or []):
         box=list(row.get("box") or [])
@@ -668,7 +699,7 @@ def run_source_detector_chain(
             try:
                 primary_sig = image_stage_signature(
                     source_path, bubble_cfg,
-                    {"role": "source", "detector_policy_primary": name, "primary_only_stage": True},
+                    {"role": "source", "detector_policy_primary": name, "primary_only_stage": True, "m6_policy": m6_cache_token(bubble_cfg)},
                 )
                 rows = cache.load_bubbles("primary_source", primary_sig)
                 if rows is not None:

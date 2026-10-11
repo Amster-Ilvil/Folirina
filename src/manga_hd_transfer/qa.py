@@ -164,7 +164,10 @@ def run_mask_replace_qa(
     if registration.confidence < cfg.registration_min_confidence:
         issues.append(QAItem("registration_low_confidence", "error" if publication_safety else "warning", "Cross-edition registration is below the mask-transfer threshold; aggressive mode keeps the diagnostic but does not publication-block an otherwise writable region.", value=registration.confidence, threshold=cfg.registration_min_confidence))
     for unit in source_units:
-        if unit.confidence < cfg.ocr_min_confidence:
+        # Geometry-only source units (e.g. Koharu/paired-diff regions when OCR is
+        # explicitly disabled) carry detector confidence but no recognized text.
+        # Do not mislabel detector confidence as OCR confidence.
+        if str(getattr(unit, "text", "") or "").strip() and unit.confidence < cfg.ocr_min_confidence:
             issues.append(QAItem("source_ocr_low_confidence", "warning", "Source Chinese OCR is low-confidence; bubble extraction should be reviewed.", unit.id, unit.confidence, cfg.ocr_min_confidence))
 
     enabled = set(getattr(replace_config, "enabled_kinds", ["speech", "narration"]))
@@ -214,13 +217,16 @@ def run_mask_replace_qa(
                 if not bool(getattr(rec, "content_complete", False)):
                     issues.append(QAItem(
                         "mask_replace_content_incomplete", "warning" if getattr(rec, "applied", False) else "error",
-                        "Pixels were written, but the independent content check found missing source ink or residual target-language ink. Raster application is not publication success.",
+                        "Pixels were written, but the independent content check found missing source ink or target-origin raster that was not invalidated by this transfer. Without OCR this is a raster-integrity signal, not a language classifier.",
                         rec.source_bubble_id,
                         meta={
                             "target": rec.target_bubble_id,
                             "source_ink_coverage": float(getattr(rec, "source_ink_coverage", 0.0)),
                             "target_residual_ratio": float(getattr(rec, "target_residual_ratio", 0.0)),
                             "clarity_mode": getattr(rec, "clarity_mode", "pixels"),
+                            "residual_basis": str((getattr(rec, "meta", {}) or {}).get("content_residual_basis") or "final_raster_proxy"),
+                            "target_visual_dark_proxy": float((getattr(rec, "meta", {}) or {}).get("target_visual_dark_proxy") or 0.0),
+                            "target_original_invalidated_ratio": float((getattr(rec, "meta", {}) or {}).get("target_original_invalidated_ratio") or 0.0),
                         },
                     ))
             elif content_check not in {"disabled"}:

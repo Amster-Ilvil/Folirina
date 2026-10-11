@@ -250,6 +250,19 @@ QPushButton#segmented {{
 }}
 QPushButton#segmented:hover {{ background:#F2F6FB; border-color:#EDF1F6; color:{TEXT}; }}
 QPushButton#segmented:checked {{ background:{BLUE_SOFT}; color:{ACCENT_HOVER}; border:1px solid #D9E5F5; font-weight:700; }}
+/* Workbench-specific 10-view dock: designed as two rows of quiet controls
+   beneath the page image, not transparent nav links above it. */
+QPushButton#segmented[workbenchView="true"] {{
+    background:#EEF2F8; color:{MUTED}; border:1px solid #E5EBF5;
+    min-height:30px; border-radius:8px; font-size:11px; padding:0 7px;
+}}
+QPushButton#segmented[workbenchView="true"]:checked {{
+    background:#FFFFFF; color:{ACCENT_HOVER}; border:1px solid #C7D8F2;
+    font-weight:750;
+}}
+QPushButton#segmented[workbenchView="true"]:hover {{
+    background:#E8F0FB; color:{TEXT}; border-color:#CBDCF2;
+}}
 QPushButton#pageNav {{ min-width:78px; min-height:30px; padding:0 10px; }}
 QPushButton#pageRailCollapse {{
     min-width:25px; max-width:25px; min-height:25px; max-height:25px;
@@ -309,6 +322,9 @@ QPushButton#topAction {{
 QPushButton#topAction:hover {{ background:#F2F6FB; color:{TEXT}; border-color:#D7E2F0; }}
 QPushButton#topAction:pressed {{ background:#EAF0F7; }}
 QPushButton#compactAction {{ min-height:30px; padding:0 10px; }}
+QLabel#workbenchPageSubtitle {{
+    color:{MUTED}; font-size:11px; padding:2px 2px 3px 2px;
+}}
 QLabel#pageCounter {{
     color:{TEXT};
     background:{BLUE_SOFT};
@@ -433,6 +449,49 @@ QLabel#infoChip {{
 """
 
 
+# --- Phase 31 refinement: tonal buttons, readable quiet text, flow bar, toast, dialogs -------------
+TONAL, TONAL_HOVER, TONAL_PRESSED = "#E8F0FD", "#DAE7FA", "#CCDDF5"
+PRIMARY_TOP, PRIMARY_BOTTOM, PRIMARY_HOVER, PRIMARY_PRESSED, PRIMARY_OFF = "#2C68EE", "#2462E8", "#1F57D6", "#1A49B8", "#BFD0F5"
+GREEN_TEXT = "#1E7A5A"
+
+STYLE += f"""
+QPushButton {{ background:{TONAL}; border:1px solid transparent; }}
+QPushButton:hover {{ background:{TONAL_HOVER}; border-color:transparent; }}
+QPushButton:pressed {{ background:{TONAL_PRESSED}; }}
+QPushButton:focus {{ border:1px solid {ACCENT}; }}
+QPushButton#primary {{
+    background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 {PRIMARY_TOP},stop:1 {PRIMARY_BOTTOM});
+    border:1px solid {PRIMARY_HOVER}; color:white;
+}}
+QPushButton#primary:hover {{ background:{PRIMARY_HOVER}; }}
+QPushButton#primary:pressed {{ background:{PRIMARY_PRESSED}; border-color:{PRIMARY_PRESSED}; }}
+QPushButton#primary:disabled {{ background:{PRIMARY_OFF}; border-color:{PRIMARY_OFF}; color:white; }}
+QLabel#quiet, QLabel#railSection, QLabel#railCaption, QLabel#workflowStep {{ color:{MUTED}; }}
+QStatusBar {{ background:#F7F9FD; border-top:1px solid {BORDER}; color:{MUTED}; }}
+QFrame#flowBar {{ background:{BG}; border:none; border-bottom:1px solid {BORDER}; }}
+QLabel#flowSep {{ color:{MUTED}; font-size:13px; }}
+QPushButton#flowChip {{
+    background:transparent; color:{MUTED}; border:1px solid transparent; border-radius:10px;
+    min-height:28px; max-height:30px; padding:0 12px; font-weight:650;
+}}
+QPushButton#flowChip:hover {{ background:{TONAL}; color:{TEXT}; }}
+QPushButton#flowChip[state="current"] {{ background:{BLUE_SOFT}; color:{ACCENT_HOVER}; border:1px solid #D9E5F5; font-weight:750; }}
+QPushButton#flowChip[state="done"] {{ color:{GREEN_TEXT}; }}
+QPushButton#flowNext {{
+    background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 {PRIMARY_TOP},stop:1 {PRIMARY_BOTTOM});
+    border:1px solid {PRIMARY_HOVER}; color:white; font-weight:700; min-height:30px; max-height:32px; padding:0 16px;
+}}
+QPushButton#flowNext:hover {{ background:{PRIMARY_HOVER}; }}
+QFrame#nfToast {{ background:{CARD}; border:1px solid {BORDER_STRONG}; border-radius:14px; }}
+QLabel#nfToastText {{ color:{TEXT}; font-size:13px; font-weight:650; background:transparent; }}
+QDialog#confirmDialog {{ background:{CARD}; }}
+QDialog#confirmDialog QLabel {{ background:transparent; }}
+QLabel#confirmTitle {{ font-size:14px; font-weight:750; }}
+QLabel#confirmIconDanger {{ background:{RED_SOFT}; color:{RED}; border-radius:21px; font-size:20px; font-weight:800; }}
+QLabel#confirmIconInfo {{ background:{BLUE_SOFT}; color:{ACCENT_HOVER}; border-radius:21px; font-size:20px; font-weight:800; }}
+QDialog#confirmDialog QPushButton {{ min-width:88px; min-height:34px; }}
+QLabel#shortcutKey {{ background:{TONAL}; border:1px solid {BORDER}; border-radius:6px; padding:2px 8px; font-weight:650; color:{TEXT}; }}
+"""
 
 LIGHT_STYLE = STYLE
 
@@ -503,6 +562,11 @@ _DARK_COLOR_REPLACEMENTS = {
     "#F3F7FC": "#0E1827",
     "#DCE7F4": "#2A3E59",
 }
+_DARK_COLOR_REPLACEMENTS.update({
+    "#E8F0FD": "#1B2A44", "#DAE7FA": "#24385A", "#CCDDF5": "#2D4670",
+    "#2C68EE": "#3569DE", "#2462E8": "#2F66D6", "#1F57D6": "#3A72E3", "#1A49B8": "#2A57B8", "#BFD0F5": "#2B3F66",
+    "#1E7A5A": "#6EE7B7",
+})
 
 
 def _make_dark_style(light_style: str) -> str:

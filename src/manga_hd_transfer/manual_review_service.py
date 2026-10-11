@@ -17,6 +17,7 @@ from .review_apply import apply_review_page
 from .review_history import undo_review_state, redo_review_state, record_review_state
 from .schema_compat import as_dict, as_dict_rows, as_list, normalize_overrides, normalize_review_applied
 from .review_artifacts import safe_page_artifact_path
+from .workspace_guard import guarded_page_write
 
 TraceFn = Callable[[str, dict[str, Any]], None]
 
@@ -79,6 +80,8 @@ _MANUAL_COMMIT_MUTABLE_NAMES = (
     "target_layer_erase.json", "target_layer_restore_base.png",
     "target_layer_restore_effective_mask.png", "target_layer_restore_preview.png",
     "target_layer_restore.json",
+    "manual_target_layer_restore_mask.png",
+    "target_layer_edit_order.json",
 )
 
 
@@ -297,6 +300,17 @@ def commit_manual_effect(
                 continue
             rows.append(existing)
         rows.append(row)
+        if mode == "region_brush_reveal" and reveal_patch is not None:
+            # A newly committed stroke takes precedence over an older TARGET
+            # restore at its actual ink pixels, never over its whole rectangle.
+            restore_path = page_dir / "manual_target_layer_restore_mask.png"
+            restore = cv2.imread(str(restore_path), cv2.IMREAD_GRAYSCALE) if restore_path.exists() else None
+            box = row.get("reveal_patch_bbox") or row.get("target_bbox") or []
+            if restore is not None and len(box) == 4:
+                x0, y0, x1, y1 = map(int, box)
+                if 0 <= x0 < x1 <= restore.shape[1] and 0 <= y0 < y1 <= restore.shape[0] and reveal_patch.shape[:2] == (y1-y0, x1-x0):
+                    restore[y0:y1, x0:x1][reveal_patch[:, :, 3] > 0] = 0
+                    write_image(restore_path, restore)
         overrides["manual_effect_regions"] = rows
         owner_mode = str(row.get("owner_transfer_mode", "") or "").strip().lower()
         if owner_mode:
@@ -371,3 +385,31 @@ def commit_manual_effect(
         snapshot.close()
     return result
 
+
+@guarded_page_write("manual_clear_mask_reset")
+def reset_manual_clear_mask_review(page_dir: str | Path, config: PipelineConfig | None = None) -> Path | None:
+    """Undo the manual replacement of the automatic clear mask *and* its pixels.
+
+    The previous GUI handler only unlinked manual_clear_mask.png, leaving
+    final.png/final_reviewed.png as the OLD reviewed render.  It now recomposes
+    the page in one guarded, rollback-capable transaction.  Keep additive JP
+    cleanup and other independent edits; this action only resets the override.
+    """
+    page_dir = Path(page_dir)
+    manual = page_dir / "manual_clear_mask.png"
+    if not manual.exists():
+        return None
+    cfg = config or PipelineConfig()
+    def restore_and_reapply():
+        manual.unlink()
+        result = apply_review_page(page_dir, cfg)
+        # Any stale preview might show the manual mask from before reset.
+        for name in ("removed_text_preview.png", "remove_text_stage.json", "effective_clear_mask.png",
+                     "japanese_residual_heatmap.png"):
+            (page_dir / name).unlink(missing_ok=True)
+        return result
+    return run_manual_review_transaction(
+        page_dir, restore_and_reapply,
+        extra_names=("manual_clear_mask.png", "removed_text_preview.png", "remove_text_stage.json",
+                     "effective_clear_mask.png", "japanese_residual_heatmap.png", "review_replay.json"),
+    )

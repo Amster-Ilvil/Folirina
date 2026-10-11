@@ -34,6 +34,7 @@ from .schema_compat import as_dict, as_dict_rows
 from .mode_contracts import mode_scoped_config_payload
 from .project_store import page_project_from_dict
 from .layout_evidence_models import LayoutEvidence, LayoutEvidenceItem
+from .geometry import rasterize_polygon
 
 CACHE_SCHEMA = "mhd-cache-v2"
 RESUME_SCHEMA = "folirina-page-resume-v3"
@@ -403,13 +404,28 @@ class PageStageCache:
                 if not _cache_bundle_matches(arrays, signature, self._path(f"layout_{role}.json"), npz_path):
                     return None
                 payload = dict(meta.get("payload") or {})
+                diagnostics = dict(payload.get("diagnostics") or {})
+                shape_raw = diagnostics.get("shape")
+                polygon_shape = None
+                if isinstance(shape_raw, (list, tuple)) and len(shape_raw) == 2:
+                    h, w = int(shape_raw[0]), int(shape_raw[1])
+                    if h > 0 and w > 0:
+                        polygon_shape = (h, w)
                 items = []
-                expected_shape = None
+                expected_shape = polygon_shape
                 for i, row in enumerate(list(payload.get("items") or [])):
                     mk = f"mask_{i}"
-                    if mk not in arrays.files:
+                    polygon = [tuple(map(float, p)) for p in list(row.get("polygon") or [])]
+                    # Legacy layout caches may contain full-size masks. New caches
+                    # deliberately persist polygons only: serializing tens of
+                    # 4096x5824 masks per SOURCE page made book processing spend
+                    # minutes compressing hundreds of MB of redundant raster data.
+                    if mk in arrays.files:
+                        mask = arrays[mk].astype(np.uint8, copy=False)
+                    elif polygon_shape is not None and polygon:
+                        mask = rasterize_polygon(polygon, polygon_shape)
+                    else:
                         return None
-                    mask = arrays[mk].astype(np.uint8, copy=False)
                     if mask.ndim != 2:
                         return None
                     if expected_shape is None:
@@ -419,7 +435,7 @@ class PageStageCache:
                     items.append(LayoutEvidenceItem(
                         label=str(row.get("label") or "unknown"),
                         confidence=float(row.get("confidence", 0.0)),
-                        polygon=[tuple(map(float, p)) for p in list(row.get("polygon") or [])],
+                        polygon=polygon,
                         mask=mask,
                         box=tuple(int(v) for v in list(row.get("box") or [])),
                         meta=dict(row.get("meta") or {}),
@@ -428,7 +444,7 @@ class PageStageCache:
                     available=bool(payload.get("available", True)),
                     backend=str(payload.get("backend") or "koharu_layout"),
                     items=items,
-                    diagnostics=dict(payload.get("diagnostics") or {}),
+                    diagnostics=diagnostics,
                 )
         except Exception:
             return None
@@ -437,10 +453,11 @@ class PageStageCache:
         if not self.enabled or evidence is None:
             return
         self.root.mkdir(parents=True, exist_ok=True)
+        # Geometry is canonical. Do not cache full-resolution masks: they are a
+        # deterministic rasterization of the polygon and can be rebuilt cheaply.
         arrays: dict[str, np.ndarray] = {"__cache_signature__": _signature_array(signature)}
         items_payload = []
-        for i, row in enumerate(list(getattr(evidence, "items", []) or [])):
-            arrays[f"mask_{i}"] = np.asarray(row.mask, dtype=np.uint8)
+        for row in list(getattr(evidence, "items", []) or []):
             items_payload.append({
                 "label": str(row.label),
                 "confidence": float(row.confidence),
@@ -451,6 +468,7 @@ class PageStageCache:
         payload = {
             "available": bool(getattr(evidence, "available", False)),
             "backend": str(getattr(evidence, "backend", "koharu_layout")),
+            "mask_storage": "polygon_v1",
             "items": items_payload,
             "diagnostics": dict(getattr(evidence, "diagnostics", {}) or {}),
         }

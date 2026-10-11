@@ -13,6 +13,8 @@ from typing import Any
 import cv2
 import numpy as np
 
+from .relocated_text import transfer_relocated_koharu_open_text_regions
+
 from ...bubbles import pair_unseeded_white_containers
 from ...detector_policy import auxiliary_detectors, detector_strategy, STRATEGY_ALWAYS
 from ...geometry import transform_to_homography
@@ -131,6 +133,12 @@ def _merge_mask_transfer(base, extra):
         if base.clear_mask is None:
             base.clear_mask = np.zeros_like(base.composite_mask)
         base.clear_mask = np.maximum(base.clear_mask, extra.clear_mask)
+    extra_allow = getattr(extra, "authority_allow_mask", None)
+    if isinstance(extra_allow, np.ndarray) and extra_allow.shape == base.composite_mask.shape:
+        base_allow = getattr(base, "authority_allow_mask", None)
+        if not isinstance(base_allow, np.ndarray) or base_allow.shape != base.composite_mask.shape:
+            base.authority_allow_mask = np.zeros_like(base.composite_mask)
+        base.authority_allow_mask = np.maximum(base.authority_allow_mask, extra_allow)
     base.matches.extend(extra.matches)
     base.records.extend(extra.records)
     return base
@@ -169,8 +177,26 @@ def run_pixel_transfer_stage(
     transfer_rgba = np.zeros((target.shape[0], target.shape[1], 4), dtype=np.uint8)
     fallback_matches = accepted
     semantic_layout_evidence = target_layout_authority
+    # Explicit Direct with a rejected/empty whole-container plan is allowed to
+    # continue only through Koharu semantic completion.  It must not silently
+    # become Mask Replace, OCR-guided transfer, structural supplement, or photo
+    # SFX transfer merely because the primary Direct planner found no safe patch.
+    direct_semantic_only = bool(mode == "direct_patch" and not direct_container_fast)
+    if cache_stats is not None and direct_semantic_only:
+        cache_stats["direct_semantic_only"] = "1"
     if mode_contract.direct or mode_contract.mask_replace:
-        if direct_container_fast and direct_container_plan is not None:
+        if direct_semantic_only:
+            if direct_container_plan is not None:
+                mask_transfer = direct_container_plan.result
+            else:
+                shape = target.shape[:2]
+                empty_mask = np.zeros(shape, np.uint8)
+                empty_rgba = np.zeros((shape[0], shape[1], 4), np.uint8)
+                from .transfer_models import MaskTransferResult
+                mask_transfer = MaskTransferResult(
+                    target.copy(), empty_rgba, empty_mask.copy(), [], [], empty_mask.copy()
+                )
+        elif direct_container_fast and direct_container_plan is not None:
             # Direct remains the primary renderer, but a publication-safe
             # OCR-free completion pass is now allowed for *isolated ordinary
             # white balloons* that Direct did not discover.  This fixes the
@@ -265,7 +291,7 @@ def run_pixel_transfer_stage(
         # only after the main photo transfer, using target-driven masks and the
         # locally aligned source, then merge the editable layers/QA records.
         supplement = getattr(paired_diff, "supplemental", None) if paired_diff is not None else None
-        if (not direct_container_fast and supplement is not None and supplement.aligned_source is not None
+        if (not direct_container_fast and not direct_semantic_only and supplement is not None and supplement.aligned_source is not None
                 and supplement.source_bubbles and supplement.target_bubbles):
             # Structural local/dense flow is excellent for *detecting* changed
             # islands but it can bend CJK strokes on B/W -> colour editions.
@@ -319,7 +345,7 @@ def run_pixel_transfer_stage(
         # Failed eligibility is ignored rather than falling into component
         # transfer, so architecture/panel false positives cannot be published.
         completion_needed = _mask_transfer_completion_needed(mask_transfer)
-        if (not direct_container_fast
+        if (not direct_container_fast and not direct_semantic_only
                 and bool(getattr(mask_cfg, "rigid_container_unseeded_completion_enabled", True))
                 and bool(pair_check.same_page)
                 and registration.confidence >= float(getattr(mask_cfg, "rigid_container_unseeded_min_registration_confidence", 0.72))):
@@ -391,21 +417,44 @@ def run_pixel_transfer_stage(
         # / open-text region could remain Japanese even though the same evidence
         # was recovered correctly in Mask/Hybrid.  Use the active renderer's
         # safety config, but keep the exact same registered-ink-only algorithm.
-        semantic_cfg = config.direct_patch if direct_container_fast else mask_cfg
+        semantic_cfg = config.direct_patch if (direct_container_fast or direct_semantic_only) else mask_cfg
+        semantic_pair_verified = bool(pair_check.same_page)
+        semantic_strict_raw_group_only = bool(
+            direct_semantic_only
+            and not semantic_pair_verified
+            and source_layout_authority is not None
+            and bool(getattr(source_layout_authority, "available", False))
+            and registration.confidence >= float(
+                getattr(semantic_cfg, "koharu_semantic_paired_raw_group_min_registration", 0.70)
+            )
+        )
         if (
             bool(getattr(semantic_cfg, "koharu_semantic_recovery_enabled", True))
             and semantic_layout_evidence is not None
             and bool(getattr(semantic_layout_evidence, "available", False))
-            and bool(pair_check.same_page)
+            and (semantic_pair_verified or semantic_strict_raw_group_only)
             and registration.confidence >= float(getattr(semantic_cfg, "ocr_guided_min_registration_confidence", 0.62))
         ):
             aligned_for_semantic = None
-            if mode in {"mask_replace", "hybrid"} and bool(getattr(mask_cfg, "paired_diff_render_use_global_raster", True)):
+            # Direct semantic completion on monochrome->colour editions must use
+            # the rigid page registration raster, not paired-diff dense alignment.
+            # Dense flow is useful for discovery, but on large SFX/starbursts it
+            # can bend halftone texture and then the source-guided recolour path
+            # faithfully reproduces those distortions.
+            direct_cross_rendition = bool(
+                (direct_container_fast or direct_semantic_only)
+                and _cross_rendition_monochrome_source(source, target)
+            )
+            if (direct_cross_rendition
+                    or (mode in {"mask_replace", "hybrid"} and bool(getattr(mask_cfg, "paired_diff_render_use_global_raster", True)))):
                 aligned_for_semantic, semantic_render_diag = global_registered_raster(
                     source, target.shape[:2], registration
                 )
                 if cache_stats is not None:
-                    cache_stats["semantic_render_source"] = "global_registration_raster_only"
+                    cache_stats["semantic_render_source"] = (
+                        "direct_global_registration_raster_only" if direct_cross_rendition
+                        else "global_registration_raster_only"
+                    )
             elif (
                 paired_diff is not None
                 and paired_diff.aligned_source is not None
@@ -425,7 +474,7 @@ def run_pixel_transfer_stage(
             # renderer re-enter the same accepted bubble and paint it with another
             # registration. v2.3.32 applies this ownership rule to Mask/Hybrid as
             # well as Direct.
-            if direct_container_fast and direct_container_plan is not None:
+            if (direct_container_fast or direct_semantic_only) and direct_container_plan is not None:
                 semantic_exclude_mask = _semantic_completion_exclude_mask(
                     mask_transfer.composite_mask, direct_container_plan
                 )
@@ -440,6 +489,28 @@ def run_pixel_transfer_stage(
                 )
                 if cache_stats is not None:
                     cache_stats["koharu_semantic_mask_owned_exclude_pixels"] = str(int(cv2.countNonZero(semantic_exclude_mask)))
+            # Cross-edition translated SFX/open captions can move within the same
+            # panel.  Run the Direct-private relocated-text pass before the ordinary
+            # same-position semantic completion so a successfully moved SOURCE
+            # caption claims both its SOURCE glyph footprint and TARGET erase mask.
+            if (
+                (direct_container_fast or direct_semantic_only)
+                and not semantic_strict_raw_group_only
+                and source_layout_authority is not None
+                and bool(getattr(source_layout_authority, "available", False))
+            ):
+                relocated_extra = transfer_relocated_koharu_open_text_regions(
+                    aligned_for_semantic, target, mask_transfer.image,
+                    source_layout_authority, semantic_layout_evidence, registration,
+                    semantic_cfg, exclude_mask=semantic_exclude_mask,
+                )
+                if relocated_extra.records:
+                    mask_transfer = _merge_mask_transfer(mask_transfer, relocated_extra)
+                    semantic_exclude_mask = np.maximum(semantic_exclude_mask, relocated_extra.composite_mask)
+                if cache_stats is not None:
+                    cache_stats["koharu_relocated_text_candidates"] = str(len(relocated_extra.records))
+                    cache_stats["koharu_relocated_text_applied"] = str(sum(1 for r in relocated_extra.records if bool(getattr(r, "applied", False))))
+
             semantic_extra = transfer_koharu_semantic_regions(
                 aligned_for_semantic,
                 mask_transfer.image,
@@ -447,6 +518,11 @@ def run_pixel_transfer_stage(
                 semantic_cfg,
                 exclude_mask=semantic_exclude_mask,
                 include_sfx=bool(getattr(semantic_cfg, "koharu_semantic_include_sfx", False)),
+                bubble_min_confidence=float(getattr(config.bubbles, "koharu_layout_bubble_threshold", 0.50)),
+                text_min_confidence=float(getattr(config.bubbles, "koharu_layout_text_threshold", 0.25)),
+                source_evidence=source_layout_authority,
+                registration=registration,
+                strict_raw_group_only=semantic_strict_raw_group_only,
             )
             if cache_stats is not None:
                 cache_stats["koharu_semantic_candidates"] = str(len(semantic_extra.records))
@@ -478,7 +554,7 @@ def run_pixel_transfer_stage(
         # Japanese glyph components and copy registered source raster ink; it
         # never re-typesets or substitutes OCR text.  Low-confidence matches
         # become reversible review candidates instead of disappearing.
-        if (not direct_container_fast
+        if (not direct_container_fast and not direct_semantic_only
                 and bool(getattr(mask_cfg, "ocr_guided_component_transfer_enabled", True))
                 and registration.confidence >= float(getattr(mask_cfg, "ocr_guided_min_registration_confidence", 0.62))
                 and source_units and target_units and matches):
@@ -534,7 +610,7 @@ def run_pixel_transfer_stage(
                         if paired_diff is not None else None)
         if color_source is None and paired_diff is not None:
             color_source = paired_diff.aligned_source
-        if (not direct_container_fast and color_source is not None and paired_diff is not None and paired_diff.method == "photo_pair"
+        if (not direct_container_fast and not direct_semantic_only and color_source is not None and paired_diff is not None and paired_diff.method == "photo_pair"
                 and mask_cfg.photo_pair_color_sfx_enabled):
             koharu_color_authority = (
                 target_layout_authority.combined_mask(("text", "sfx"), dilate_px=4)
@@ -699,7 +775,7 @@ def run_pixel_transfer_stage(
     # this boundary. OCR/reletter orchestration only receives candidates that
     # are genuinely uncovered or rejected by the pixel route.
     if mask_transfer is not None:
-        triage_cfg = config.direct_patch if direct_container_fast else mask_cfg
+        triage_cfg = config.direct_patch if (direct_container_fast or direct_semantic_only) else mask_cfg
         finalize_transfer_records(mask_transfer.records, triage_cfg)
         if (
             mode == "auto"

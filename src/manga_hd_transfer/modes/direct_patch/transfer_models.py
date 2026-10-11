@@ -67,6 +67,12 @@ class MaskTransferResult:
     matches: list[BubblePatchMatch]
     records: list[MaskTransferRecord]
     clear_mask: np.ndarray | None = None
+    # Exact pixels that a stronger two-sided semantic proof has explicitly
+    # authorized even when the generic TARGET authority map marks the surrounding
+    # panel as PROTECT.  Never use this for broad containers; it is reserved for
+    # bounded semantic glyph writes such as relocated/open text confirmed on both
+    # SOURCE and TARGET.
+    authority_allow_mask: np.ndarray | None = None
 
     @property
     def applied_count(self) -> int:

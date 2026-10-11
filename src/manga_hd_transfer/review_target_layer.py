@@ -8,6 +8,7 @@ application dispatcher and remains protected by page-level write guards.
 """
 
 from pathlib import Path
+import shutil
 
 import cv2
 import numpy as np
@@ -252,6 +253,102 @@ def _subtract_mask_file(path: Path, remove_mask: np.ndarray) -> dict:
     return {'path': path.name, 'changed': before != after, 'before_pixels': before, 'after_pixels': after, 'removed_pixels': before - after}
 
 
+_RESTORE_MASK_DRIVERS = (
+    "manual_force_auto_target_override.png", "manual_clear_mask.png",
+    "manual_japanese_clear_mask.png", "manual_force_transfer_mask.png",
+)
+
+
+def _snapshot_restore_mask_drivers(page_dir: Path) -> None:
+    """Freeze driver-mask existence/content before restore subtracts their pixels.
+
+    The old reset erased the visible TARGET restore, but did not put the mask
+    pixels it had removed back.  Later review replay therefore changed the page
+    despite a successful-looking reset.  Keep this small per-page inverse state.
+    """
+    folder = page_dir / ".target_restore_mask_backup"
+    manifest = folder / "manifest.json"
+    if manifest.exists():
+        return
+    folder.mkdir(parents=True, exist_ok=True)
+    presence = {}
+    for name in _RESTORE_MASK_DRIVERS:
+        src = page_dir / name
+        presence[name] = bool(src.is_file())
+        if src.is_file():
+            shutil.copy2(src, folder / name)
+    save_json(manifest, {"schema": "folirina.target_restore_inverse.v1", "files": presence})
+
+
+def _restore_mask_drivers_from_snapshot(page_dir: Path) -> bool:
+    folder = page_dir / ".target_restore_mask_backup"
+    manifest = folder / "manifest.json"
+    if not manifest.exists():
+        return False
+    data = as_dict(load_json(manifest))
+    files = as_dict(data.get("files"))
+    for name in _RESTORE_MASK_DRIVERS:
+        path = page_dir / name
+        if bool(files.get(name)):
+            saved = folder / name
+            if not saved.is_file():
+                raise FileNotFoundError(f"TARGET restore inverse snapshot damaged: {saved}")
+            shutil.copy2(saved, path)
+        else:
+            path.unlink(missing_ok=True)
+    shutil.rmtree(folder)
+    return True
+
+
+_TARGET_EDIT_ORDER = 'target_layer_edit_order.json'
+_TARGET_EDIT_BASES = {
+    'erase': 'target_layer_erase_base.png',
+    'restore': 'target_layer_restore_base.png',
+}
+
+
+def _target_edit_order(page_dir: Path) -> list[str]:
+    """Preserve layer order even if a later edit rebases an older layer.
+
+    Older workspaces have no order manifest, so use initial base-file timestamps
+    once and persist the result on the next successful edit. Do not use these
+    timestamps again after rebasing either base image.
+    """
+    path = page_dir / _TARGET_EDIT_ORDER
+    if path.exists():
+        saved = as_dict(load_json(path)).get('layers', [])
+        if isinstance(saved, list):
+            result = [key for key in saved if key in _TARGET_EDIT_BASES and (page_dir / _TARGET_EDIT_BASES[key]).exists()]
+            if len(result) == len(set(result)):
+                return result
+    dated = [( (page_dir / name).stat().st_mtime_ns, key)
+             for key, name in _TARGET_EDIT_BASES.items() if (page_dir / name).exists()]
+    return [key for _, key in sorted(dated)]
+
+
+def _remember_target_edit(page_dir: Path, layer: str) -> None:
+    order = _target_edit_order(page_dir)
+    if layer not in order:
+        order.append(layer)
+    save_json(page_dir / _TARGET_EDIT_ORDER, {
+        'schema': 'folirina.target_layer_edit_order.v1', 'layers': order,
+    })
+
+
+def _forget_target_edit(page_dir: Path, layer: str) -> None:
+    order = [name for name in _target_edit_order(page_dir) if name != layer]
+    path = page_dir / _TARGET_EDIT_ORDER
+    if order:
+        save_json(path, {'schema': 'folirina.target_layer_edit_order.v1', 'layers': order})
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _target_edit_precedes(page_dir: Path, first: str, second: str) -> bool:
+    order = _target_edit_order(page_dir)
+    return first in order and second in order and order.index(first) < order.index(second)
+
+
 def _project_restore_back_into_masks(page_dir: Path, effective: np.ndarray) -> dict:
     """Persist TARGET-restore intent back into the driving masks.
 
@@ -328,6 +425,8 @@ def _apply_target_layer_restore_to_rendered(
     out = rendered.copy()
     sel = effective > 0
     out[sel] = target[sel]
+    if cv2.countNonZero(effective) > 0:
+        _snapshot_restore_mask_drivers(page_dir)
     persist_diag = _project_restore_back_into_masks(page_dir, effective)
     write_image(page_dir / 'target_layer_restore_effective_mask.png', effective)
     write_image(page_dir / 'target_layer_restore_preview.png', out)
@@ -343,6 +442,24 @@ def _apply_target_layer_restore_to_rendered(
     }
     save_json(page_dir / 'target_layer_restore.json', diag)
     return out, diag
+
+
+def _rebase_active_restore(page_dir: Path, base: np.ndarray, target: np.ndarray) -> np.ndarray:
+    """Keep a later TARGET restore alive when its earlier erase layer changes."""
+    write_image(page_dir / 'target_layer_restore_base.png', base)
+    out, diag = _apply_target_layer_restore_to_rendered(page_dir, base, target)
+    diag['final'] = str(page_dir / 'final_reviewed.png')
+    save_json(page_dir / 'target_layer_restore.json', diag)
+    return out
+
+
+def _rebase_active_erase(page_dir: Path, base: np.ndarray, target: np.ndarray, cfg: PipelineConfig) -> np.ndarray:
+    """Keep a later TARGET erase alive when its earlier restore layer changes."""
+    write_image(page_dir / 'target_layer_erase_base.png', base)
+    out, diag = _apply_target_layer_erase_to_rendered(page_dir, base, target, cfg)
+    diag['final'] = str(page_dir / 'final_reviewed.png')
+    save_json(page_dir / 'target_layer_erase.json', diag)
+    return out
 
 
 @guarded_page_write("target_layer_erase")
@@ -362,6 +479,9 @@ def apply_target_layer_erase_review(page_dir: str | Path, config: PipelineConfig
         base = read_image(source)
         write_image(base_path, base)
     rendered, diag = _apply_target_layer_erase_to_rendered(page_dir, base, target, cfg, refresh_base=False)
+    _remember_target_edit(page_dir, 'erase')
+    if _target_edit_precedes(page_dir, 'erase', 'restore') and (page_dir / 'manual_target_layer_restore_mask.png').exists():
+        rendered = _rebase_active_restore(page_dir, rendered, target)
     final_path = page_dir / 'final_reviewed.png'
     write_image(final_path, rendered)
     diag['final'] = str(final_path)
@@ -374,11 +494,15 @@ def reset_target_layer_erase_review(page_dir: str | Path) -> Path | None:
     """Remove the dedicated TARGET erase mask and restore its pre-erase base."""
     page_dir = Path(page_dir)
     base_path = page_dir / 'target_layer_erase_base.png'
+    later_restore = _target_edit_precedes(page_dir, 'erase', 'restore') and (page_dir / 'manual_target_layer_restore_mask.png').exists()
     restored: Path | None = None
     if base_path.exists():
         base = read_image(base_path)
         restored = page_dir / 'final_reviewed.png'
+        if later_restore:
+            base = _rebase_active_restore(page_dir, base, read_image(page_dir / 'target_original.png'))
         write_image(restored, base)
+    _forget_target_edit(page_dir, 'erase')
     for name in (
         'manual_target_layer_erase_mask.png', 'target_layer_erase_effective_mask.png',
         'target_layer_erase_chinese_protect_mask.png', 'target_layer_erase_preview.png',
@@ -392,7 +516,7 @@ def reset_target_layer_erase_review(page_dir: str | Path) -> Path | None:
 
 
 @guarded_page_write("target_layer_restore")
-def apply_target_layer_restore_review(page_dir: str | Path) -> Path:
+def apply_target_layer_restore_review(page_dir: str | Path, config: PipelineConfig | None = None) -> Path:
     """Fast final-stage TARGET restore without rerunning OCR/registration."""
     page_dir = Path(page_dir)
     target = read_image(page_dir / 'target_original.png')
@@ -407,6 +531,9 @@ def apply_target_layer_restore_review(page_dir: str | Path) -> Path:
         base = read_image(source)
         write_image(base_path, base)
     rendered, diag = _apply_target_layer_restore_to_rendered(page_dir, base, target, refresh_base=False)
+    _remember_target_edit(page_dir, 'restore')
+    if _target_edit_precedes(page_dir, 'restore', 'erase') and (page_dir / 'manual_target_layer_erase_mask.png').exists():
+        rendered = _rebase_active_erase(page_dir, rendered, target, config or PipelineConfig())
     final_path = page_dir / 'final_reviewed.png'
     write_image(final_path, rendered)
     diag['final'] = str(final_path)
@@ -415,15 +542,23 @@ def apply_target_layer_restore_review(page_dir: str | Path) -> Path:
 
 
 @guarded_page_write("target_layer_restore_reset")
-def reset_target_layer_restore_review(page_dir: str | Path) -> Path | None:
+def reset_target_layer_restore_review(page_dir: str | Path, config: PipelineConfig | None = None) -> Path | None:
     """Remove the dedicated TARGET restore mask and restore its pre-restore base."""
     page_dir = Path(page_dir)
     base_path = page_dir / 'target_layer_restore_base.png'
+    later_erase = _target_edit_precedes(page_dir, 'restore', 'erase') and (page_dir / 'manual_target_layer_erase_mask.png').exists()
     restored: Path | None = None
     if base_path.exists():
         base = read_image(base_path)
         restored = page_dir / 'final_reviewed.png'
+    # Resetting TARGET restore must also undo the destructive back-projection
+    # into the auto-clear/forced-transfer masks (including file creation).
+    _restore_mask_drivers_from_snapshot(page_dir)
+    if restored is not None:
+        if later_erase:
+            base = _rebase_active_erase(page_dir, base, read_image(page_dir / 'target_original.png'), config or PipelineConfig())
         write_image(restored, base)
+    _forget_target_edit(page_dir, 'restore')
     for name in (
         'manual_target_layer_restore_mask.png', 'target_layer_restore_effective_mask.png',
         'target_layer_restore_preview.png', 'target_layer_restore.json',

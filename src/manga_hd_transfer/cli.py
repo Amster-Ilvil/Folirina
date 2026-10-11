@@ -67,7 +67,7 @@ def run_cmd(
     target_dir: Path = typer.Argument(..., help="高清日文原图目录"),
     output_dir: Path = typer.Argument(..., help="输出目录"),
     config: Optional[Path] = typer.Option(None, "--config"),
-    ocr_backend: Optional[str] = typer.Option(None, "--ocr-backend", help="paddle|sidecar|none"),
+    ocr_backend: Optional[str] = typer.Option(None, "--ocr-backend", help="paddle|m6_japanese_auto|hayai_ocr|ndlocr_lite|ocr48px|sidecar|none"),
     registration_backend: Optional[str] = typer.Option(None, "--registration-backend", help="auto|opencv|lightglue|loftr"),
     mode: Optional[str] = typer.Option(None, "--mode", help="direct_patch|mask_replace|aligned_overlay_reveal|transparent_bubble_reveal|hybrid|reletter (legacy: auto)"),
     font: Optional[Path] = typer.Option(None, "--font", help="中文字体文件路径"),
@@ -177,6 +177,76 @@ def doctor_cmd():
         status["font"] = find_default_font()
     except Exception as e:
         status["font"] = f"ERROR: {e}"
+    typer.echo(json.dumps(status, ensure_ascii=False, indent=2))
+
+
+@app.command("diagnose-accel")
+def diagnose_accel_cmd():
+    """Report hardware-aware acceleration policy without downloading models."""
+    from .accelerator_policy import detect_apple_hardware, recommended_cpu_threads, recommended_mps_memory_fraction, resolve_precision, diagnostic_snapshot
+    hw = detect_apple_hardware()
+    snapshot = diagnostic_snapshot()
+    try:
+        from .runtime_calibration import best_batch, hardware_fingerprint, safe_batch_ceiling
+        calibration = {
+            "hardware_fingerprint": hardware_fingerprint(),
+            "hayai_safe_batch_ceiling": safe_batch_ceiling("hayai_ocr"),
+            "hayai_best_batch": best_batch("hayai_ocr"),
+            "manga_48px_safe_batch_ceiling": safe_batch_ceiling("ocr48px"),
+            "manga_48px_best_batch": best_batch("ocr48px"),
+        }
+    except Exception:
+        calibration = {}
+    from .m6_runtime_plan import build_m6_runtime_plan
+    from .mlx_runtime import status as mlx_status
+    status = {
+        "hardware": hw.to_dict(),
+        "hardware_snapshot": {**snapshot, "calibration": calibration},
+        "recommended_policy": {
+            "cpu_threads": recommended_cpu_threads(hw),
+            "mps_memory_fraction": recommended_mps_memory_fraction(hw),
+            "mps_precision_auto": resolve_precision("mps", "auto", hw),
+        },
+        "m6_runtime_plan": build_m6_runtime_plan(None, hw=hw).to_dict(),
+        "runtime": runtime_summary("auto", probe_torch=True),
+        "onnxruntime_coreml": None,
+        "paddle_onnx_coreml": None,
+        "mlx": mlx_status(),
+    }
+    try:
+        import onnxruntime as ort
+        providers = ort.get_available_providers()
+        status["onnxruntime_coreml"] = {
+            "scope": "gui_python",
+            "version": getattr(ort, "__version__", ""),
+            "coreml_provider": "CoreMLExecutionProvider" in providers,
+            "providers": providers,
+        }
+    except Exception as exc:
+        status["onnxruntime_coreml"] = {"scope": "gui_python", "available": False, "error": f"{type(exc).__name__}: {exc}"}
+    try:
+        from .paddle_onnx_coreml_runtime import runtime_status as paddle_coreml_status
+        ps = paddle_coreml_status()
+        status["paddle_onnx_coreml"] = {
+            "ready": ps.ready, "python": ps.python, "onnxruntime_version": ps.onnxruntime_version,
+            "coreml_provider": ps.coreml_available, "paddleocr_version": ps.paddleocr_version,
+            "engine_api": ps.engine_api, "detail": ps.detail,
+        }
+    except Exception as exc:
+        status["paddle_onnx_coreml"] = {"ready": False, "error": f"{type(exc).__name__}: {exc}"}
+    try:
+        from .deep_registration_runtime import require_runtime_python
+        worker_py = require_runtime_python()
+        proc = __import__("subprocess").run(
+            [str(worker_py), "-c", "import json, onnxruntime as ort; print(json.dumps({'version': getattr(ort, '__version__', ''), 'coreml_provider': 'CoreMLExecutionProvider' in ort.get_available_providers(), 'providers': ort.get_available_providers()}))"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if proc.returncode == 0:
+            status["onnxruntime_coreml_isolated"] = {"scope": "isolated_torch_runtime", **json.loads(proc.stdout.strip() or "{}"), "python": str(worker_py)}
+        else:
+            status["onnxruntime_coreml_isolated"] = {"scope": "isolated_torch_runtime", "available": False, "python": str(worker_py), "error": (proc.stderr or proc.stdout)[-2000:]}
+    except Exception as exc:
+        status["onnxruntime_coreml_isolated"] = {"scope": "isolated_torch_runtime", "available": False, "error": f"{type(exc).__name__}: {exc}"}
     typer.echo(json.dumps(status, ensure_ascii=False, indent=2))
 
 
