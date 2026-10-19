@@ -422,6 +422,9 @@ class PageStageCache:
                     # minutes compressing hundreds of MB of redundant raster data.
                     if mk in arrays.files:
                         mask = arrays[mk].astype(np.uint8, copy=False)
+                    elif polygon_shape is not None and (row.get("meta") or {}).get("foreground_mask"):
+                        from .koharu_mask_codec import decode_mask
+                        mask = decode_mask(row["meta"]["foreground_mask"], polygon_shape)
                     elif polygon_shape is not None and polygon:
                         mask = rasterize_polygon(polygon, polygon_shape)
                     else:
@@ -453,8 +456,8 @@ class PageStageCache:
         if not self.enabled or evidence is None:
             return
         self.root.mkdir(parents=True, exist_ok=True)
-        # Geometry is canonical. Do not cache full-resolution masks: they are a
-        # deterministic rasterization of the polygon and can be rebuilt cheaply.
+        # Bubble geometry is rebuilt cheaply. Text masks retain all disconnected
+        # strokes and holes through the compact foreground PNG in item metadata.
         arrays: dict[str, np.ndarray] = {"__cache_signature__": _signature_array(signature)}
         items_payload = []
         for row in list(getattr(evidence, "items", []) or []):
@@ -468,7 +471,7 @@ class PageStageCache:
         payload = {
             "available": bool(getattr(evidence, "available", False)),
             "backend": str(getattr(evidence, "backend", "koharu_layout")),
-            "mask_storage": "polygon_v1",
+            "mask_storage": "polygon_or_foreground_png_v2",
             "items": items_payload,
             "diagnostics": dict(getattr(evidence, "diagnostics", {}) or {}),
         }

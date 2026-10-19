@@ -7,7 +7,7 @@ brush stroke from cold-importing every Precise/Hybrid rendering backend.
 from typing import Any
 import cv2
 import numpy as np
-from .manual_effect import registration_homography
+from .registration_geometry import registration_homography
 
 def aligned_source_roi(source: np.ndarray, target_shape: tuple[int, int], project: dict[str, Any],
                         roi: tuple[int, int, int, int], *, source_offset_x: int = 0,

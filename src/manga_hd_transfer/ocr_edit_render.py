@@ -472,6 +472,9 @@ def apply_ocr_edit_blocks(
                 "outside_safe_pixels":outside_safe,
             }); continue
         out=composite_text(out,lr,lcfg)
+        from .white_bubble_composite import compose_ocr_white_bubbles
+        out, white_diag = compose_ocr_white_bubbles(target, out, lr.text_mask, lcfg.fill, project.get("target_bubbles", []))
+        clean_diag["white_bubble_blank_first"] = white_diag
         text_masks.append(lr.text_mask)
         applied.append({
             "id":row.get("id"),"success":True,"bbox":bbox,"text":text,

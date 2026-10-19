@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Private execution capsule for the explicit whole-page hole mode."""
 
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -30,6 +30,7 @@ def execute_isolated_hole_route(
     cache_stats: dict[str, Any] | None = None,
     source_path: str | None = None,
     target_path: str | None = None,
+    inpaint_callback: Callable | None = None,
 ) -> AlignedOverlayResult:
     mode = str(requested_mode or "").strip().lower()
     if mode != MODE_KEY:
@@ -41,7 +42,7 @@ def execute_isolated_hole_route(
         result = build_production_aligned_hole_result(
             source, target, registration, config, bubble_config,
             stage_cache=stage_cache, cache_stats=stats, source_path=source_path,
-            target_path=target_path, target_bubbles=[],
+            target_path=target_path, target_bubbles=[], inpaint_callback=inpaint_callback,
         )
         result.plan.accepted = False
         result.plan.reason = "rejected_page_pair_verification"
@@ -50,6 +51,7 @@ def execute_isolated_hole_route(
     return build_production_aligned_hole_result(
         source, target, registration, config, bubble_config, stage_cache=stage_cache,
         cache_stats=stats, source_path=source_path, target_path=target_path,
+        inpaint_callback=inpaint_callback,
     )
 
 

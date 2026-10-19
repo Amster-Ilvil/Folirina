@@ -4654,6 +4654,18 @@ def execute_transparent_bubble(
         total_cn_ink_pixels += int(cn_ink_pixels)
         text_region_diags.append(diag)
 
+    from .white_bubble_composite import compose_white_bubbles
+    white = compose_white_bubbles(
+        target, final, cv2.cvtColor(aligned, cv2.COLOR_BGR2RGBA),
+        [{"id": r.id, "polygon": r.polygon, "confidence": r.confidence, "kind": "speech"}
+         for r in plan.applied_regions],
+    )
+    final = white.image
+    cn_layer = aligned.copy()
+    white_use = white.clear_mask > 0
+    cn_layer[white_use] = final[white_use]
+    alpha[white_use] = 0
+    page_clear[white_use] = 255
     jp_rgba = cv2.cvtColor(target, cv2.COLOR_BGR2RGBA)
     jp_rgba[..., 3] = alpha
 
@@ -4675,12 +4687,13 @@ def execute_transparent_bubble(
         "pixel_contract": "target_authority_plus_true_full_bubble_reveal",
         "color_preserve_outside_holes": True,
         "engine": "v2.0.24_mtu_bt_effect_inpaint",
+        "white_bubble_blank_first": white.diagnostics,
     }
     return TransparentBubbleResult(
         image_rgb=final,
         image_rgba=jp_rgba.copy(),
         jp_layer_rgba=jp_rgba,
-        cn_layer_rgb=aligned.copy(),
+        cn_layer_rgb=cn_layer,
         clear_mask=page_clear,
         plan=plan,
         diagnostics=diagnostics,

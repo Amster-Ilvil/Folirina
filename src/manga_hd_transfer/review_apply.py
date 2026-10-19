@@ -313,6 +313,11 @@ def _apply_manual_reletters(rendered: np.ndarray, target: np.ndarray, page_dir: 
         if safe is None or cv2.countNonZero(safe) == 0 or not polygon:
             continue
         out = _clear_region_to_paper(out, target, safe)
+        if bubble_id in bubbles_by_id:
+            from .white_bubble_composite import white_bubble_interior
+            white_inner, _ = white_bubble_interior(target, bubbles_by_id[bubble_id])
+            if white_inner is not None:
+                out[white_inner > 0] = 255
         orientation = str(row.get("orientation", "auto") or "auto")
         lcfg = cfg.lettering.model_copy(deep=True) if hasattr(cfg.lettering, 'model_copy') else cfg.lettering.copy(deep=True)
         lcfg.orientation = orientation
@@ -560,6 +565,8 @@ def _apply_mask_replace_review(page_dir: Path, project: dict, cfg: PipelineConfi
     # while the recovered Chinese raster is merged into the transfer layer.
     if cv2.countNonZero(effect_clear_mask) > 0:
         effect_clean = inpaint_image(target, effect_clear_mask, cfg.inpainting).image
+        from .white_bubble_composite import fill_verified_white_under_mask
+        effect_clean = fill_verified_white_under_mask(target, effect_clean, effect_clear_mask, project.get("target_bubbles", []))
         base[effect_clear_mask > 0] = effect_clean[effect_clear_mask > 0]
         write_image(reviewed_base_path, base)
     merged_bgra = _alpha_over_bgra(reviewed_bgra, effect_layer) if np.any(effect_layer[:, :, 3] > 0) else reviewed_bgra
@@ -1031,9 +1038,15 @@ def _apply_review_page_core(page_dir: str | Path, config: PipelineConfig | None 
             rendered = composite_text(rendered, lr, cfg.lettering)
             masks.append(lr.text_mask)
 
+    from .white_bubble_composite import compose_white_bubbles, fill_verified_white_under_mask
+    white = compose_white_bubbles(target, rendered, None, target_bubbles,
+                                   text_rgba=make_text_layer_rgba(target.shape[:2], masks, color=cfg.lettering.fill))
+    rendered = white.image
+    inpainted[white.clear_mask > 0] = 255
     rendered, effect_layer, effect_clear_mask, effect_applied = _apply_manual_effect_regions(rendered, target, page_dir, project, overrides, cfg)
     if cv2.countNonZero(effect_clear_mask) > 0:
         effect_clean = inpaint_image(target, effect_clear_mask, cfg.inpainting).image
+        effect_clean = fill_verified_white_under_mask(target, effect_clean, effect_clear_mask, project.get("target_bubbles", []))
         inpainted[effect_clear_mask > 0] = effect_clean[effect_clear_mask > 0]
     rendered, force_layer, force_clear_mask, force_diag = _apply_manual_force_transfer_mask(page_dir, rendered, target, project, cfg)
     erase_extra = list(masks)
@@ -1452,6 +1465,12 @@ def _manual_ocr_allowed_change_mask(shape: tuple[int, int], rows: list[dict], re
     for item in list(render_state.get("applied") or []):
         if not isinstance(item, dict):
             continue
+        clear_diag = item.get("clear") if isinstance(item.get("clear"), dict) else {}
+        white_diag = clear_diag.get("white_bubble_blank_first") if isinstance(clear_diag.get("white_bubble_blank_first"), dict) else {}
+        for polygon in white_diag.get("white_bubble_polygons", []) or []:
+            points = np.asarray(polygon, np.float32)
+            if points.ndim == 2 and points.shape[0] >= 3 and points.shape[1] == 2 and np.all(np.isfinite(points)):
+                cv2.fillPoly(allowed, [np.rint(points).astype(np.int32)], 255)
         layout = item.get("layout") if isinstance(item.get("layout"), dict) else {}
         box = list(layout.get("container_bbox") or [])
         if len(box) == 4:

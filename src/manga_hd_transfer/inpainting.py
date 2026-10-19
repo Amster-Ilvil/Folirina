@@ -153,18 +153,24 @@ def inpaint_image(image: np.ndarray, mask: np.ndarray, config: InpaintingConfig 
             raise ValueError("inpainting.backend='lama' requires inpainting.lama_command")
         return lama_subprocess(image, mask, cfg.lama_command, cfg.lama_timeout_seconds, allow_shell=bool(getattr(cfg, "lama_allow_shell", False)))
     if backend in {"lama_manga", "aot_inpainting", "flux2_klein", "rorem_mixed"}:
-        command = {
-            "lama_manga": cfg.lama_manga_command or cfg.lama_command,
-            "aot_inpainting": cfg.aot_command,
-            "flux2_klein": cfg.flux2_klein_command,
-            "rorem_mixed": cfg.rorem_mixed_command,
-        }[backend]
         model_path = {
             "lama_manga": cfg.lama_model_path,
             "aot_inpainting": cfg.aot_model_path,
             "flux2_klein": cfg.flux2_klein_model_path,
             "rorem_mixed": cfg.rorem_mixed_model_path,
         }[backend]
+        if backend == "lama_manga" and not model_path:
+            from .storage_paths import model_home
+            model_path = str(model_home() / "inpainting" / "lama-manga.safetensors")
+        command = {
+            "lama_manga": cfg.lama_manga_command or cfg.lama_command,
+            "aot_inpainting": cfg.aot_command,
+            "flux2_klein": cfg.flux2_klein_command,
+            "rorem_mixed": cfg.rorem_mixed_command,
+        }[backend]
+        if backend == "lama_manga" and not command:
+            from .lama_manga_runtime import command_template
+            command = command_template(model_path)
         if not command:
             raise ValueError(f"inpainting.backend='{backend}' requires a local runner command in the corresponding config field")
         prompt = cfg.flux2_klein_prompt if backend == "flux2_klein" else (cfg.rorem_mixed_prompt if backend == "rorem_mixed" else "")

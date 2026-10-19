@@ -292,10 +292,16 @@ def m6_ocr_backend_order(*, prefer: str = "auto", japanese_vertical: bool = True
 
 
 def m6_cache_token(config: Any | None = None, *, hw: AppleHardwareInfo | None = None) -> str:
-    """Broad M6 policy discriminator retained for whole-pipeline compatibility."""
+    """Cache discriminator for runtime choices that can change rendered pixels.
+
+    Live OCR batch size is intentionally excluded: it is a throughput/memory
+    scheduling decision, can change with momentary unified-memory pressure, and
+    does not change recognition semantics or page pixels. Including it made the
+    cache identity flap between consecutive calls on a busy Apple Silicon host.
+    """
     hw = hw or detect_apple_hardware()
     plan = build_m6_runtime_plan(config, hw=hw)
-    return f"m6:{int(plan.enabled)}:{plan.profile}:{plan.memory_gb}:{plan.koharu_shape}:{plan.mangalens_imgsz}:{plan.ysg_obb_imgsz}:{plan.rtdetr_imgsz}:{plan.ocr_batch_size}"
+    return f"m6:{int(plan.enabled)}:{plan.profile}:{plan.memory_gb}:{plan.koharu_shape}:{plan.mangalens_imgsz}:{plan.ysg_obb_imgsz}:{plan.rtdetr_imgsz}"
 
 
 def m6_layout_cache_token(config: Any | None = None, *, hw: AppleHardwareInfo | None = None) -> str:

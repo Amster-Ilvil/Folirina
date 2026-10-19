@@ -36,12 +36,13 @@ from .content_audit import _evaluate_content_completeness, _repair_content_regio
 from .transfer_models import MaskTransferRecord, MaskTransferResult
 from .raster_policy import paired_proxy_geometry_risk
 from ...external_command import run_external_command
-from .text_transfer import changed_text_masks, target_text_mask_in_container, cleanup_target_residual_specks, clear_uniform_white_container_interior, white_container_paper_mask, white_container_write_envelope, target_container_border_mask, remove_container_boundary_line_components
+from .text_transfer import source_text_render, changed_text_masks, target_text_mask_in_container, cleanup_target_residual_specks, clear_uniform_white_container_interior, white_container_paper_mask, white_container_write_envelope, target_container_border_mask, remove_container_boundary_line_components
 from .source_clarity import enhance_white_source_patch as _enhance_white_source_patch
 from ...config import MaskReplaceConfig
 from ...geometry import polygon_bbox, rasterize_polygon, transform_points, transform_to_homography
 from ...io_utils import read_image, write_image
 from ...models import BubbleInstance, RegistrationResult, TextUnit, UnitMatch
+from ...text_ink_equivalence import equivalent_registered_ink
 
 
 
@@ -371,6 +372,8 @@ def _transfer_open_complex_text_region(
     *,
     source_ink_map: np.ndarray | None = None,
     target_ink_map: np.ndarray | None = None,
+    target_clear_hint: np.ndarray | None = None,
+    region_pad_px: int | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray, np.ndarray, dict]:
     """Erase only Japanese glyph strokes and composite the registered Chinese ink.
 
@@ -388,6 +391,8 @@ def _transfer_open_complex_text_region(
     x0, y0, x1, y1 = box
     bw, bh = max(1, x1 - x0), max(1, y1 - y0)
     pad = max(6, int(round(max(bw, bh) * float(getattr(cfg, "paired_diff_complex_region_pad_ratio", 0.16)))))
+    if region_pad_px is not None:
+        pad = max(0, int(region_pad_px))
     gate = cv2.dilate(
         region_mask,
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (pad * 2 + 1, pad * 2 + 1)),
@@ -411,6 +416,12 @@ def _transfer_open_complex_text_region(
     gap = int(getattr(cfg, "paired_diff_complex_group_gap_px", 5))
     src_sel = _select_changed_text_components(src_ink, src_unique, gate, gap)
     tgt_sel = _select_changed_text_components(tgt_ink, tgt_unique, gate, gap)
+    # Clear all compact TARGET strokes in trusted detector text scopes,
+    # including punctuation/overlapping strokes with no edition-exclusive seed.
+    if target_clear_hint is not None and target_clear_hint.shape == shape:
+        text_scope = cv2.bitwise_and((target_clear_hint > 0).astype(np.uint8) * 255, gate)
+        full_target_text = _select_changed_text_components(tgt_ink, tgt_ink, text_scope, gap)
+        tgt_sel = np.maximum(tgt_sel, full_target_text)
     src_count = int(cv2.countNonZero(src_sel)); tgt_count = int(cv2.countNonZero(tgt_sel))
     # Cross-rendition scans can move/blur a glyph enough that the strict
     # edition-exclusive seed disappears, even though compact source/target
@@ -437,17 +448,38 @@ def _transfer_open_complex_text_region(
         return None, empty, empty, {"reason": "insufficient_target_ink", "source_ink_pixels": src_count, "target_ink_pixels": tgt_count}
 
     clear = tgt_sel.copy()
+    if target_clear_hint is not None and target_clear_hint.shape == shape:
+        from ...koharu_mask_codec import refine_text_mask
+        clear = np.maximum(clear, refine_text_mask(target_clear_hint, gate))
     d = max(1, int(getattr(cfg, "paired_diff_complex_clear_dilate_px", 2)))
     clear = cv2.dilate(clear, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d * 2 + 1, d * 2 + 1)))
     clear = cv2.bitwise_and(clear, gate)
     out = cv2.inpaint(target, clear, 2.5, cv2.INPAINT_TELEA)
 
-    alpha = _soft_ink_alpha(aligned_source, src_sel, gate)
-    a3 = alpha[..., None]
-    out = np.clip(
-        aligned_source.astype(np.float32) * a3 + out.astype(np.float32) * (1.0 - a3),
-        0, 255,
-    ).astype(np.uint8)
+    hsv = cv2.cvtColor(target, cv2.COLOR_BGR2HSV)
+    background = (region_mask > 0) & (hsv[..., 2] >= 160)
+    src_rgb = aligned_source[region_mask > 0]
+    src_bright = src_rgb[src_rgb.max(axis=1) >= 140]
+    color_ink = bool(
+        np.count_nonzero(background) >= 64 and src_bright.shape[0] >= 64
+        and np.median(hsv[..., 1][background]) >= 58
+        and np.percentile(src_bright.max(axis=1).astype(float) - src_bright.min(axis=1), 90) <= 30
+    )
+    if color_ink:
+        # Extract black-ink opacity from the mono scan. Its AA gray already
+        # includes white paper; using it as foreground RGB creates a white matte.
+        support = cv2.dilate(src_sel, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+        support = cv2.bitwise_and(support, gate)
+        alpha, ink_gray = source_text_render(aligned_source, support)
+        alpha = np.minimum(alpha, (255.0 - ink_gray) / 255.0)
+        out = np.clip(out.astype(np.float32) * (1.0 - alpha[..., None]), 0, 255).astype(np.uint8)
+    else:
+        alpha = _soft_ink_alpha(aligned_source, src_sel, gate)
+        a3 = alpha[..., None]
+        out = np.clip(
+            aligned_source.astype(np.float32) * a3 + out.astype(np.float32) * (1.0 - a3),
+            0, 255,
+        ).astype(np.uint8)
     write = np.maximum(clear, (alpha * 255).astype(np.uint8))
     # Float alpha can change a pixel by one code value even when uint8(alpha*255)
     # rounds to zero.  Audit/export masks must describe the *exact* write footprint
@@ -464,6 +496,7 @@ def _transfer_open_complex_text_region(
     boundary_touch = bool(np.count_nonzero((src_sel > 0) & (edge_band > inner)))
     return out, write, src_sel, {
         "reason": "ok",
+        "text_composite": "neutral_ink_over_target" if color_ink else "source_rgb",
         "source_ink_pixels": src_count,
         "target_ink_pixels": tgt_count,
         "clear_pixels": int(cv2.countNonZero(clear)),
@@ -953,6 +986,22 @@ def transfer_koharu_semantic_regions(
         candidates.append((str(getattr(row, "label", "text") or "text"), row, gate, True, local_change_ratio))
 
     for index, (kind, row, gate, standalone, local_change_ratio) in enumerate(candidates):
+        # Identical numbers/signage in both editions require no replacement.
+        # Treating them as translated containers erases unchanged shared glyphs
+        # and can blank the burst rays around them (real p-110 regression).
+        equivalence_gate = gate
+        if kind == "bubble" and not standalone:
+            # Burst rays and colour gradients are container artwork. Compare
+            # the container's actual compact lettering in both editions.
+            inner = cv2.erode(gate, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+            shared_text_scope = np.maximum(
+                target_text_mask_in_container(aligned_source, inner),
+                target_text_mask_in_container(target, inner),
+            )
+            if cv2.countNonZero(shared_text_scope) > 0:
+                equivalence_gate = shared_text_scope
+        if equivalent_registered_ink(aligned_source, target, equivalence_gate):
+            continue
         active_exclude = np.maximum(exclude_mask, composite)
         if overlap_ratio(gate, active_exclude) > max_overlap:
             continue
@@ -988,10 +1037,18 @@ def transfer_koharu_semantic_regions(
                     raw_group_used = True
                     effective_gate = raw_group_gate
         if not raw_group_used and not empty_source_clear_used:
+            target_text_hint = np.zeros(shape, np.uint8)
+            if not standalone:
+                for child in texts:
+                    child_mask = getattr(child, "mask", None)
+                    if child_mask is not None and overlap_ratio(np.asarray(child_mask, dtype=np.uint8), gate) >= 0.35:
+                        target_text_hint = np.maximum(target_text_hint, np.asarray(child_mask, dtype=np.uint8))
             text_img, write_mask, source_ink_mask, diag = _transfer_open_complex_text_region(
                 aligned_source, rendered, gate, cfg,
                 source_ink_map=source_ink_cache,
                 target_ink_map=rendered_target_ink_cache,
+                target_clear_hint=target_text_hint,
+                region_pad_px=(3 if not standalone else None),
             )
         rid = str((getattr(row, "meta", {}) or {}).get("item_index", index))
         source_id = f"koharu-semantic-src-{kind}-{rid}"
@@ -3273,6 +3330,11 @@ def transfer_rigid_container_rasters(
                         clear_env_diag["spiky_safe_core_ellipse_pixels"] = int(cv2.countNonZero(ellipse))
                         clear_env_diag["spiky_safe_core_ellipse_inset_px"] = int(inset)
 
+            # A recovered burst ellipse is only a search envelope. Its white
+            # majority must never grant permission to blank coloured pixels at
+            # the edge of a star or on the surrounding effect background.
+            full_clear_envelope = full_clear_envelope.copy()
+            full_clear_envelope[target_hsv[..., 1] > 8] = 0
             full_out, full_mask, full_clear_diag = clear_uniform_white_container_interior(
                 rendered, target_reference, full_clear_envelope,
                 min_paper_ratio=float(getattr(cfg, "white_container_full_clear_min_paper_ratio", 0.68)),
@@ -3728,6 +3790,12 @@ def transfer_paired_diff_regions(
         # half-cleared Japanese / blurred Chinese in the published pixel layer.
         # Snapshot only for policies that can roll back; keep_review retains the
         # legacy behaviour without the copy cost.
+        if region_kind in {"free_text", "complex_text"} and equivalent_registered_ink(aligned_source, target, tm):
+            rec.reason = "preserved_equivalent_source_lettering"
+            rec.content_complete = True
+            rec.review_required = False
+            records.append(rec)
+            continue
         incomplete_policy = str(getattr(cfg, "incomplete_pixel_policy", "keep_review") or "keep_review").strip().lower()
         rollback_state = None
         if incomplete_policy in {"restore_target", "defer_to_ocr"}:
@@ -3838,7 +3906,11 @@ def transfer_paired_diff_regions(
             else:
                 rec.clarity_mode = "complex-text-ink-transfer" if region_kind == "complex_text" else "open-text-ink-transfer"
             _evaluate_content_completeness(
-                rec, source_ink_mask, text_diag.get("target_ink_mask"), text_img, cfg
+                rec, source_ink_mask, text_diag.get("target_ink_mask"), text_img, cfg,
+                # A cleared dark colour fill is still dark in grayscale. Judge
+                # TARGET survival against the actual removal mask, rather than
+                # mistaking the restored colour for the old Japanese glyphs.
+                target_invalidation_mask=text_diag.get("clear_mask"),
             )
 
             if not bool(getattr(rec, "content_complete", False)) and incomplete_policy in {"restore_target", "defer_to_ocr"}:

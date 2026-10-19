@@ -452,7 +452,14 @@ class ModelPage(QWidget):
         _ndl_units = self.ndlocr_coreml_units.findData(str(getattr(ocr_cfg,"ndlocr_lite_coreml_compute_units","ane") or "ane")); self.ndlocr_coreml_units.setCurrentIndex(max(0,_ndl_units))
         inpaint_cfg=self.window.state.config.inpainting
         self.ocr48px_command.setText(str(getattr(ocr_cfg,"ocr48px_command","") or ""))
-        self.lama_manga_command.setText(str(getattr(inpaint_cfg,"lama_manga_command","") or ""))
+        lama_command = str(getattr(inpaint_cfg,"lama_manga_command","") or "")
+        if not lama_command:
+            try:
+                from .lama_manga_runtime import command_template as _lama_command_template
+                lama_command = _lama_command_template() or ""
+            except (ImportError, OSError, RuntimeError):
+                lama_command = ""
+        self.lama_manga_command.setText(lama_command)
         self.aot_command.setText(str(getattr(inpaint_cfg,"aot_command","") or ""))
         self.flux_command.setText(str(getattr(inpaint_cfg,"flux2_klein_command","") or ""))
         self.flux_prompt.setText(str(getattr(inpaint_cfg,"flux2_klein_prompt","") or ""))

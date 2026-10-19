@@ -686,17 +686,19 @@ class RevealMaskDialog(QDialog):
         return self.view.mask.copy()
 
     def result_patch_bgra(self):
-        """Return the exact visible reveal as a sparse BGRA commit patch.
+        """Return the visible reveal as a sparse BGRA commit patch.
 
-        Alpha is 255 only where the accepted brush gate actually changes TARGET.
-        Re-applying this patch therefore reproduces the editor preview exactly
-        without copying untouched background pixels.
+        The gate owns both changed pixels and SOURCE/clear-mask pixels. Keeping
+        unchanged SOURCE ink is essential when a Chinese glyph pixel happens
+        to equal the Japanese pixel beneath it: the commit first clears that
+        Japanese pixel, then reapplies the SOURCE glyph from this patch.
         """
         gate = self.view.mask > 0
         changed = gate & self._np.any(self._full_reveal != self._target, axis=2)
+        owned = gate & (changed | (self._source_mask > 0) | (self._clear_mask > 0))
         patch = self._np.zeros((self._target.shape[0], self._target.shape[1], 4), dtype=self._np.uint8)
         patch[:, :, :3] = self._full_reveal
-        patch[:, :, 3] = changed.astype(self._np.uint8) * 255
+        patch[:, :, 3] = owned.astype(self._np.uint8) * 255
         return patch
 
 

@@ -31,6 +31,7 @@ REGION_MODES = {
     "region_precise_mask",
     "region_hole_reveal",
     "region_transparent",
+    "region_white_bubble",
     "region_ocr",
     "region_brush_reveal",
 }
@@ -519,6 +520,7 @@ def apply_region_action(current: np.ndarray, target: np.ndarray, source: np.ndar
             "idempotent_success": bool(cv2.countNonZero(alpha) > 0 and not np.any(changed)),
             "transparent_pixels": int(row.get("transparent_pixels", 0) or 0),
             "hole_pixels": int(row.get("hole_pixels", 0) or 0),
+            "restore_pixels": int(row.get("restore_pixels", 0) or 0),
             "preview_patch_replayed": True,
             "diagnostics": {"sparse_patch": True, "patch_shape": [int(y1-y0), int(x1-x0)]},
         }
@@ -530,6 +532,36 @@ def apply_region_action(current: np.ndarray, target: np.ndarray, source: np.ndar
         raise ValueError("区域工具没有有效选区")
     bbox = bbox_from_mask(selection)
     diag: dict[str, Any] = {"selection_pixels": selected_px, "selection_bbox": bbox}
+
+    # Every raster review tool uses the same deterministic erase-before-write
+    # rule for a proven white speech balloon. The selection chooses the balloon;
+    # its inset semantic polygon becomes the complete replacement authority.
+    if mode in {"region_direct_patch", "region_precise_mask", "region_hole_reveal", "region_transparent", "region_white_bubble"}:
+        from .white_bubble_composite import apply_white_bubble_blank_first
+        try:
+            white_out, white_layer, white_clear, white_authority, white_diag = apply_white_bubble_blank_first(
+                current, target, source, project, row, selection
+            )
+        except ValueError as exc:
+            if mode == "region_white_bubble":
+                raise
+            diag["white_bubble_policy_deferred"] = str(exc)
+        else:
+            changed = np.any(white_out != current, axis=2)
+            outside = int(np.count_nonzero(changed & (white_authority == 0)))
+            if outside:
+                raise RuntimeError(f"白底气泡工具越界写入 {outside} px")
+            return white_out, white_layer, white_clear, {
+                "id": str(row.get("id") or ""), "success": True, "mode": mode,
+                "target_bbox": white_diag["bubble_bbox"], "selection_kind": "verified_white_bubble",
+                "changed_pixels": int(np.count_nonzero(changed)), "pixel_changed": bool(np.any(changed)),
+                "idempotent_success": not bool(np.any(changed)),
+                "authority_pixels": int(cv2.countNonZero(white_authority)),
+                "outside_selection_changed_pixels": 0,
+                "target_clear_pixels": int(cv2.countNonZero(white_clear)),
+                "diagnostics": {**diag, **white_diag, "user_selection_bbox": bbox,
+                                "expanded_to_verified_bubble": True, "ocr_used": False},
+            }
 
     if mode in {"region_direct_patch", "region_hole_reveal"}:
         roi = _roi_bounds(selection, halo=max(10, int(row.get("feather_px", 0) or 0) * 4))
@@ -656,7 +688,15 @@ def apply_region_action(current: np.ndarray, target: np.ndarray, source: np.ndar
         # repeated identical region action progressively darker/thicker.
         canonical_base = target.copy()
         if cv2.countNonZero(clear):
-            cleaned, clean_diag = local_ops.clean_manual_target_text(target, clear, bbox=bbox)
+            from .lama_manga_runtime import status as lama_status, inpaint_koharu_text
+            model_path = getattr(cfg.inpainting, "lama_model_path", None)
+            colour = cv2.cvtColor(target, cv2.COLOR_BGR2HSV)[..., 1]
+            colour_background = bool(np.mean(colour[selection > 0] > 25) >= 0.10)
+            if colour_background and lama_status(model_path).ready:
+                cleaned, clean_diag = inpaint_koharu_text(target, clear, model_path=model_path)
+                clean_diag["background_policy"] = "lama_manga_colour_target_before_source_ink"
+            else:
+                cleaned, clean_diag = local_ops.clean_manual_target_text(target, clear, bbox=bbox)
             use = clear > 0
             out[use] = cleaned[use]
             canonical_base[use] = cleaned[use]
@@ -747,6 +787,16 @@ def apply_region_action(current: np.ndarray, target: np.ndarray, source: np.ndar
         outside = selection == 0; out[outside] = before[outside]
         layer = np.zeros((h, w, 4), np.uint8); use = text_mask > 0; layer[use, :3] = out[use]; layer[use, 3] = text_mask[use]
         diag.update({"text": text, "text_pixels": int(cv2.countNonZero(text_mask)), "font_path": lr.font_path, "font_size": int(lr.font_size), "orientation": lr.orientation, "ocr_used": True})
+        # Clear the whole verified balloon beneath the new OCR glyphs, including
+        # Japanese columns outside the user's smaller typesetting rectangle.
+        from .white_bubble_composite import compose_white_bubbles
+        white = compose_white_bubbles(target, out, None, project.get("target_bubbles", []),
+                                      text_rgba=cv2.cvtColor(layer, cv2.COLOR_BGRA2RGBA))
+        if white.diagnostics["applied"]:
+            out = white.image
+            clear = np.maximum(clear, white.clear_mask)
+            selection = np.maximum(selection, white.clear_mask)
+            diag["white_bubble_blank_first"] = white.diagnostics
 
     changed = np.any(out != current, axis=2)
     outside_changed = int(np.count_nonzero(changed & (selection == 0)))

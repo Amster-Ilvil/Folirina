@@ -36,7 +36,7 @@ from .content_audit import _evaluate_content_completeness, _repair_content_regio
 from .transfer_models import MaskTransferRecord, MaskTransferResult
 from .raster_policy import paired_proxy_geometry_risk
 from ...external_command import run_external_command
-from .text_transfer import target_text_mask_in_container, cleanup_target_residual_specks, clear_uniform_white_container_interior, white_container_paper_mask, white_container_write_envelope, target_container_border_mask, remove_container_boundary_line_components
+from .text_transfer import source_text_render, target_text_mask_in_container, cleanup_target_residual_specks, clear_uniform_white_container_interior, white_container_paper_mask, white_container_write_envelope, target_container_border_mask, remove_container_boundary_line_components
 from .source_clarity import enhance_white_source_patch as _enhance_white_source_patch
 from ...config import MaskReplaceConfig
 from ...geometry import polygon_bbox, transform_points, transform_to_homography
@@ -443,12 +443,20 @@ def _source_guided_monochrome_recolor(
     replace = cv2.bitwise_and(replace, container_mask)
     out = target.copy()
     alpha = cv2.GaussianBlur((replace.astype(np.float32) / 255.0), (0, 0), 1.2)[..., None]
+    alpha[~container] = 0
     out = np.clip(target.astype(np.float32) * (1.0 - alpha) + recolored.astype(np.float32) * alpha, 0, 255).astype(np.uint8)
 
-    # SOURCE glyph cores are neutral black/white artwork and should retain their
-    # exact raster style.  The bounded halo carries the original white outline.
-    text_alpha = cv2.GaussianBlur((halo.astype(np.float32) / 255.0), (0, 0), 0.6)[..., None]
-    out = np.clip(out.astype(np.float32) * (1.0 - text_alpha) + aligned_source.astype(np.float32) * text_alpha, 0, 255).astype(np.uint8)
+    # The large reconstruction halo is background authority, not SOURCE paper
+    # authority. Copying it verbatim leaves white islands around every Chinese
+    # glyph on pink/yellow bursts. Only real source ink and its AA fringe enter.
+    ink_support = cv2.dilate(dense_ink, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    ink_support[~container] = 0
+    ink_alpha, ink_gray = source_text_render(aligned_source, ink_support)
+    ink_alpha = np.minimum(ink_alpha, (255.0 - ink_gray) / 255.0)
+    text_alpha = ink_alpha[..., None]
+    # Monochrome AA pixels encode black-ink coverage on white paper. Blending
+    # that grayscale RGB again imports the white matte and desaturates colour.
+    out = np.clip(out.astype(np.float32) * (1.0 - text_alpha), 0, 255).astype(np.uint8)
     write = np.zeros(shape, np.uint8)
     write[np.any(out != target, axis=2)] = 255
     return out, write, {
@@ -460,6 +468,8 @@ def _source_guided_monochrome_recolor(
         "source_chroma_spread_p90": round(src_chroma_spread_p90, 3),
         "target_saturation_p50": round(tgt_sat_p50, 3),
         "source_text_halo_pixels": int(cv2.countNonZero(halo)),
+        "source_paper_transparent": True,
+        "text_composite": "neutral_ink_over_target",
         "source_dense_glyph_pixels": int(cv2.countNonZero(dense_ink)),
         "source_dense_glyph_components": int(kept_components),
         "target_saturation_floor": int(target_sat_floor),
@@ -1403,6 +1413,7 @@ def _transfer_open_complex_text_region(
     prefer_source_recolor: bool = False,
     source_text_gate: np.ndarray | None = None,
     raw_group_mode: bool = False,
+    region_pad_px: int | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray, np.ndarray, dict]:
     """Erase only Japanese glyph strokes and composite the registered Chinese ink.
 
@@ -1419,7 +1430,8 @@ def _transfer_open_complex_text_region(
         return None, empty, empty, {"reason": "empty_region"}
     x0, y0, x1, y1 = box
     bw, bh = max(1, x1 - x0), max(1, y1 - y0)
-    pad = max(6, int(round(max(bw, bh) * float(getattr(cfg, "paired_diff_complex_region_pad_ratio", 0.16)))))
+    default_pad = max(6, int(round(max(bw, bh) * float(getattr(cfg, "paired_diff_complex_region_pad_ratio", 0.16)))))
+    pad = default_pad if region_pad_px is None else max(0, int(region_pad_px))
     gate = cv2.dilate(
         region_mask,
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (pad * 2 + 1, pad * 2 + 1)),
@@ -1443,6 +1455,12 @@ def _transfer_open_complex_text_region(
     gap = int(getattr(cfg, "paired_diff_complex_group_gap_px", 5))
     src_sel = _select_changed_text_components(src_ink, src_unique, gate, gap)
     tgt_sel = _select_changed_text_components(tgt_ink, tgt_unique, gate, gap)
+    # Detector text authority includes overlapping strokes and isolated marks
+    # that paired-difference seeds alone cannot select.
+    if target_clear_hint is not None and target_clear_hint.shape == shape:
+        text_scope = cv2.bitwise_and((target_clear_hint > 0).astype(np.uint8) * 255, gate)
+        full_target_text = _select_changed_text_components(tgt_ink, tgt_ink, text_scope, gap)
+        tgt_sel = np.maximum(tgt_sel, full_target_text)
     src_count = int(cv2.countNonZero(src_sel)); tgt_count = int(cv2.countNonZero(tgt_sel))
     # Cross-rendition scans can move/blur a glyph enough that the strict
     # edition-exclusive seed disappears, even though compact source/target
@@ -1491,7 +1509,8 @@ def _transfer_open_complex_text_region(
             # Require real target-ink contact so a coarse detector polygon can
             # never become an unconditional rectangular clear instruction.
             if touch >= max(8, int(round(0.002 * hint_area))):
-                clear = np.maximum(clear, hint)
+                from ...koharu_mask_codec import refine_text_mask
+                clear = np.maximum(clear, refine_text_mask(hint, gate))
                 # ``hint`` is a semantic erase authority and may fill a coarse
                 # polygon around coloured glyphs; it is not itself literal ink
                 # evidence.  For residual QA, keep only target ink components
@@ -1567,6 +1586,7 @@ def _transfer_open_complex_text_region(
     boundary_touch = bool(np.count_nonzero((src_sel > 0) & (edge_band > inner)))
     return out, write, src_sel, {
         "reason": "ok",
+        "region_pad_px": int(pad),
         "source_ink_pixels": src_count,
         "target_ink_pixels": tgt_count,
         "clear_pixels": int(cv2.countNonZero(clear)),
@@ -2239,6 +2259,9 @@ def transfer_koharu_semantic_regions(
                 aligned_source, rendered, transfer_gate, cfg, target_clear_hint=target_text_hint,
                 prefer_source_recolor=bool(raw_gate is not None), source_text_gate=source_text_gate,
                 raw_group_mode=(str(paired_proof.get("proof_mode") or "") == "raw_group"),
+                # Koharu already supplies a segmented bubble/text region. A
+                # bbox-proportional fringe can spill into nearby artwork.
+                region_pad_px=(3 if not standalone else None),
             )
         # Never permit a broad detector-box rescue to degrade into large-area
         # Telea on artwork. If colour reconstruction cannot prove itself safe,
@@ -2285,7 +2308,9 @@ def transfer_koharu_semantic_regions(
                     raw_gate_diag["raw_page_area_ratio"] = round(raw_area_ratio, 6)
                 else:
                     text_img, write_mask, source_ink_mask, diag = _transfer_open_complex_text_region(
-                        aligned_source, rendered, gate, cfg, target_clear_hint=target_text_hint
+                        aligned_source, rendered, gate, cfg, target_clear_hint=target_text_hint,
+                        # Keep semantic bubble fallback inside its detector region.
+                        region_pad_px=(3 if not standalone else None),
                     )
                     raw_gate_diag = dict(raw_gate_diag)
                     raw_gate_diag["expanded"] = False

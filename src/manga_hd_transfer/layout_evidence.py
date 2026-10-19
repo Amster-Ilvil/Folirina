@@ -109,6 +109,7 @@ def _layout_signature(
     cache_role = _canonical_cache_role(role)
     payload = {
         'backend': 'koharu_layout',
+        'mask_transport': 'foreground_png_v1',
         # New v5 layout signatures are intentionally role-neutral: SOURCE/TARGET
         # are cache-file scopes, not model-output semantics. This also lets the
         # in-process memo reuse identical image content across cooperating stages.
@@ -137,7 +138,7 @@ def _layout_signature(
         except OSError:
             pass
     return (
-        f"array:{cache_role if legacy else 'shared'}:{_array_signature(image)}:"
+        f"array:foreground_png_v1:{cache_role if legacy else 'shared'}:{_array_signature(image)}:"
         f"{payload['thresholds']['shape']}:{payload['thresholds']['postprocess_max_side']}:"
         f"{payload['thresholds']['postprocess_downscale_trigger_side']}:"
         f"{payload['thresholds']['text']}:{payload['thresholds']['bubble']}:{payload['thresholds']['m6_policy']}"
@@ -284,6 +285,12 @@ def prepare_page_layout_evidence(
         stats["layout_prefetch_unavailable"] = ",".join(unavailable)
         stats["layout_authority"] = "koharu_first_allow_protect_unknown" if available else "fallback_unknown_only"
         stats["layout_authority_mode"] = key
+        stats["layout_device_receipts"] = {
+            role: {name: ev.diagnostics.get(name, "unknown") for name in (
+                "device", "requested_device", "model_device", "input_device", "precision", "fallback_reason"
+            )}
+            for role, ev in out.items() if ev.available
+        }
     return out
 
 
@@ -586,7 +593,16 @@ def collect_koharu_layout_evidence(
                 polygon = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
         if len(polygon) < 3:
             continue
-        mask = rasterize_polygon(polygon, (h, w))
+        foreground = raw.get("foreground_mask")
+        if foreground:
+            from .koharu_mask_codec import decode_mask
+            mask = decode_mask(foreground, (h, w))
+            full_box = raw.get("box") or []
+            if len(full_box) == 4:
+                x0,y0,x1,y1 = map(float, full_box)
+                polygon = [(x0,y0),(x1,y0),(x1,y1),(x0,y1)]
+        else:
+            mask = rasterize_polygon(polygon, (h, w))
         if cv2.countNonZero(mask) <= 0:
             continue
         label = normalize_layout_label(str(raw.get("label") or "unknown"))
@@ -599,6 +615,8 @@ def collect_koharu_layout_evidence(
             "device": str(payload.get("device") or "isolated"),
             "item_index": idx,
         }
+        if foreground:
+            meta["foreground_mask"] = foreground
         items.append(LayoutEvidenceItem(
             label=label,
             confidence=float(raw.get("confidence", 0.0)),
@@ -628,6 +646,11 @@ def collect_koharu_layout_evidence(
         "optimized_weights_fp16": bool(payload.get("optimized_weights_fp16", False)),
         "optimize_weights_fp16_requested": bool(payload.get("optimize_weights_fp16_requested", False)),
         "predict_seconds": float(payload.get("predict_seconds", 0.0) or 0.0),
+        "requested_device": str(payload.get("requested_device", "auto")),
+        "precision": str(payload.get("precision", "unknown")),
+        "model_device": str(payload.get("model_device", "unknown")),
+        "input_device": str(payload.get("input_device", "unknown")),
+        "fallback_reason": str(payload.get("fallback_reason", "")),
     }
     return LayoutEvidence(True, "koharu_layout", items, diagnostics)
 

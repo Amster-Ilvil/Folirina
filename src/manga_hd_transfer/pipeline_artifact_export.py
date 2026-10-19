@@ -81,6 +81,8 @@ def export_page_artifacts(
     target,
     rendered,
     inpaint_result,
+    koharu_text_clear_mask,
+    koharu_text_cleanup_diagnostics,
     mask_result,
     lettering_masks,
     mask_transfer,
@@ -123,6 +125,8 @@ def export_page_artifacts(
     final_local = page_root / "final.png"
     inpainted_path = page_root / "inpainted.png"
     clear_mask_path = page_root / "clear_mask.png"
+    koharu_text_clear_mask_path = page_root / "koharu_text_clear_mask.png"
+    koharu_text_cleanup_path = page_root / "koharu_text_cleanup.json"
     target_clear_mask_path = page_root / "target_clear_mask.png"
     text_layer_path = page_root / "text_layer.png"
     transfer_layer_path = page_root / "mask_transfer_layer.png"
@@ -205,6 +209,12 @@ def export_page_artifacts(
 
     exact_clear = review_effective_mask
     write_image(target_clear_mask_path, exact_clear, params=sparse_png)
+    if koharu_text_clear_mask is not None and cv2.countNonZero(koharu_text_clear_mask) > 0:
+        write_image(koharu_text_clear_mask_path, koharu_text_clear_mask, params=sparse_png)
+        save_json(koharu_text_cleanup_path, koharu_text_cleanup_diagnostics or {})
+    else:
+        koharu_text_clear_mask_path.unlink(missing_ok=True)
+        koharu_text_cleanup_path.unlink(missing_ok=True)
     save_json(transfer_audit_path, transfer_audit)
 
     if config.export.save_inpainted:
@@ -351,6 +361,8 @@ def export_page_artifacts(
             "source_authority_original": str(authority_artifact_path),
             "target_original": str(original_path),
             "target_clear_mask": str(target_clear_mask_path),
+            "koharu_text_clear_mask": str(koharu_text_clear_mask_path) if koharu_text_clear_mask_path.exists() else "",
+            "koharu_text_cleanup": str(koharu_text_cleanup_path) if koharu_text_cleanup_path.exists() else "",
             "chinese_transfer_layer": str(chinese_layer_path),
             "transfer_audit": str(transfer_audit_path),
             "final": str(final_local),

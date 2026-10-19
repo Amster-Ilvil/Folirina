@@ -234,6 +234,15 @@ def probe_components(config: PipelineConfig | None = None, *, deep: bool = False
     ):
         path=Path(path_value).expanduser() if path_value else local_models[key]
         exists=path.exists()
+        if key == "lama_manga":
+            from .lama_manga_runtime import status as lama_runner_status
+            runner = lama_runner_status(path)
+            rows[key] = ComponentStatus(
+                key, label, bool(runner.ready and exists),
+                bool(runner.python_path.is_file() and runner.runner_path.is_file()),
+                (f"模型：{path}" if exists else "模型尚未导入。") + " " + runner.detail,
+            )
+            continue
         rows[key]=ComponentStatus(
             key,label,bool(exists and command),bool(command),
             (f"模型：{path}" if exists else "模型尚未导入。") + (" 本地 runner 已配置。" if command else " 尚未配置本地 runner 命令。"),

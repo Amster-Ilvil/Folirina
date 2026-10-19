@@ -183,6 +183,13 @@ def run_mask_replace_qa(
 
     for rec in records:
         if not rec.applied:
+            if rec.reason == "preserved_equivalent_source_lettering":
+                issues.append(QAItem(
+                    "mask_replace_equivalent_lettering_preserved", "info",
+                    "Registered SOURCE and TARGET lettering is equivalent; TARGET artwork was preserved.",
+                    rec.source_bubble_id, meta={"target": rec.target_bubble_id},
+                ))
+                continue
             if rec.reason == "source_text_region_clipped_at_page_edge":
                 issues.append(QAItem(
                     "mask_replace_source_translation_clipped",

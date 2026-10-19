@@ -404,6 +404,8 @@ def _koharu_layout(image: np.ndarray, req: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError("Koharu Layout load_model.py has no load_model()")
         model = load_fn(str(weights))
         model_load_seconds = time.perf_counter() - load_started
+        if hasattr(getattr(model, "model", None), "device"):
+            model.model.device = torch.device(effective_device)
         # RF-DETR exposes an official inference-only optimization path that can
         # resident-optimize weights to FP16. Treat it as a best-effort M6 memory
         # optimization: never let its absence/failure affect the stable route.
@@ -416,6 +418,13 @@ def _koharu_layout(image: np.ndarray, req: dict[str, Any]) -> dict[str, Any]:
                 optimized_weights_fp16 = False
             optimize_seconds = time.perf_counter() - optimize_started
         _MODEL_CACHE[key] = model
+
+    # RF-DETR captures its own default accelerator during construction. That
+    # default can disagree with Folirina's requested device (notably CPU after
+    # an MPS probe/fallback), so keep the model context authoritative too.
+    model_context = getattr(model, "model", None)
+    if model_context is not None and hasattr(model_context, "device"):
+        model_context.device = torch.device(effective_device)
 
     orig_h, orig_w = image.shape[:2]
     model_shape = max(512, int(req.get("shape", 1152)))
@@ -447,25 +456,70 @@ def _koharu_layout(image: np.ndarray, req: dict[str, Any]) -> dict[str, Any]:
         "shape": (model_shape, model_shape),
         "include_source_image": False,
     }
+    observed_devices = {}
+    fallback_reason = ""
+
+    def predict_with_device_receipt():
+        # Observe the actual forward pass, including RF-DETR's optimized path.
+        network = (getattr(model_context, "inference_model", None)
+                   if getattr(model, "_is_optimized_for_inference", False)
+                   else getattr(model_context, "model", None))
+        def capture_device(module, args):
+            parameter = next(module.parameters(), None)
+            if parameter is not None:
+                observed_devices["model_device"] = str(parameter.device)
+            if args and isinstance(args[0], torch.Tensor):
+                observed_devices["input_device"] = str(args[0].device)
+        hook = network.register_forward_pre_hook(capture_device) if network is not None else None
+        try:
+            return model.predict(pil, **kwargs)
+        finally:
+            if hook is not None:
+                hook.remove()
+
     predict_started = time.perf_counter()
     try:
         with torch.inference_mode():
             with autocast_context(torch, effective_device, precision):
-                det = model.predict(pil, **kwargs)
+                det = predict_with_device_receipt()
     except TypeError:
         kwargs.pop("include_source_image", None)
         with torch.inference_mode():
             with autocast_context(torch, effective_device, precision):
-                det = model.predict(pil, **kwargs)
+                det = predict_with_device_receipt()
     except Exception as first:
-        if effective_device == "mps" and precision != "fp32":
-            with torch.inference_mode():
-                det = model.predict(pil, **kwargs)
-            precision = "fp32"
-        elif effective_device == "cpu":
+        if effective_device != "mps":
             raise first
+        fallback_reason = str(first)
+        # Retry MPS in full precision first. If the backend still cannot place
+        # the model (e.g. a runtime/OS mismatch), move RF-DETR's context to CPU
+        # and make one explicit CPU attempt instead of leaking a stale MPS
+        # device from the model's constructor.
+        mps_error = first
+        if precision != "fp32":
+            try:
+                with torch.inference_mode():
+                    with autocast_context(torch, "mps", "fp32"):
+                        det = predict_with_device_receipt()
+                precision = "fp32"
+            except Exception as exc:
+                mps_error = exc
+                det = None
         else:
-            raise
+            det = None
+        if det is None:
+            if model_context is not None and hasattr(model_context, "device"):
+                model_context.device = torch.device("cpu")
+            try:
+                with torch.inference_mode():
+                    with autocast_context(torch, "cpu", "fp32"):
+                        det = predict_with_device_receipt()
+                effective_device = "cpu-fallback"
+                precision = "fp32"
+            except Exception as cpu_error:
+                raise RuntimeError(
+                    f"RF-DETR failed on MPS and CPU fallback: MPS={mps_error}; CPU={cpu_error}"
+                ) from cpu_error
     predict_seconds = time.perf_counter() - predict_started
 
     xyxy = np.asarray(getattr(det, "xyxy", []), dtype=np.float32)
@@ -500,10 +554,21 @@ def _koharu_layout(image: np.ndarray, req: dict[str, Any]) -> dict[str, Any]:
             x0,y0,x1,y1=scaled_box
             polygon=[[x0,y0],[x1,y0],[x1,y1],[x0,y1]]
             area=int(max(0,x1-x0)*max(0,y1-y0))
-        items.append({"label":label,"confidence":score,"box":scaled_box,"polygon":polygon,"area":area})
+        item = {"label":label,"confidence":score,"box":scaled_box,"polygon":polygon,"area":area}
+        if label in {"text", "onomatopoeia"} and masks is not None and i < len(masks):
+            try:
+                from .koharu_mask_codec import encode_mask
+            except ImportError:
+                from koharu_mask_codec import encode_mask
+            item["foreground_mask"] = encode_mask(np.asarray(masks[i]))
+        items.append(item)
     return {
         "items":items,
         "device": effective_device,
+        "requested_device": str(req.get("device", "auto")),
+        "model_device": observed_devices.get("model_device", "unknown"),
+        "input_device": observed_devices.get("input_device", "unknown"),
+        "fallback_reason": fallback_reason,
         "precision": precision,
         "isolated_runtime":True,
         "original_shape":[int(orig_h), int(orig_w)],

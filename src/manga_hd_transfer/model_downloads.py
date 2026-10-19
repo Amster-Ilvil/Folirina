@@ -424,6 +424,10 @@ def import_builtin_model(key: str, source: str | Path, config: PipelineConfig | 
         updates.update({"bubbles.sam2_checkpoint": str(dst), "bubbles.sam2_allow_model_downloads": False})
     elif key == "lama_manga":
         updates["inpainting.lama_model_path"] = str(dst)
+        from .lama_manga_runtime import command_template
+        command = command_template()
+        if command:
+            updates["inpainting.lama_manga_command"] = command
     return ModelDownloadResult(key, MODEL_LABELS[key], str(dst), f"{MODEL_LABELS[key]} 已离线导入。", updates)
 
 def _download_paddle(cfg: PipelineConfig, progress: ProgressFn | None) -> ModelDownloadResult:
@@ -769,14 +773,19 @@ def download_builtin_model(key: str, config: PipelineConfig, progress: ProgressF
 
     if key == "lama_manga":
         from .koharu_model_stack import model_spec
+        from .lama_manga_runtime import command_template
         spec = model_spec(key); entry = spec.files[0]
         path = _download_file(
             _hf_urls(str(spec.repo), entry.path, str(spec.revision or "main")),
             paths[key], sha256=entry.sha256, progress=progress, label=label, timeout=120.0,
         )
+        runner_command = command_template()
+        updates = {"inpainting.lama_model_path": str(path)}
+        if runner_command:
+            updates["inpainting.lama_manga_command"] = runner_command
         return ModelDownloadResult(
-            key, label, str(path), "LaMa Manga checkpoint 已下载；运行时通过本地/隔离 runner 调用。",
-            {"inpainting.lama_model_path": str(path)},
+            key, label, str(path), "LaMa Manga checkpoint 已下载并自动连接本机隔离 runner。",
+            updates,
         )
 
     if key == "flux2_klein":

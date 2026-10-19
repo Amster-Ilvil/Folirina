@@ -201,7 +201,7 @@ def _aggregate_registered_text_union_equivalent(
     Koharu may split the same printed diagram/caption differently between two scans
     (Vol.04 p0179 class), so exact detector counts are not a reliable equivalence
     criterion.  This fallback grants **no write authority**.  It only validates an
-    already-zero-output Direct page when: registration is strong, most TARGET text
+    already-zero-output Direct page when: registration is strong, every TARGET text
     groups independently match a SOURCE raster, and the union of every bilateral
     text raw-box is nearly identical after tolerant stroke comparison.
 
@@ -220,7 +220,12 @@ def _aggregate_registered_text_union_equivalent(
         return False
     if max(len(source_rows), len(target_rows)) / max(1, min(len(source_rows), len(target_rows))) > 2.0:
         return False
-    if strict_equivalent_count < max(2, int(np.ceil(len(target_rows) * 0.40))):
+    # A single unmatched/changed target label is enough to make the page
+    # non-equivalent. A 40% quorum let one short translated label hide inside a
+    # page of unchanged diagram text (for example CN -> JP with similar strokes).
+    # Keep the no-op fail-closed: every target text item must have a strict
+    # registered SOURCE raster match before the aggregate detector-split check.
+    if strict_equivalent_count < len(target_rows):
         return False
     try:
         if float(getattr(registration, "confidence", 0.0) or 0.0) < 0.85:

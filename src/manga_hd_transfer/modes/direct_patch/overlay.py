@@ -513,6 +513,17 @@ def compose_direct_overlay(
     effective_mask, guard_diag = _refine_region_mask_with_support(
         region_mask, support_mask, white_mode=bool(white_mode)
     )
+    requested_white_mode = bool(white_mode)
+    # SOURCE paper cannot authorize replacing a coloured TARGET interior.
+    # Include pale yellow/pink fills, which the old high-saturation classifier
+    # treated as white. Dark glyphs are excluded from this background evidence.
+    hsv = cv2.cvtColor(target_region, cv2.COLOR_BGR2HSV)
+    use = effective_mask > 0
+    chroma = np.ptp(target_region.astype(np.int16), axis=2)
+    colored_fill = use & (hsv[..., 2] >= 160) & (hsv[..., 1] >= 12) & (chroma >= 12)
+    colored_fill_ratio = float(np.count_nonzero(colored_fill) / max(1, np.count_nonzero(use)))
+    if white_mode and colored_fill_ratio >= 0.02:
+        white_mode = False
     if bool(white_mode):
         candidate, write_mask, source_payload, diag = build_white_source_overlay(
             target_region, source_region, effective_mask,
@@ -558,6 +569,9 @@ def compose_direct_overlay(
     actual_changed = (np.any(candidate != target_region, axis=2)).astype(np.uint8) * 255
     write_mask = cv2.bitwise_and((write_mask > 0).astype(np.uint8) * 255, actual_changed)
     diag = dict(diag)
+    diag["requested_white_mode"] = requested_white_mode
+    diag["target_colored_fill_ratio"] = colored_fill_ratio
+    diag["target_color_rerouted"] = bool(requested_white_mode and not white_mode)
     diag["strict_support_guard"] = guard_diag
     diag["outside_allowed_source_payload_pixels"] = int(np.count_nonzero(source_payload[~allowed]))
     return candidate, write_mask, source_payload, diag

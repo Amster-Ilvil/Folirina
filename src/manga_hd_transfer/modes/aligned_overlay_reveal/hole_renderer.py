@@ -4,7 +4,8 @@ import json
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Sequence, Tuple
+import subprocess
 
 import cv2
 import numpy as np
@@ -832,6 +833,7 @@ def build_production_aligned_hole_result(
     source_path: str | os.PathLike[str] | None = None,
     target_path: str | os.PathLike[str] | None = None,
     target_bubbles: Sequence[BubbleInstance] | None = None,
+    inpaint_callback: Callable[[np.ndarray, np.ndarray], tuple[np.ndarray, dict[str, Any]]] | None = None,
 ) -> AlignedOverlayResult:
     """Independent production whole-page hole renderer.
 
@@ -915,6 +917,8 @@ def build_production_aligned_hole_result(
         koharu_source_text_warped = np.zeros(shape, np.uint8)
 
     cleaned_target = target.copy()
+    lama_jp_mask = np.zeros(shape, dtype=np.uint8)
+    japanese_cleanup = {"backend": "telea_fallback", "reason": "runner_unavailable"}
     lower_rgba = np.zeros((h, w, 4), dtype=np.uint8)
     upper_alpha = np.full((h, w), 255, dtype=np.uint8)
     hole_mask = np.zeros(shape, dtype=np.uint8)
@@ -926,6 +930,7 @@ def build_production_aligned_hole_result(
     supplemental_filtered_count = 0
     supplemental_filter_reasons: dict[str, int] = {}
     candidate_decisions: list[dict[str, Any]] = []
+    applied_white_candidates = []
 
     for idx, bubble in enumerate(candidates):
         mask = _bubble_mask_from_instance(bubble, shape)
@@ -1019,6 +1024,7 @@ def build_production_aligned_hole_result(
             else:
                 triage = "SAFE"
                 cleaned_target = cv2.inpaint(cleaned_target, jp_mask, 3, cv2.INPAINT_TELEA)
+                lama_jp_mask = cv2.bitwise_or(lama_jp_mask, jp_mask)
                 # Coloured/effect containers must not reveal SOURCE paper RGB.
                 # Render SOURCE glyph darkness as opacity instead: white SOURCE
                 # paper becomes fully transparent, black ink becomes opaque, and
@@ -1040,6 +1046,7 @@ def build_production_aligned_hole_result(
                     lower_rgba[..., 3][ink_use] = 255
 
         if triage != "REJECT":
+            applied_white_candidates.append(bubble)
             hole_mask = cv2.bitwise_or(hole_mask, local_hole)
             erase_mask = cv2.bitwise_or(erase_mask, local_erase)
             source_ink_mask = cv2.bitwise_or(source_ink_mask, local_source_ink)
@@ -1070,6 +1077,29 @@ def build_production_aligned_hole_result(
             },
         ))
 
+    # Use the already verified Japanese glyph masks for one page-level LaMa
+    # repair before compositing Chinese ink. Hard clipping keeps every pixel
+    # outside those masks under the original TARGET authority.
+    lama_pixels = int(cv2.countNonZero(lama_jp_mask))
+    if inpaint_callback is not None and lama_pixels > 0:
+        try:
+            model_image, model_diag = inpaint_callback(target, lama_jp_mask)
+            if not isinstance(model_image, np.ndarray) or model_image.shape != target.shape or model_image.dtype != np.uint8:
+                raise ValueError("LaMa Manga runner must return a uint8 image matching TARGET dimensions")
+            use = lama_jp_mask > 0
+            cleaned_target[use] = model_image[use]
+            japanese_cleanup = {
+                "backend": "lama_manga",
+                "mask_pixels": lama_pixels,
+                "runner": dict(model_diag or {}),
+            }
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+            japanese_cleanup = {
+                "backend": "telea_fallback",
+                "mask_pixels": lama_pixels,
+                "error": str(exc)[:800],
+            }
+
     upper_rgba = np.dstack([cleaned_target, upper_alpha])
     alpha_top = upper_rgba[..., 3:4].astype(np.float32) / 255.0
     alpha_bottom = lower_rgba[..., 3:4].astype(np.float32) / 255.0
@@ -1080,6 +1110,15 @@ def build_production_aligned_hole_result(
     )
     flat = np.clip(premul / np.maximum(out_alpha, 1e-6), 0, 255).astype(np.uint8)
     flat[allowed_change_mask == 0] = target[allowed_change_mask == 0]
+
+    from ...white_bubble_composite import compose_white_bubbles
+    white = compose_white_bubbles(target, flat, cv2.cvtColor(aligned, cv2.COLOR_BGR2RGBA), applied_white_candidates)
+    flat = white.image
+    white_use = white.clear_mask > 0
+    allowed_change_mask[white_use] = 255
+    erase_mask[white_use] = 255
+    hole_mask[white_use] = 255
+    source_ink_mask[white_use] = np.where(cv2.cvtColor(flat, cv2.COLOR_BGR2GRAY)[white_use] < 248, 255, 0)
 
     changed = np.any(flat != target, axis=2)
     changed_pixels = int(np.count_nonzero(changed))
@@ -1116,6 +1155,8 @@ def build_production_aligned_hole_result(
             "supplemental_filter_reasons": dict(supplemental_filter_reasons),
             "cache_primary_target": str(stats.get("primary_detector_target", "")),
             "candidate_decisions": candidate_decisions,
+            "japanese_cleanup": japanese_cleanup,
+            "white_bubble_blank_first": white.diagnostics,
         },
     )
     layer = np.zeros((h, w, 4), dtype=np.uint8)

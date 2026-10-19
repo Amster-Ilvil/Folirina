@@ -372,7 +372,11 @@ def source_text_render(source: np.ndarray, source_mask: np.ndarray) -> tuple[np.
     raw = np.clip((paper - sg) / denom, 0.0, 1.0)
 
     dist = cv2.distanceTransform(use.astype(np.uint8), cv2.DIST_L2, 3)
-    strong = use & ((dist >= 1.05) | (raw >= 0.58) | (sg <= (paper - max(18.0, denom * 0.34))))
+    # Semantic text masks can be filled rectangles or relaxed glyph outlines.
+    # Distance inside that mask is not evidence of ink: paper in counters and
+    # between columns must retain zero alpha even deep inside the mask.
+    ink_evidence = (paper - sg) >= max(5.0, denom * 0.025)
+    strong = use & ink_evidence & ((dist >= 1.05) | (raw >= 0.58) | (sg <= (paper - max(18.0, denom * 0.34))))
     near = cv2.dilate(strong.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1) > 0
     fringe = use & (~strong) & near & (raw >= 0.06)
 

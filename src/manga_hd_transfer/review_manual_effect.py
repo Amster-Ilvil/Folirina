@@ -125,6 +125,24 @@ def _apply_manual_effect_regions(
                 all_clear = np.maximum(all_clear, region_clear)
             applied.append(rec)
             continue
+        # Legacy manual recovery controls share the same white-balloon policy
+        # as the Region workbench. Painted Reveal masks remain explicitly local.
+        if mode in {"full_patch", "white_bubble_text", "effect_text", "open_text_box"}:
+            white_row = dict(row)
+            white_row["mode"] = "region_white_bubble"
+            try:
+                white_out, white_layer, white_clear, rec = apply_region_action(
+                    out, target, source, project, white_row, cfg, page_dir=page_dir
+                )
+            except ValueError:
+                pass
+            else:
+                out = white_out
+                effect_layer = _alpha_over_bgra(effect_layer, white_layer)
+                all_clear = np.maximum(all_clear, white_clear)
+                rec["mode"] = mode
+                applied.append(rec)
+                continue
         if mode == "open_text_box" and project_mode not in {"mask_replace", "hybrid"}:
             applied.append({
                 "id": str(row.get("id", f"manual-effect-{index:03d}")),
@@ -208,6 +226,10 @@ def _apply_manual_effect_regions(
                 continue
             source_mask, clear_mask = apply_reveal_window(source_mask, clear_mask, reveal)
             reveal_patch = _load_reveal_commit_patch(page_dir, row, target.shape[:2])
+            from .white_bubble_composite import verified_white_bubble_mask
+            white_scope = cv2.bitwise_and(verified_white_bubble_mask(target, project.get("target_bubbles", [])), reveal)
+            if np.any(white_scope):
+                clear_mask = np.maximum(clear_mask, white_scope)
             if reveal_patch is not None:
                 # The sparse preview patch is authoritative. Empty patches are a
                 # no-op: never clear TARGET just because an old/stale reveal mask
@@ -397,6 +419,8 @@ def _apply_manual_effect_only_review(page_dir: Path, project: dict, overrides: d
     clean_base = base.copy()
     if cv2.countNonZero(clear_mask) > 0:
         cleaned = inpaint_image(target, clear_mask, cfg.inpainting).image
+        from .white_bubble_composite import fill_verified_white_under_mask
+        cleaned = fill_verified_white_under_mask(target, cleaned, clear_mask, project.get("target_bubbles", []))
         clean_base[clear_mask > 0] = cleaned[clear_mask > 0]
     clean_path = page_dir / "review_base.png"
     write_image(clean_path, clean_base)

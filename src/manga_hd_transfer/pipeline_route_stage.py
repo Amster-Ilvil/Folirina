@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -114,6 +114,7 @@ def run_page_route_stage(
     secondary_source_available: bool,
     cache_stats: dict,
     stage_cache=None,
+    inpaint_callback: Callable | None = None,
 ) -> PageRouteState:
     """Resolve explicit Reveal/Direct/Auto routing without owning renderer algorithms."""
     base = dict(
@@ -163,6 +164,7 @@ def run_page_route_stage(
             registration=registration, config=config.aligned_overlay_reveal, bubble_config=config.bubbles,
             stage_cache=stage_cache, cache_stats=cache_stats,
             source_path=str(source_path_local), target_path=str(pair.target_path),
+            inpaint_callback=inpaint_callback,
         )
         aligned_available = bool(aligned_result.accepted and aligned_result.applied_count > 0)
         aligned_safe = bool(aligned_available and str(aligned_result.page_triage).upper() == "SAFE")

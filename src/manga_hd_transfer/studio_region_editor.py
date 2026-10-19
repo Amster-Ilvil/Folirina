@@ -25,6 +25,8 @@ from .region_workspace_state import RegionWorkspaceLinkState, selection_signatur
 from .region_brush_reveal import (
     stroke_bbox as brush_stroke_bbox, paint_reveal_stroke_inplace, compose_reveal_patch,
     mask_bbox as brush_mask_bbox, mask_counts as brush_mask_counts,
+    label_verified_white_bubbles, touched_verified_white_bubble_labels,
+    expand_to_verified_white_bubbles_inplace,
 )
 from .region_selection import project_selection_spec
 from .manual_effect import map_target_bbox_to_source, registration_homography
@@ -95,6 +97,7 @@ class RegionCompositeDialog(QDialog):
         ("精准蒙版", "region_precise_mask", "只清 TARGET 日文字形并迁移 SOURCE 中文原字形；现在只计算选区周边 ROI，不再为一个小框重跑整页。"),
         ("挖孔揭示", "region_hole_reveal", "把选区内部揭示为已配准 SOURCE；可向内缩保护气泡/文本框边线。"),
         ("透明文字", "region_transparent", "只迁移 SOURCE 中文笔画差量，尽量保留 TARGET 彩图、肤色和背景纹理。"),
+        ("白底气泡", "region_white_bubble", "框选白底气泡：先把完整气泡内区清成纯白，再显示配准后的中文笔画；保留气泡边框。"),
         ("OCR / 排字", "region_ocr", "只 OCR 当前选区；可修改中文、方向、字号、断句和排版后再应用。"),
     ]
 
@@ -123,7 +126,7 @@ class RegionCompositeDialog(QDialog):
         self._preview_dirty=set()
         self._preview_versions={}
         self._tile_counts={}
-        self._brush_counts={"transparent_pixels":0,"hole_pixels":0,"union_pixels":0}
+        self._brush_counts={"transparent_pixels":0,"hole_pixels":0,"restore_pixels":0,"union_pixels":0}
         self._preview_timer=QTimer(self); self._preview_timer.setSingleShot(True)
         # UI was creating stale QThreads at 60Hz even while a drag invalidated
         # their output; coalesce into a few 30fps previews and flush at release.
@@ -176,12 +179,20 @@ class RegionCompositeDialog(QDialog):
         self._brush_base=cv2.imread(str(self.display_path if self.display_path.exists() else self.target_path),cv2.IMREAD_COLOR)
         self._brush_source=cv2.imread(str(self.source_path),cv2.IMREAD_COLOR)
         self._brush_target=cv2.imread(str(self.target_path),cv2.IMREAD_COLOR)
+        from .white_bubble_composite import verified_white_bubble_mask
+        self._brush_white = (verified_white_bubble_mask(self._brush_target, self.project.get("target_bubbles", []))
+                             if self._brush_target is not None else None)
+        if self._brush_white is not None and np.any(self._brush_white):
+            self._brush_white_labels, self._brush_white_stats = label_verified_white_bubbles(self._brush_white)
+        else:
+            self._brush_white_labels = self._brush_white_stats = None
         if self._brush_base is None or self._brush_base.shape[:2] != self.target_view.image_shape():
             raise ValueError("区域涂抹无法读取当前结果")
         if self._brush_source is None:
             raise ValueError("区域涂抹无法读取旧版中文 SOURCE")
         bh,bw=self._brush_base.shape[:2]
         self._brush_transparent=np.zeros((bh,bw),np.uint8); self._brush_hole=np.zeros((bh,bw),np.uint8)
+        self._brush_restore=np.zeros((bh,bw),np.uint8)
         self._brush_history=[]; self._brush_redo_stack=[]; self._brush_stroke_before={}; self._brush_stroke_tiles=set()
         self._brush_preview_items={}; self._brush_source_tile_cache={}; self._brush_tile_size=256
         # Inpainting and inward feathering need pixels *outside* a tile. Without
@@ -270,7 +281,7 @@ class RegionCompositeDialog(QDialog):
         brush_panel=QFrame(); brush_panel.setObjectName("selectionPanel")
         bp=QVBoxLayout(brush_panel); bp.setContentsMargins(8,7,8,7); bp.setSpacing(5)
         brush_head=QLabel("③ 涂抹揭示 / 挖孔"); brush_head.setObjectName("sectionTitle"); bp.addWidget(brush_head)
-        brush_help=QLabel("左键实时揭示；右键临时恢复日文；中键平移。透明揭示使用软边透明，挖孔是硬剪裁。每一笔都可撤销/重做。")
+        brush_help=QLabel("左键使用当前画笔；右键恢复原始日文；中键平移。恢复会覆盖已提交的中文，可保存、撤销和重做。")
         brush_help.setObjectName("quiet"); brush_help.setWordWrap(True); brush_help.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred); bp.addWidget(brush_help)
         brush_modes=QWidget(); bg=QGridLayout(brush_modes); bg.setContentsMargins(0,0,0,0); bg.setHorizontalSpacing(5); bg.setVerticalSpacing(5)
         self.brush_group=QButtonGroup(self); self.brush_group.setExclusive(True); self.brush_buttons=[]
@@ -288,7 +299,7 @@ class RegionCompositeDialog(QDialog):
         br.addWidget(QLabel("透明强度"),2,0); br.addWidget(self.brush_opacity,2,1,1,2); br.setColumnStretch(1,1); bp.addLayout(br)
         self.brush_limit_selection=QCheckBox("仅在当前选区内涂抹"); self.brush_limit_selection.setChecked(False); bp.addWidget(self.brush_limit_selection)
         brush_actions=QGridLayout(); brush_actions.setHorizontalSpacing(5); brush_actions.setVerticalSpacing(5)
-        self.brush_undo_btn=QPushButton("撤销一笔"); self.brush_redo_btn=QPushButton("重做一笔"); self.brush_clear_btn=QPushButton("全部恢复日文")
+        self.brush_undo_btn=QPushButton("撤销一笔"); self.brush_redo_btn=QPushButton("重做一笔"); self.brush_clear_btn=QPushButton("清空本次涂抹")
         brush_actions.addWidget(self.brush_undo_btn,0,0); brush_actions.addWidget(self.brush_redo_btn,0,1); brush_actions.addWidget(self.brush_clear_btn,1,0,1,2); brush_actions.setColumnStretch(0,1); brush_actions.setColumnStretch(1,1); bp.addLayout(brush_actions)
         self.brush_status=QLabel("尚未涂抹 · 选择“透明揭示”或“挖孔揭示”后直接在中间画布操作")
         self.brush_status.setObjectName("hint"); self.brush_status.setWordWrap(True); self.brush_status.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred); bp.addWidget(self.brush_status)
@@ -479,7 +490,7 @@ class RegionCompositeDialog(QDialog):
         self._activate_selection_interaction(restore_region_tool=False)
         hints={k:h for _l,k,h in self._TOOLS}; self.tool_hint.setText(hints.get(key,""))
         is_ocr=key=="region_ocr"; self.ocr_box.setVisible(is_ocr); self.performance_hint.setVisible(key=="region_precise_mask")
-        self.inset.setEnabled(key=="region_hole_reveal")
+        self.inset.setEnabled(key in {"region_hole_reveal", "region_white_bubble"})
         self.feather.setEnabled(key in {"region_direct_patch","region_hole_reveal","region_transparent"})
         offsets=key!="region_ocr"; self.offset_x.setEnabled(offsets); self.offset_y.setEnabled(offsets)
         if key=="region_hole_reveal" and self.feather.value()==0: self.feather.setValue(1)
@@ -544,7 +555,7 @@ class RegionCompositeDialog(QDialog):
         for key in keys:
             if key in self._brush_stroke_before: continue
             x0,y0,x1,y1=self._tile_bounds(key)
-            self._brush_stroke_before[key]=(self._brush_transparent[y0:y1,x0:x1].copy(),self._brush_hole[y0:y1,x0:x1].copy())
+            self._brush_stroke_before[key]=(self._brush_transparent[y0:y1,x0:x1].copy(),self._brush_hole[y0:y1,x0:x1].copy(),self._brush_restore[y0:y1,x0:x1].copy())
             self._brush_stroke_tiles.add(key)
 
     def _source_tile(self,key):
@@ -559,7 +570,8 @@ class RegionCompositeDialog(QDialog):
     def _refresh_brush_tile(self,key):
         x0,y0,x1,y1=self._tile_bounds(key)
         tr=self._brush_transparent[y0:y1,x0:x1]; ho=self._brush_hole[y0:y1,x0:x1]
-        alpha_present=bool(np.any(tr>0) or np.any(ho>0))
+        restore=self._brush_restore[y0:y1,x0:x1]
+        alpha_present=bool(np.any(tr>0) or np.any(ho>0) or np.any(restore>0))
         item=self._brush_preview_items.get(key)
         if not alpha_present:
             if item is not None:
@@ -569,7 +581,7 @@ class RegionCompositeDialog(QDialog):
             return
         base=self._brush_base[y0:y1,x0:x1]
         under=self._source_tile(key)
-        preview,_patch=compose_reveal_patch(base,under,tr,ho,transparent_feather_px=int(self.brush_feather.value()),transparent_opacity=float(self.brush_opacity.value())/100.0,target_bgr=self._brush_target[y0:y1,x0:x1] if self._brush_target is not None else None)
+        preview,_patch=compose_reveal_patch(base,under,tr,ho,transparent_feather_px=int(self.brush_feather.value()),transparent_opacity=float(self.brush_opacity.value())/100.0,target_bgr=self._brush_target[y0:y1,x0:x1] if self._brush_target is not None else None,verified_white_mask=self._brush_white[y0:y1,x0:x1] if getattr(self,"_brush_white",None) is not None else None,restore_mask=restore)
         rgb=cv2.cvtColor(preview,cv2.COLOR_BGR2RGB); hh,ww=rgb.shape[:2]
         q=QImage(rgb.data,ww,hh,int(rgb.strides[0]),QImage.Format.Format_RGB888).copy(); pix=QPixmap.fromImage(q)
         if item is None:
@@ -580,7 +592,7 @@ class RegionCompositeDialog(QDialog):
     def _refresh_brush_tiles(self,keys):
         for key in set(keys or []):
             x0,y0,x1,y1=self._tile_bounds(key)
-            counts=brush_mask_counts(self._brush_transparent[y0:y1,x0:x1],self._brush_hole[y0:y1,x0:x1])
+            counts=brush_mask_counts(self._brush_transparent[y0:y1,x0:x1],self._brush_hole[y0:y1,x0:x1],self._brush_restore[y0:y1,x0:x1])
             previous=self._tile_counts.get(key,{})
             for name,value in counts.items():
                 self._brush_counts[name]+=value-previous.get(name,0)
@@ -604,15 +616,17 @@ class RegionCompositeDialog(QDialog):
             snapshots.append((key,self._preview_versions[key],(x0,y0,x1,y1),extended,
                 self._brush_base[ya:yb,xa:xb].copy(),
                 self._brush_transparent[ya:yb,xa:xb].copy(),self._brush_hole[ya:yb,xa:xb].copy(),
-                self._brush_target[ya:yb,xa:xb].copy() if self._brush_target is not None else None))
+                self._brush_target[ya:yb,xa:xb].copy() if self._brush_target is not None else None,
+                self._brush_white[ya:yb,xa:xb].copy() if getattr(self,"_brush_white",None) is not None else None,
+                self._brush_restore[ya:yb,xa:xb].copy()))
         source=self._brush_source; project=self.project; shape=self._brush_base.shape[:2]
         dx=int(self.offset_x.value()); dy=int(self.offset_y.value())
         feather=int(self.brush_feather.value()); opacity=float(self.brush_opacity.value())/100.0
         cached={key:self._brush_source_tile_cache.get((key[0],key[1],dx,dy,tuple(ext))) for key,_,_,ext,*_ in snapshots}
         def render():
             rows=[]
-            for key,version,roi,extended,base,tr,ho,target in snapshots:
-                if not np.any(tr) and not np.any(ho):
+            for key,version,roi,extended,base,tr,ho,target,white,restore in snapshots:
+                if not np.any(tr) and not np.any(ho) and not np.any(restore):
                     rows.append((key,version,roi,None,None)); continue
                 under=cached[key]
                 if under is None:
@@ -620,7 +634,7 @@ class RegionCompositeDialog(QDialog):
                 # The expanded tile can be 300x300, while one pen segment is
                 # often only 10-40px wide. Compose its active brush footprint
                 # plus halo instead of the entire expanded square.
-                bx0,by0,bx1,by1=brush_mask_bbox(tr,ho)
+                bx0,by0,bx1,by1=brush_mask_bbox(tr,ho,restore)
                 pad=max(12,feather+8)
                 bx0=max(0,bx0-pad); by0=max(0,by0-pad)
                 bx1=min(base.shape[1],bx1+pad); by1=min(base.shape[0],by1+pad)
@@ -629,7 +643,9 @@ class RegionCompositeDialog(QDialog):
                     base[by0:by1,bx0:bx1],under[by0:by1,bx0:bx1],
                     tr[by0:by1,bx0:bx1],ho[by0:by1,bx0:bx1],
                     transparent_feather_px=feather,transparent_opacity=opacity,
-                    target_bgr=target[by0:by1,bx0:bx1] if target is not None else None)
+                    target_bgr=target[by0:by1,bx0:bx1] if target is not None else None,
+                    verified_white_mask=white[by0:by1,bx0:bx1] if white is not None else None,
+                    restore_mask=restore[by0:by1,bx0:bx1])
                 preview[by0:by1,bx0:bx1]=local
                 x0,y0,x1,y1=roi; xa,ya,_,_=extended
                 preview=preview[y0-ya:y1-ya,x0-xa:x1-xa]
@@ -693,20 +709,45 @@ class RegionCompositeDialog(QDialog):
                 return
             limit=self.target_view._selection_mask
         mode="restore" if bool((payload or {}).get("right")) else self._brush_mode_key()
-        diag=paint_reveal_stroke_inplace(self._brush_transparent,self._brush_hole,[start,end],diameter,mode,limit_mask=limit)
+        diag=paint_reveal_stroke_inplace(self._brush_transparent,self._brush_hole,[start,end],diameter,mode,limit_mask=limit,restore_mask=self._brush_restore)
         if diag.changed_pixels>0:
+            expanded_boxes=[]
+            if mode != "restore" and self._brush_white_labels is not None:
+                labels=touched_verified_white_bubble_labels(
+                    self._brush_transparent,self._brush_hole,self._brush_white_labels,diag.bbox
+                )
+                if labels:
+                    boxes=[]
+                    for label in labels:
+                        if label < len(self._brush_white_stats):
+                            x,y,bw,bh=[int(v) for v in self._brush_white_stats[label,:4]]
+                            boxes.append((x,y,x+bw,y+bh))
+                    extra_tiles=set().union(*(self._tiles_for_bbox(box) for box in boxes))
+                    self._remember_before_tiles(extra_tiles)
+                    expanded_boxes=expand_to_verified_white_bubbles_inplace(
+                        self._brush_transparent,self._brush_hole,self._brush_white_labels,
+                        self._brush_white_stats,labels
+                    )
+                    for label in labels:
+                        if label < len(self._brush_white_stats):
+                            x,y,bw,bh=[int(v) for v in self._brush_white_stats[label,:4]]
+                            roi=self._brush_restore[y:y+bh,x:x+bw]
+                            roi[self._brush_white_labels[y:y+bh,x:x+bw]==label]=0
             # Feather/Telea touch neighboring tiles; invalidate those borders
             # too so a tile seam cannot resurrect Japanese strokes.
-            self._refresh_brush_tiles(self._tiles_for_bbox(self._halo_bounds(diag.bbox)))
+            dirty=set(self._tiles_for_bbox(self._halo_bounds(diag.bbox)))
+            for box in expanded_boxes:
+                dirty.update(self._tiles_for_bbox(box))
+            self._refresh_brush_tiles(dirty)
 
     def _brush_stroke_finished(self):
         entries=[]; changed_keys=set()
         for key in sorted(self._brush_stroke_tiles):
             before=self._brush_stroke_before.get(key)
             if before is None: continue
-            x0,y0,x1,y1=self._tile_bounds(key); after=(self._brush_transparent[y0:y1,x0:x1].copy(),self._brush_hole[y0:y1,x0:x1].copy())
-            if np.array_equal(before[0],after[0]) and np.array_equal(before[1],after[1]): continue
-            entries.append((key,before[0],before[1],after[0],after[1])); changed_keys.add(key)
+            x0,y0,x1,y1=self._tile_bounds(key); after=(self._brush_transparent[y0:y1,x0:x1].copy(),self._brush_hole[y0:y1,x0:x1].copy(),self._brush_restore[y0:y1,x0:x1].copy())
+            if all(np.array_equal(a,b) for a,b in zip(before,after)): continue
+            entries.append((key,before,after)); changed_keys.add(key)
         self._brush_stroke_before={}; self._brush_stroke_tiles=set()
         if entries:
             self._brush_history.append(entries)
@@ -720,10 +761,10 @@ class RegionCompositeDialog(QDialog):
 
     def _restore_brush_record(self,record,after:bool):
         keys=set()
-        for key,btr,bho,atr,aho in record:
+        for key,before,changed in record:
             x0,y0,x1,y1=self._tile_bounds(key)
-            self._brush_transparent[y0:y1,x0:x1]=atr if after else btr
-            self._brush_hole[y0:y1,x0:x1]=aho if after else bho
+            for mask,value in zip((self._brush_transparent,self._brush_hole,self._brush_restore),changed if after else before):
+                mask[y0:y1,x0:x1]=value
             keys.update(self._tiles_for_bbox(self._halo_bounds((x0,y0,x1,y1))))
         self._refresh_brush_tiles(keys)
 
@@ -736,15 +777,16 @@ class RegionCompositeDialog(QDialog):
         record=self._brush_redo_stack.pop(); self._restore_brush_record(record,True); self._brush_history.append(record); self._update_brush_controls()
 
     def _brush_clear(self):
-        box=brush_mask_bbox(self._brush_transparent,self._brush_hole)
+        box=brush_mask_bbox(self._brush_transparent,self._brush_hole,self._brush_restore)
         keys=self._tiles_for_bbox(box)
         if not keys: return
         record=[]
         for key in sorted(keys):
-            x0,y0,x1,y1=self._tile_bounds(key); btr=self._brush_transparent[y0:y1,x0:x1].copy(); bho=self._brush_hole[y0:y1,x0:x1].copy()
-            if not np.any(btr) and not np.any(bho): continue
-            atr=np.zeros_like(btr); aho=np.zeros_like(bho); record.append((key,btr,bho,atr,aho))
-            self._brush_transparent[y0:y1,x0:x1]=0; self._brush_hole[y0:y1,x0:x1]=0
+            x0,y0,x1,y1=self._tile_bounds(key)
+            before=tuple(mask[y0:y1,x0:x1].copy() for mask in (self._brush_transparent,self._brush_hole,self._brush_restore))
+            if not any(np.any(mask) for mask in before): continue
+            record.append((key,before,tuple(np.zeros_like(mask) for mask in before)))
+            self._brush_transparent[y0:y1,x0:x1]=0; self._brush_hole[y0:y1,x0:x1]=0; self._brush_restore[y0:y1,x0:x1]=0
         if record:
             self._brush_history.append(record); self._brush_redo_stack.clear(); self._refresh_brush_tiles(keys)
 
@@ -752,7 +794,7 @@ class RegionCompositeDialog(QDialog):
         if not hasattr(self,"brush_status"): return
         counts=self._brush_counts
         self.brush_undo_btn.setEnabled(bool(self._brush_history)); self.brush_redo_btn.setEnabled(bool(self._brush_redo_stack)); self.brush_clear_btn.setEnabled(counts["union_pixels"]>0)
-        self.brush_status.setText(f"透明 {counts['transparent_pixels']:,} px · 挖孔 {counts['hole_pixels']:,} px · 共 {counts['union_pixels']:,} px · 撤销 {len(self._brush_history)} / 重做 {len(self._brush_redo_stack)}")
+        self.brush_status.setText(f"透明 {counts['transparent_pixels']:,} px · 挖孔 {counts['hole_pixels']:,} px · 恢复 {counts['restore_pixels']:,} px · 撤销 {len(self._brush_history)} / 重做 {len(self._brush_redo_stack)}")
         self._update_region_action_state()
 
     def _clear_brush_preview_items(self):
@@ -764,21 +806,22 @@ class RegionCompositeDialog(QDialog):
     def _reset_brush_session(self,final_path:Path|None=None):
         self._preview_epoch+=1; self._preview_dirty.clear(); self._preview_timer.stop()
         self._tile_counts.clear()
-        self._brush_counts={"transparent_pixels":0,"hole_pixels":0,"union_pixels":0}
+        self._brush_counts={"transparent_pixels":0,"hole_pixels":0,"restore_pixels":0,"union_pixels":0}
         if final_path is not None and final_path.exists():
             image=cv2.imread(str(final_path),cv2.IMREAD_COLOR)
             if image is not None and image.shape==self._brush_base.shape:
                 self._brush_base=image; self.target_view.replace_display_image(final_path)
-        self._brush_transparent[:]=0; self._brush_hole[:]=0; self._brush_history.clear(); self._brush_redo_stack.clear(); self._brush_stroke_before={}; self._brush_stroke_tiles=set(); self._brush_source_tile_cache.clear(); self._clear_brush_preview_items(); self._update_brush_controls()
+        self._brush_transparent[:]=0; self._brush_hole[:]=0; self._brush_restore[:]=0; self._brush_history.clear(); self._brush_redo_stack.clear(); self._brush_stroke_before={}; self._brush_stroke_tiles=set(); self._brush_source_tile_cache.clear(); self._clear_brush_preview_items(); self._update_brush_controls()
 
     def _brush_commit_snapshot(self):
-        box=brush_mask_bbox(self._brush_transparent,self._brush_hole)
+        box=brush_mask_bbox(self._brush_transparent,self._brush_hole,self._brush_restore)
         if len(box)!=4: raise ValueError("当前没有可提交的涂抹揭示")
         # Commit exactly the same padded context used by live preview.
         box=list(self._halo_bounds(box)); x0,y0,x1,y1=box
         return {"box":box,"tr":self._brush_transparent[y0:y1,x0:x1].copy(),
-            "ho":self._brush_hole[y0:y1,x0:x1].copy(),"base":self._brush_base[y0:y1,x0:x1].copy(),
+            "ho":self._brush_hole[y0:y1,x0:x1].copy(),"restore":self._brush_restore[y0:y1,x0:x1].copy(),"base":self._brush_base[y0:y1,x0:x1].copy(),
             "target":self._brush_target[y0:y1,x0:x1].copy() if self._brush_target is not None else None,
+            "white":self._brush_white[y0:y1,x0:x1].copy() if getattr(self,"_brush_white",None) is not None else None,
             "source":self._brush_source,"shape":self._brush_base.shape[:2],"project":copy.deepcopy(self.project),
             "dx":int(self.offset_x.value()),"dy":int(self.offset_y.value()),
             "feather":int(self.brush_feather.value()),"opacity":float(self.brush_opacity.value())/100.0,
@@ -791,11 +834,13 @@ class RegionCompositeDialog(QDialog):
         x0,y0,x1,y1=box
         tr=snapshot["tr"]; ho=snapshot["ho"]
         under,_identity=_aligned_source_roi(snapshot["source"],snapshot["shape"],snapshot["project"],(x0,y0,x1,y1),source_offset_x=snapshot["dx"],source_offset_y=snapshot["dy"])
-        _preview,patch=compose_reveal_patch(snapshot["base"],under,tr,ho,transparent_feather_px=snapshot["feather"],transparent_opacity=snapshot["opacity"],target_bgr=snapshot["target"])
+        restore=snapshot.get("restore")
+        _preview,patch=compose_reveal_patch(snapshot["base"],under,tr,ho,transparent_feather_px=snapshot["feather"],transparent_opacity=snapshot["opacity"],target_bgr=snapshot["target"],verified_white_mask=snapshot.get("white"),restore_mask=restore)
         if cv2.countNonZero(patch[:,:,3])<=0: raise ValueError("涂抹揭示的有效透明区域为空")
-        counts=brush_mask_counts(tr,ho); kinds=[]
+        counts=brush_mask_counts(tr,ho,restore); kinds=[]
         if counts["transparent_pixels"]: kinds.append("transparent")
         if counts["hole_pixels"]: kinds.append("hole")
+        if counts.get("restore_pixels"): kinds.append("restore")
         row={
             "id":f"region-brush-{uuid.uuid4().hex[:10]}","enabled":True,"mode":"region_brush_reveal","target_bbox":box,
             "reveal_patch_bbox":box,"reveal_mask_bbox":box,"origin":"region_composite_editor","tool_kind":"region_brush_reveal","owner_transfer_mode":"",
@@ -804,6 +849,7 @@ class RegionCompositeDialog(QDialog):
             "brush_reveal_kind":"+".join(kinds) if kinds else "none",**counts,
         }
         union=np.maximum(tr,ho).astype(np.uint8)
+        if restore is not None: union=np.maximum(union,restore)
         return row,union,patch
 
     def _commit_brush_session(self, *, interactive:bool=True, after_commit=None)->bool:

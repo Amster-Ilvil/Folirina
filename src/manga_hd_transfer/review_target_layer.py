@@ -205,6 +205,10 @@ def _apply_target_layer_erase_to_rendered(
     else:
         cleaned_target, clean_diag = _clean_target_under_erase_mask(target, effective, cfg)
         fill_mode = 'auto'
+        project_path = page_dir / 'project.json'
+        project = as_dict(load_json(project_path)) if project_path.exists() else {}
+        from .white_bubble_composite import fill_verified_white_under_mask
+        cleaned_target = fill_verified_white_under_mask(target, cleaned_target, effective, project.get('target_bubbles', []))
     out = rendered.copy()
     sel = effective > 0
     out[sel] = cleaned_target[sel]

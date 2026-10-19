@@ -10,16 +10,19 @@ composition, persistence algorithms, or renderer internals.
 from pathlib import Path
 from typing import Callable
 import time
+import cv2
+import numpy as np
 
 from .config import PipelineConfig
 from .layout_evidence import (
     prepare_page_layout_evidence, collect_koharu_layout_evidence_cached, classify_layout_authority,
+    koharu_semantic_text_ink_mask,
 )
 from .detector_policy import (
     STRATEGY_ALWAYS, auxiliary_detectors, detector_strategy, primary_detector, koharu_is_primary,
 )
 from .mode_contracts import get_mode_contract, mode_ocr_execution_violations
-from .models import PagePair, PageProject
+from .models import PagePair, PageProject, QAItem
 from .page_management import PageMark
 from .pipeline_page_prep import prepare_workspace, load_page_inputs
 from .pipeline_bubble_service import primary_bubbles_cached
@@ -36,6 +39,9 @@ from .pipeline_transfer_execution import run_transfer_execution_stage
 from .pipeline_transfer_composition import compose_transfer_state
 from .pipeline_project_assembly import assemble_page_project, finalize_page_project
 from .pipeline_artifact_export import export_page_artifacts
+from .koharu_sfx_cleanup import clean_koharu_text_on_flat_backgrounds
+from .lama_manga_runtime import inpaint_koharu_text, status as lama_manga_status
+from .colored_target_composition import compose_coloured_containers
 
 
 
@@ -220,6 +226,8 @@ def run_page_flow(
     # prefetch when it is primary.  A non-Koharu primary is cached as bubble
     # geometry first; Koharu auxiliary evidence is never allowed to run before it.
     selected_primary = primary_detector(config.bubbles)
+    koharu_target_evidence = None
+    koharu_source_evidence = None
     if selected_primary == "koharu_layout":
         layout_prefetch = prepare_page_layout_evidence(
             mode, source, target, source_path=source_path_local, target_path=target_path_local,
@@ -227,6 +235,8 @@ def run_page_flow(
             cache_enabled=bool(config.cache.bubbles) and bool(getattr(config.bubbles, "koharu_layout_cache_enabled", True)),
             stats=cache_stats,
         )
+        koharu_target_evidence = layout_prefetch.get("target")
+        koharu_source_evidence = layout_prefetch.get("source")
         pair_check = refine_pairing_with_layout_evidence(
             pair_check, registration, layout_prefetch.get("source"), layout_prefetch.get("target"),
         )
@@ -271,6 +281,7 @@ def run_page_flow(
             target=str(cache_stats.get("layout_target_cache", "")),
             primary_detector=primary_detector(config.bubbles),
             detector_strategy=detector_strategy(config.bubbles),
+            device_receipts=cache_stats.get("layout_device_receipts", {}),
         )
     check_cancel(cancel_cb, "after_layout_evidence")
     emit_progress(42, "layout", "主布局检测完成")
@@ -278,6 +289,12 @@ def run_page_flow(
 
     stage_started = time.perf_counter()
     emit_progress(45, "route", "正在规划当前模式路线")
+    lama_model_path = getattr(config.inpainting, "lama_model_path", None)
+    lama_status = lama_manga_status(lama_model_path)
+    lama_inpaint_callback = (
+        (lambda image, mask: inpaint_koharu_text(image, mask, model_path=lama_model_path))
+        if lama_status.ready else None
+    )
     route = run_page_route_stage(
         config=config, mode=mode, mode_contract=mode_contract, pair=pair,
         page_root=page_root, final_path=final_path, mark=mark,
@@ -286,7 +303,7 @@ def run_page_flow(
         registration=registration, pair_check=pair_check,
         replace_source_specs=replace_source_specs,
         secondary_source_available=bool(secondary_source_available), cache_stats=cache_stats,
-        stage_cache=stage_cache,
+        stage_cache=stage_cache, inpaint_callback=lama_inpaint_callback,
     )
     if route.early_project is not None:
         if trace is not None and mode == "aligned_overlay_reveal":
@@ -547,6 +564,120 @@ def run_page_flow(
     constrained_layout_units = transfer_stage.constrained_layout_units
     target_layout_hint_units = transfer_stage.target_layout_hint_units
     qa = transfer_stage.qa
+    # Keep the mode-owned Chinese foreground before any TARGET-based cleanup
+    # can be baked into a transfer layer. Otherwise missed Japanese can later
+    # be mistaken for translated foreground during final composition.
+    white_bubble_foreground = transfer_rgba.copy() if transfer_rgba is not None else None
+
+    # Koharu's disconnected foreground text masks survive OCR-free and OCR modes
+    # alike. Apply only the flat-background cleanup policy here, after each
+    # mode's own renderer and before the common artifact/export boundary. This
+    # does not call an OCR backend or alter the mode's matching/transfer logic.
+    koharu_text_blocks = []
+    if koharu_target_evidence is not None and bool(getattr(koharu_target_evidence, "available", False)):
+        koharu_text_blocks = [
+            block for block in koharu_target_evidence.text_blocks(
+                include_sfx=True, backend_name="koharu_layout", target_only=True,
+            )
+            if str(getattr(block, "kind", "") or "").strip().lower() in {"speech", "sfx"}
+        ]
+    # SOURCE text remains authoritative even when a common CJK glyph or numeral
+    # happens to have identical TARGET pixels. Pixel difference alone cannot
+    # distinguish an untranslated glyph from already correct shared lettering.
+    source_ink = koharu_semantic_text_ink_mask(
+        source, koharu_source_evidence, labels=("text", "sfx"),
+        min_confidence=0.50, pad_px=3, dilate_px=2,
+    )
+    protected_source_ink = cv2.warpPerspective(
+        source_ink, np.asarray(registration.matrix, dtype=np.float64),
+        (target.shape[1], target.shape[0]), flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
+    # Protect lettering, not the SOURCE detector's surrounding paper corridor.
+    protected_source_ink[cv2.cvtColor(rendered, cv2.COLOR_BGR2GRAY) > 210] = 0
+    koharu_cleanup = clean_koharu_text_on_flat_backgrounds(
+        target, rendered, inpaint_result.image, koharu_text_blocks,
+        protected_mask=protected_source_ink,
+        aligned_source=cv2.warpPerspective(
+            source, np.asarray(registration.matrix, dtype=np.float64),
+            (target.shape[1], target.shape[0]), borderValue=(255, 255, 255),
+        ),
+        inpaint_callback=(
+            lama_inpaint_callback
+            if lama_status.ready else None
+        ),
+    )
+    rendered = koharu_cleanup.rendered
+    if int(koharu_cleanup.diagnostics.get("applied", 0) or 0) > 0:
+        inpaint_result.image = koharu_cleanup.editable_base
+        cache_stats["koharu_text_cleanup"] = str(koharu_cleanup.diagnostics["applied"])
+        if trace is not None:
+            trace.event("koharu_text_cleanup", diagnostics=koharu_cleanup.diagnostics)
+    elif koharu_cleanup.diagnostics.get("candidates"):
+        cache_stats["koharu_text_cleanup"] = "deferred"
+        if trace is not None:
+            trace.event("koharu_text_cleanup", diagnostics=koharu_cleanup.diagnostics)
+    if int(koharu_cleanup.diagnostics.get("needs_model_inpainting", 0) or 0) > 0:
+        # Do not silently report a clean page when Koharu found high-confidence
+        # foreground text over a textured/color background that this conservative
+        # stage intentionally left untouched. The dedicated inpainting model is
+        # optional and may not be installed on the host.
+        qa.append(QAItem(
+            "koharu_text_cleanup_deferred", "warning",
+            "Koharu detected Japanese text/SFX on a non-uniform background, but no safe flat fill was applied; Japanese may remain. Use a configured inpainting model or review this region manually.",
+            meta={
+                "needs_model_inpainting": int(koharu_cleanup.diagnostics.get("needs_model_inpainting", 0) or 0),
+                "unresolved_foreground_pixels": int(koharu_cleanup.diagnostics.get("unresolved_foreground_pixels", 0) or 0),
+                "model_inpainting_error": str(koharu_cleanup.diagnostics.get("model_inpainting_error", "") or ""),
+                "runner_status": lama_status.detail,
+                "rows": [
+                    row for row in koharu_cleanup.diagnostics.get("rows", [])
+                    if str(row.get("status", "")) == "skipped_non_uniform_background"
+                ],
+            },
+        ))
+
+    target_first = None
+    if mode in {"direct_patch", "mask_replace", "auto"} and mask_transfer is not None:
+        source_letters = koharu_semantic_text_ink_mask(
+            source, koharu_source_evidence, labels=("text",),
+            min_confidence=0.35, pad_px=4, dilate_px=2,
+        )
+        matrix = np.asarray(registration.matrix, dtype=np.float64)
+        aligned_letters = cv2.warpPerspective(source_letters, matrix,
+            (target.shape[1], target.shape[0]), flags=cv2.INTER_NEAREST)
+        aligned_raster = cv2.warpPerspective(source, matrix,
+            (target.shape[1], target.shape[0]), borderValue=(255, 255, 255))
+        target_first = compose_coloured_containers(
+            target, rendered, aligned_raster, aligned_letters,
+            mask_transfer.records, lama_inpaint_callback,
+        )
+        if target_first.diagnostics.get("applied", 0):
+            rendered = target_first.image
+            use = target_first.authority > 0
+            inpaint_result.image[use] = target_first.clean_base[use]
+            mask_transfer.image = rendered
+            rgb = cv2.cvtColor(rendered, cv2.COLOR_BGR2RGB)
+            mask_transfer.layer_rgba[use, :3] = rgb[use]
+            mask_transfer.layer_rgba[use, 3] = 255
+            mask_transfer.composite_mask[use] = 255
+            if mask_transfer.clear_mask is not None:
+                mask_transfer.clear_mask[use] = target_first.clear_mask[use]
+            transfer_rgba = mask_transfer.layer_rgba
+            koharu_cleanup.clear_mask[use] = target_first.clear_mask[use]
+        colour_rows = target_first.diagnostics.get("rows", [])
+        unresolved = [row for row in colour_rows if str(row.get("status", "")).startswith("deferred_")]
+        residual = [row for row in colour_rows if row.get("status") == "applied_target_first_lama"
+                    and (int(row.get("unchanged_target_dark_pixels_outside_source_ink", 0)) > 16
+                         or int(row.get("clean_base_dark_pixels", 0)) > 16)]
+        if unresolved or residual:
+            qa.append(QAItem(
+                "target_first_colour_review", "error",
+                "Some coloured containers could not be independently cleaned or still have dark foreground in the clean TARGET base; manual review is required.",
+                meta={"deferred": unresolved, "possible_residual": residual},
+            ))
+        if trace is not None:
+            trace.event("target_first_colour", diagnostics=target_first.diagnostics)
 
     _stage_done("transfer", stage_started)
     stage_started = time.perf_counter()
@@ -591,6 +722,44 @@ def run_page_flow(
         selected_arbitration_evidence=selected_arbitration_evidence,
         replace_source_specs=replace_source_specs, composition=composition,
     )
+    project.meta["koharu_text_cleanup"] = koharu_cleanup.diagnostics
+    from .white_bubble_composite import compose_white_bubbles
+    from .export import make_text_layer_rgba
+    lcfg = config.hybrid.lettering if mode == "hybrid" else config.reletter.lettering if mode == "reletter" else config.lettering
+    white_bubbles = compose_white_bubbles(
+        target, rendered, white_bubble_foreground, target_bubbles,
+        text_rgba=make_text_layer_rgba(target.shape[:2], lettering_masks, color=lcfg.fill),
+    )
+    project.meta["white_bubble_blank_first"] = white_bubbles.diagnostics
+    if white_bubbles.diagnostics["applied"]:
+        rendered = white_bubbles.image
+        use = white_bubbles.clear_mask > 0
+        inpaint_result.image[use] = 255
+        mask_result.mask[use] = 255
+        koharu_cleanup.clear_mask[use] = 255
+        if white_bubbles.layer_rgba is not None:
+            if transfer_rgba is None:
+                transfer_rgba = white_bubbles.layer_rgba
+            else:
+                transfer_rgba[use] = white_bubbles.layer_rgba[use]
+        if mask_transfer is not None:
+            mask_transfer.image = rendered
+            if white_bubbles.layer_rgba is not None:
+                mask_transfer.layer_rgba[use] = white_bubbles.layer_rgba[use]
+                mask_transfer.composite_mask[use] = 255
+            if mask_transfer.clear_mask is not None:
+                mask_transfer.clear_mask[use] = 255
+        if trace is not None:
+            trace.event("white_bubble_blank_first", diagnostics=white_bubbles.diagnostics)
+    if target_first is not None:
+        project.meta["target_first_colour"] = target_first.diagnostics
+        if target_first.diagnostics.get("applied", 0):
+            from .io_utils import write_image
+            write_image(page_root / "target_clean_base.png", inpaint_result.image)
+            write_image(page_root / "target_removal_mask.png", target_first.clear_mask)
+            write_image(page_root / "source_ink_layer.png", target_first.source_layer)
+            for name in ("target_clean_base", "target_removal_mask", "source_ink_layer"):
+                project.artifacts[name] = str(page_root / (name + ".png"))
 
     _stage_done("composition_assembly", stage_started)
     check_cancel(cancel_cb, "before_export")
@@ -600,6 +769,8 @@ def run_page_flow(
         config=config, project=project, pair=pair, page_root=page_root,
         final_path=final_path, source=source, authority_source=authority_source,
         target=target, rendered=rendered, inpaint_result=inpaint_result,
+        koharu_text_clear_mask=koharu_cleanup.clear_mask,
+        koharu_text_cleanup_diagnostics=koharu_cleanup.diagnostics,
         mask_result=mask_result, lettering_masks=lettering_masks,
         mask_transfer=mask_transfer, direct_container_fast=direct_container_fast,
         transfer_rgba=transfer_rgba, transfer_audit=composition.transfer_audit,

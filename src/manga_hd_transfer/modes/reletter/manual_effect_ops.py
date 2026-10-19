@@ -806,6 +806,10 @@ def clean_manual_target_text(
     out=target.copy()
     if cv2.countNonZero(mask)==0:
         return out,{"mode":"none","pixels":0}
+    from ...white_bubble_composite import clean_white_mask_if_proven
+    white_fill = clean_white_mask_if_proven(target, mask)
+    if white_fill is not None:
+        return white_fill
 
     def _repair_local_components(dst: np.ndarray, work_mask: np.ndarray) -> tuple[np.ndarray,int]:
         """Inpaint only explicitly requested components, never a whole ROI."""
@@ -1042,6 +1046,23 @@ def build_manual_effect_masks(
     source_mask = np.zeros((h, w), np.uint8)
     clear_mask = np.zeros((h, w), np.uint8)
     diag: dict[str, Any]
+    if mode in {"full_patch", "white_bubble_text", "effect_text", "reveal_text"}:
+        from ...white_bubble_composite import apply_white_bubble_blank_first
+        locator = np.zeros((h, w), np.uint8)
+        locator[y0:y1, x0:x1] = 255
+        try:
+            _white_out, white_layer, white_clear, _authority, white_diag = apply_white_bubble_blank_first(
+                target, target, source, project, row, locator
+            )
+        except ValueError:
+            pass
+        else:
+            aligned, identity = align_source_to_target(source, target.shape[:2], project,
+                source_offset_x=manual_dx, source_offset_y=manual_dy)
+            white_diag.update({"mode": mode, "bbox": [x0,y0,x1,y1],
+                              "white_bubble_blank_first": True, "identity_pixel_lock": bool(identity),
+                              "source_offset": [manual_dx, manual_dy]})
+            return ManualEffectMasks(aligned, white_layer[:, :, 3].copy(), white_clear, white_diag)
     if mode in {"full_patch", "white_bubble_text"}:
         region = np.zeros((h, w), np.uint8)
         if x1 > x0 and y1 > y0:
