@@ -5,6 +5,13 @@ const $=id=>document.getElementById(id);
 const state={sources:[],targets:[],pairs:[],index:0,view:'result',tool:'paint-transfer',brush:24,threshold:185,paper:255,gesture:null,cloneAnchor:null,stamp:0,rendering:false,hover:null};
 const cvs=$('editorCanvas'),over=$('overlayCanvas'),ctx=cvs.getContext('2d',{willReadFrequently:true}),oc=over.getContext('2d');
 let toastHandle=null;
+// Matching pages is not image registration. Every selected unedited pair needs a
+// validated transform before displaying/migrating SOURCE. Jobs are per-pair and
+// keyed by object identity so switching pages cannot overwrite a different pair.
+const pendingAlignment=new WeakMap();
+function isRegistered(p){return !!(p && Array.isArray(p.affine) && p.affine.length===6 && p.affine.every(Number.isFinite))}
+function pairNeedsAlignment(p){return !!(p && p.src!==null && !p.skip && !isRegistered(p) && !p.edits.length && !p.alignError)}
+
 function toast(message){$('toast').textContent=message;$('toast').classList.add('show');clearTimeout(toastHandle);toastHandle=setTimeout(()=>$('toast').classList.remove('show'),3900)}
 function busy(on,title='',detail=''){ $('busy').classList.toggle('hidden',!on);if(on){$('busyTitle').textContent=title;$('busyDetail').textContent=detail} }
 function current(){return state.pairs[state.index]||null}
@@ -31,7 +38,7 @@ async function importImages(kind,files){
    if(items.length>1000)throw Error('单批最多导入 1000 页');
    const old=kind==='source'?state.sources:state.targets;
    releaseItems(old);
-   if(kind==='source'){state.sources=items;state.pairs.forEach(p=>{p.edits=[];p.undo=[];p.redo=[];p.dx=0;p.dy=0;p.scale=1;p.affine=null;p.alignDiagnostics=null});freshPairsForSources()}else{state.targets=items;createPairs()}
+   if(kind==='source'){state.sources=items;state.pairs.forEach(p=>{p.edits=[];p.undo=[];p.redo=[];p.dx=0;p.dy=0;p.scale=1;p.affine=null;p.alignDiagnostics=null;p.alignError=null});freshPairsForSources()}else{state.targets=items;createPairs()}
    toast(`已导入 ${items.length} 张${kind==='source'?'中文 SOURCE':'日文 TARGET'}图片`);
  }catch(err){toast(`导入失败：${err.message}`);console.error(err)}finally{busy(false);updateUI()}
 }
@@ -42,7 +49,9 @@ function refreshPageList(){
    const img=document.createElement('img');img.src=state.targets[p.tgt]?.url||'';img.loading='lazy';img.alt='';
    const meta=document.createElement('div');meta.className='page-meta';
    const title=document.createElement('strong');title.textContent=`${String(i+1).padStart(3,'0')}  ${state.targets[p.tgt]?.name||'未命名'}`;
-   const sub=document.createElement('span');sub.textContent=p.skip?'已跳过':`${p.src===null?'未配对':`SOURCE ${p.src+1}`} · ${p.edits.length} 次操作`;
+   const sub=document.createElement('span');
+   const alignLabel=p.src===null?'未配对':isRegistered(p)?'已配准':pendingAlignment.has(p)?'配准中':p.alignError?'配准失败':'待配准';
+   sub.textContent=p.skip?'已跳过':`SOURCE ${p.src===null?'—':p.src+1} · ${alignLabel} · ${p.edits.length} 次操作`;
    meta.append(title,sub);const dot=document.createElement('span');dot.className='status-dot'+(p.skip?' skipped':(p.score!==null&&p.score<.24||p.edits.length?' good':''));dot.textContent=p.skip?'−':p.score!==null&&p.score>.3?'!':'●';
    b.append(img,meta,dot);b.addEventListener('click',()=>goPage(i));list.append(b);
  });
@@ -59,14 +68,20 @@ function updateUI(){
  $('sourceSelect').value=p&&p.src!==null?String(p.src):'';
  $('skipPage').checked=!!p?.skip;
  $('alignX').value=p?.dx||0;$('alignY').value=p?.dy||0;$('alignScale').value=100*(p?.scale||1);$('scaleValue').textContent=((p?.scale||1)*100).toFixed(1)+'%';
- $('alignStatus').textContent=p?.affine?`有效匹配 ${p.alignDiagnostics?.inliers??'?'} 组 · 缩略图中位误差 ${(p.alignDiagnostics?.medianError||0).toFixed(2)} px`:'尚未自动配准：旧版仅缩放和平移';
+ $('alignStatus').textContent=isRegistered(p)?`已配准 · 一致特征 ${p.alignDiagnostics?.inliers??'?'} 组 · 中位误差 ${(p.alignDiagnostics?.medianError??0).toFixed(2)} px`:
+   pendingAlignment.has(p)?'正在自动配准当前页，请等待完成后再涂抹迁移':
+   p?.alignError?`配准失败：${p.alignError}。请核对 SOURCE 页面，或使用桌面版`:
+   p?.src===null?'尚未配对中文 SOURCE':'尚未对齐：系统将自动计算，未对齐前禁止文字迁移';
  $('editCount').textContent=(p?.edits.length||0)+' 次编辑';$('clearEdits').disabled=!p||!p.edits.length;$('undoButton').disabled=!p||!p.undo.length;$('redoButton').disabled=!p||!p.redo.length;
  $('pairSummary').textContent=state.targets.length?`${state.pairs.filter(x=>x.src!==null).length} / ${state.pairs.length} 页已配对 · ${state.pairs.filter(x=>x.skip).length} 页跳过`:'按自然文件名顺序配对；请手工核对。';
  refreshPageList();renderPage();
+ // No need to press a separate button: automatically register the selected
+ // page after import, pairing, page navigation or loading an old workspace.
+ if(pairNeedsAlignment(p))void alignPage(p).catch(err=>console.error(err));
 }
 function goPage(index){if(index<0||index>=state.pairs.length)return;state.index=index;state.cloneAnchor=null;state.hover=null;updateUI()}
 $('previousPage').addEventListener('click',()=>goPage(state.index-1));$('nextPage').addEventListener('click',()=>goPage(state.index+1));
-$('sourceSelect').addEventListener('change',e=>{const p=current();if(!p)return;if(p.edits.length&&!confirm('修改 SOURCE 配对会改变本页已有迁移结果，确定继续？')){e.target.value=String(p.src??'');return}p.src=e.target.value===''?null:Number(e.target.value);p.affine=null;p.alignDiagnostics=null;p.dx=0;p.dy=0;p.scale=1;updateUI()});
+$('sourceSelect').addEventListener('change',e=>{const p=current();if(!p)return;if(p.edits.length&&!confirm('修改 SOURCE 配对会改变本页已有迁移结果，确定继续？')){e.target.value=String(p.src??'');return}p.src=e.target.value===''?null:Number(e.target.value);p.affine=null;p.alignDiagnostics=null;p.alignError=null;p.dx=0;p.dy=0;p.scale=1;updateUI()});
 $('skipPage').addEventListener('change',e=>{const p=current();if(p){p.skip=e.target.checked;updateUI()}});
 for(const name of ['alignX','alignY'])$(name).addEventListener('change',()=>{const p=current();if(!p)return;p.dx=Number($('alignX').value)||0;p.dy=Number($('alignY').value)||0;updateUI()});
 $('alignScale').addEventListener('input',()=>{$('scaleValue').textContent=Number($('alignScale').value).toFixed(1)+'%'});
@@ -82,31 +97,58 @@ $('threshold').addEventListener('input',()=>{state.threshold=Number($('threshold
 $('paperColor').addEventListener('input',()=>{state.paper=Number($('paperColor').value);$('paperValue').textContent=state.paper});
 for(const button of document.querySelectorAll('[data-view]'))button.addEventListener('click',()=>{state.view=button.dataset.view;document.querySelectorAll('[data-view]').forEach(b=>b.classList.toggle('active',b===button));renderPage()});
 for(const button of document.querySelectorAll('[data-tool]'))button.addEventListener('click',()=>{state.tool=button.dataset.tool;document.querySelectorAll('[data-tool]').forEach(b=>b.classList.toggle('active',b===button));drawOverlay()});
-$('autoAlign').addEventListener('click',async()=>{
- const p=current();if(!p||p.src===null)return;
- if(p.edits.length&&!confirm('重新对齐会改变本页已有文字迁移效果。建议先保存工作区，是否继续？'))return;
- const targetIndex=p.tgt,sourceIndex=p.src;
- busy(true,'非 AI 画面配准','检测特征并计算仿射变换（无需模型）...');
- try{
-  const [src,tgt]=await Promise.all([bitmap(state.sources[sourceIndex]),bitmap(state.targets[targetIndex])]);
-  const result=await estimateBrowserAffine(src,tgt,text=>$('busyDetail').textContent=text);
-  const active=state.pairs.find(q=>q.tgt===targetIndex);
-  if(active&&active.src===sourceIndex){
-   active.affine=result.matrix;active.alignDiagnostics={inliers:result.inliers,total:result.total,medianError:result.medianError,coverage:result.coverage};
-   active.dx=0;active.dy=0;active.scale=1;
-   toast(`自动配准成功：${result.inliers} 组一致特征点。请打开「叠加检查」核对画框和气泡！`);updateUI();
-  }
- }catch(e){toast(`自动配准失败，旧对齐已保留：${e.message}`);console.error(e)}finally{busy(false)}
+async function alignPage(pair,{manual=false}={}){
+ if(!pair||pair.src===null||pair.skip)return false;
+ if(pendingAlignment.has(pair))return pendingAlignment.get(pair);
+ const sourceIndex=pair.src,targetIndex=pair.tgt;
+ if(manual&&pair.edits.length&&!confirm('重新对齐会改变本页已有文字迁移效果。请先保存工作区，确定重新对齐？'))return false;
+ if(!manual&&!pairNeedsAlignment(pair))return false;
+ pair.alignError=null;
+ const task=(async()=>{
+   if(manual)busy(true,'正在重新配准','匹配 SOURCE 和 TARGET 结构特征...');
+   else if(pair===current())$('alignStatus').textContent='正在自动配准，暂不可涂抹迁移...';
+   try{
+     const [src,tgt]=await Promise.all([bitmap(state.sources[sourceIndex]),bitmap(state.targets[targetIndex])]);
+     const result=await estimateBrowserAffine(src,tgt,detail=>{
+       if(manual)$('busyDetail').textContent=detail;
+     });
+     // Never use an outdated result if the user imported/re-paired another page.
+     if(!state.pairs.includes(pair)||pair.src!==sourceIndex||pair.tgt!==targetIndex)return false;
+     pair.affine=result.matrix;
+     pair.alignDiagnostics={inliers:result.inliers,total:result.total,medianError:result.medianError,coverage:result.coverage};
+     pair.dx=0;pair.dy=0;pair.scale=1;pair.alignError=null;
+     if(pair===current())toast(`本页已自动配准（${result.inliers} 组特征）；请在叠加检查中确认线条重合`);
+     return true;
+   }catch(e){
+     if(state.pairs.includes(pair)&&pair.src===sourceIndex){
+       pair.alignError=e.message||'不可靠的特征匹配';
+       if(pair===current())toast(`自动配准失败：${pair.alignError}`);
+     }
+     return false;
+   }finally{
+     if(manual)busy(false);
+   }
+ })();
+ pendingAlignment.set(pair,task);
+ const ok=await task;
+ pendingAlignment.delete(pair);
+ if(state.pairs.includes(pair))updateUI();
+ return ok;
+}
+$('autoAlign').addEventListener('click',()=>{
+ const p=current();if(!p)return;
+ if(pendingAlignment.has(p)){toast('当前页正在配准，请等待');return;}
+ void alignPage(p,{manual:true});
 });
 $('resetAlign').addEventListener('click',()=>{
  const p=current();if(!p)return;if(p.edits.length&&!confirm('重置对齐会影响当前页的已有文字迁移，确定继续？'))return;
- p.affine=null;p.alignDiagnostics=null;p.dx=0;p.dy=0;p.scale=1;updateUI();toast('已重置对齐');
+ p.affine=null;p.alignDiagnostics=null;p.alignError=null;p.dx=0;p.dy=0;p.scale=1;updateUI();toast('已重置对齐');
 });
 $('autoPair').addEventListener('click',async()=>{
  if(!state.sources.length||!state.targets.length)return;
  if(state.pairs.some(p=>p.edits.length)&&!confirm('智能配对会改变页面对应关系，从而影响已编辑页面的迁移效果。是否继续？'))return;
  busy(true,'非 AI 页面结构配对','提取小尺寸结构特征...');
- try{const oldPairs=state.pairs;state.pairs=await smartPairs(state.sources,state.targets,state.pairs,text=>$('busyDetail').textContent=text);state.pairs.forEach((p,i)=>{if(p.src!==oldPairs[i]?.src){p.affine=null;p.alignDiagnostics=null;p.dx=0;p.dy=0;p.scale=1}});toast('智能配对已完成；相似图片或封面仍可能配错，请核对后导出');updateUI()}
+ try{const oldPairs=state.pairs;state.pairs=await smartPairs(state.sources,state.targets,state.pairs,text=>$('busyDetail').textContent=text);state.pairs.forEach((p,i)=>{if(p.src!==oldPairs[i]?.src){p.affine=null;p.alignDiagnostics=null;p.alignError=null;p.dx=0;p.dy=0;p.scale=1}});toast('智能配对已完成；相似图片或封面仍可能配错，请核对后导出');updateUI()}
  catch(e){toast(`智能配对失败：${e.message}`);console.error(e)}finally{busy(false)}
 });
 async function renderPage(){
@@ -153,6 +195,11 @@ over.addEventListener('pointerdown',e=>{
  const point=pointFromEvent(e);if(state.tool==='clone'&&e.altKey){state.cloneAnchor=point;toast(`克隆取样点 (${point.x}, ${point.y}) 已设定`);return}
  if(state.tool==='clone'&&!state.cloneAnchor){toast('请先按住 Alt，在原图的干净背景处单击取样');return}
  if(['ellipse','rect','paint-transfer'].includes(state.tool)&&!currentSrc()){toast('当前页面尚未配对 SOURCE，无法迁移中文文字');return}
+ if(['ellipse','rect','paint-transfer'].includes(state.tool)&&!isRegistered(current())){
+   const p=current();toast(p.alignError?'配准失败，请检查对应页或使用桌面版':'正在自动配准当前页，完成后才能涂抹迁移');
+   if(pairNeedsAlignment(p))void alignPage(p);
+   return;
+ }
  if(state.view!=='result'){state.view='result';document.querySelectorAll('[data-view]').forEach(b=>b.classList.toggle('active',b.dataset.view==='result'));/* Deferred redraw until stroke completes to retain pointer capture. */}
  const shape=['ellipse','rect'].includes(state.tool)?state.tool:'brush';state.gesture={kind:['ellipse','rect','paint-transfer'].includes(state.tool)?'transfer':state.tool,shape,start:point,end:point,points:shape==='brush'?[point]:undefined,brush:state.brush,threshold:state.threshold,paper:state.paper};
  if(state.tool==='clone')state.gesture.cloneOffset={x:state.cloneAnchor.x-point.x,y:state.cloneAnchor.y-point.y};
@@ -167,13 +214,16 @@ function redo(){const p=current();if(!p||!p.redo.length)return;p.undo.push(struc
 $('undoButton').addEventListener('click',undo);$('redoButton').addEventListener('click',redo);
 $('clearEdits').addEventListener('click',()=>{const p=current();if(!p||!p.edits.length)return;if(!confirm('清空本页全部编辑？可以用撤销恢复。'))return;p.undo.push(structuredClone(p.edits));p.edits=[];p.redo=[];updateUI()});
 document.addEventListener('keydown',e=>{if(['INPUT','SELECT','TEXTAREA'].includes(document.activeElement.tagName))return;if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='z'){e.preventDefault();e.shiftKey?redo():undo()}if(e.key==='ArrowRight')goPage(state.index+1);if(e.key==='ArrowLeft')goPage(state.index-1);if(e.key==='['||e.key===']'){e.preventDefault();updateBrushSize(state.brush+(e.key===']'?8:-8))}});
-async function exportOne(){const p=current();if(!p)return;busy(true,'生成 PNG','按原始 TARGET 分辨率合成...');try{const [t,s]=await Promise.all([bitmap(currentTarget()),currentSrc()?bitmap(currentSrc()):null]);const c=compose(t,s,p);const blob=await canvasBlob(c);c.width=0;c.height=0;download(blob,safeName(currentTarget().name).replace(/\.[^.]+$/,'')+'_folirina.png');toast('本页 PNG 已生成')}catch(e){toast(`导出失败：${e.message}`);console.error(e)}finally{busy(false)}}
+async function exportOne(){const p=current();if(!p)return;
+ if(p.edits.some(e=>e.kind==='transfer')&&!isRegistered(p)){toast('本页含未配准的迁移操作，禁止错位导出；请先自动配准');return;}
+ busy(true,'生成 PNG','按原始 TARGET 分辨率合成...');try{const [t,s]=await Promise.all([bitmap(currentTarget()),currentSrc()?bitmap(currentSrc()):null]);const c=compose(t,s,p);const blob=await canvasBlob(c);c.width=0;c.height=0;download(blob,safeName(currentTarget().name).replace(/\.[^.]+$/,'')+'_folirina.png');toast('本页 PNG 已生成')}catch(e){toast(`导出失败：${e.message}`);console.error(e)}finally{busy(false)}}
 $('exportPage').addEventListener('click',exportOne);
 $('exportAll').addEventListener('click',async()=>{
  if(!state.targets.length)return;busy(true,'导出整册','正在生成 PNG 文件...');try{
  const zip=new JSZip(),dir=zip.folder('Folirina_Output');let count=0;
  for(let i=0;i<state.pairs.length;i++){
   const p=state.pairs[i];if(p.skip)continue;
+  if(p.edits.some(e=>e.kind==='transfer')&&!isRegistered(p))throw Error(`第 ${i+1} 页包含未配准文字迁移，请先自动配准，避免错位导出`);
   $('busyDetail').textContent=`合成页面 ${i+1}/${state.pairs.length}`;
   const t=await bitmap(state.targets[p.tgt]),s=p.src===null?null:await bitmap(state.sources[p.src]);
   const c=compose(t,s,p),blob=await canvasBlob(c);c.width=0;c.height=0;
