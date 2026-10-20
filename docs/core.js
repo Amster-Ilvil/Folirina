@@ -152,15 +152,48 @@ export function estimateTranslation(source,target,priorX=0,priorY=0){
 export async function structureFingerprint(item){const b=await bitmap(item);const c=nativeCanvas(28,40),cx=c.getContext('2d',{willReadFrequently:true});cx.filter='blur(2px)';cx.drawImage(b,0,0,28,40);const d=cx.getImageData(0,0,28,40).data;const out=new Float32Array(28*40);for(let i=0;i<out.length;i++)out[i]=(d[i*4]*.299+d[i*4+1]*.587+d[i*4+2]*.114)/255;return out}
 export function fingerprintDistance(a,b){let s=0,n=0;for(let y=2;y<38;y++)for(let x=2;x<26;x++){const i=y*28+x;s+=Math.abs(a[i]-b[i]);n++}return s/n}
 export async function smartPairs(sources,targets,pairs,onProgress){
- const srcF=[],tgtF=[];
- for(let i=0;i<sources.length;i++){srcF.push(await structureFingerprint(sources[i]));onProgress?.(`计算中文版特征 ${i+1}/${sources.length}`)}
- for(let i=0;i<targets.length;i++){tgtF.push(await structureFingerprint(targets[i]));onProgress?.(`计算日文版特征 ${i+1}/${targets.length}`)}
+ // When CN and JP_color archives already use the same numeric filenames,
+ // pairing by visual thumbnail can silently scramble pages due to recoloring.
+ // Exact unique basename matches always take precedence over visual similarity.
+ const base=s=>String(s||'').split(/[\\/]/).pop().toLowerCase().trim();
+ const srcNames=new Map(),tgtNames=new Map();
+ sources.forEach((s,i)=>{const n=base(s.name);if(!srcNames.has(n))srcNames.set(n,[]);srcNames.get(n).push(i)});
+ targets.forEach((t,i)=>{const n=base(t.name);if(!tgtNames.has(n))tgtNames.set(n,[]);tgtNames.get(n).push(i)});
  const used=new Set(),out=pairs.map(p=>({...p}));
- for(let i=0;i<out.length;i++){
-   const candidates=[];for(let j=Math.max(0,i-5);j<Math.min(sources.length,i+6);j++)if(!used.has(j))candidates.push({src:j,score:fingerprintDistance(srcF[j],tgtF[i])+Math.abs(i-j)*.004});
-   candidates.sort((a,b)=>a.score-b.score);
-   const best=candidates[0];if(best){out[i].src=best.src;out[i].score=best.score;used.add(best.src)}else{out[i].src=null;out[i].score=null}
+ let exactCount=0;
+ for(let i=0;i<targets.length;i++){
+   const n=base(targets[i].name),a=srcNames.get(n),b=tgtNames.get(n);
+   if(a?.length===1 && b?.length===1){out[i].src=a[0];out[i].score=0;used.add(a[0]);exactCount++}
+   else{out[i].src=null;out[i].score=null}
  }
+ if(exactCount===targets.length){onProgress?.(`文件名精确配对 ${exactCount}/${targets.length}，不重新进行视觉重排`);return out}
+ // For truly unmatched names use a weak visual hint only, NOT a forced reassignment.
+ // A wrong SOURCE page can irreversibly contaminate downstream replacement.
+ const srcF=[],tgtF=[];
+ for(let i=0;i<sources.length;i++){
+   if(used.has(i)){srcF.push(null);continue}
+   srcF.push(await structureFingerprint(sources[i]));onProgress?.(`提取未匹配 SOURCE 特征 ${i+1}/${sources.length}`);
+ }
+ for(let i=0;i<targets.length;i++){
+   if(out[i].src!==null){tgtF.push(null);continue}
+   tgtF.push(await structureFingerprint(targets[i]));onProgress?.(`提取未匹配 TARGET 特征 ${i+1}/${targets.length}`);
+ }
+ for(let i=0;i<out.length;i++){
+   if(out[i].src!==null)continue;
+   const candidates=[];
+   for(let j=Math.max(0,i-5);j<Math.min(sources.length,i+6);j++){
+     if(used.has(j)||!srcF[j])continue;
+     candidates.push({src:j,score:fingerprintDistance(srcF[j],tgtF[i])+Math.abs(i-j)*.004});
+   }
+   candidates.sort((a,b)=>a.score-b.score);
+   const best=candidates[0],next=candidates[1];
+   // Only accept an unmatched thumbnail if both absolute score and margin
+   // are unusually compelling. Uncertain pages remain unpaired for review.
+   if(best && best.score<.10 && (!next||next.score-best.score>.035)){
+     out[i].src=best.src;out[i].score=best.score;used.add(best.src);
+   }
+ }
+ onProgress?.(`精确同名匹配 ${exactCount}，其余仅接受高置信候选；不确定页面留待人工检查`);
  return out;
 }
 export async function canvasBlob(canvas,type='image/png',quality=1){return new Promise((resolve,reject)=>canvas.toBlob(b=>b?resolve(b):reject(Error('无法编码图像')),type,quality))}

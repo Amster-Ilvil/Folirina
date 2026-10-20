@@ -46,7 +46,7 @@ function findCorners(g,limit=460){
  }
  return result;
 }
-function nccMatch(a,b,p,rad=37){
+function nccMatch(a,b,p,rad=65){
  const {width:aw,data:ad}=a,{width:bw,height:bh,data:bd}=b;
  const r=12,step=3;const samples=[];let sum=0,sumsq=0;
  for(let y=-r;y<=r;y+=step)for(let x=-r;x<=r;x+=step){let v=ad[(p.y+y)*aw+p.x+x];samples.push([x,y,v]);sum+=v;sumsq+=v*v}
@@ -68,7 +68,7 @@ function nccMatch(a,b,p,rad=37){
  for(let y=minY;y<=maxY;y+=2)for(let x=minX;x<=maxX;x+=2)search(x,y);
  const cx=px,cy=py;
  for(let y=Math.max(minY,cy-2);y<=Math.min(maxY,cy+2);y++)for(let x=Math.max(minX,cx-2);x<=Math.min(maxX,cx+2);x++)search(x,y);
- return best>=.72?{x:p.x,y:p.y,u:px,v:py,score:best}:null;
+ return best>=.68?{x:p.x,y:p.y,u:px,v:py,score:best}:null;
 }
 function transformFromTriplet(p,q,r){
  let det=p.x*(q.y-r.y)+q.x*(r.y-p.y)+r.x*(p.y-q.y);
@@ -137,14 +137,22 @@ export async function registerAffineGrays(source,target,onProgress){
   if(i%18===17){onProgress?.(`匹配画面特征 ${i+1}/${corners.length}`);await new Promise(resolve=>setTimeout(resolve,0));}
  }
  const result=fitAffineRansac(matches,source.width,source.height);
- if(!result)throw Error(`特征匹配无法通过安全验证（匹配 ${matches.length} 处），请手动配准或使用桌面版`);
+ if(!result)throw Error(`特征匹配无法通过安全验证（匹配 ${matches.length} 处），请检查 SOURCE 配对页或使用桌面版`);
+ // Reject narrow, ambiguous clusters (e.g. mostly text-only low-coverage pages).
+ // A few good-looking matches are not proof of safe whole-page registration.
+ if(result.inliers<35 || result.inliers/Math.max(1,matches.length)<.35)
+   throw Error(`可靠配准证据不足（${result.inliers}/${matches.length} 个一致特征）；需要人工核对或桌面版`);
  return {...result,features:corners.length};
 }
 export async function estimateBrowserAffine(sourceBitmap,targetBitmap,onProgress){
- const ratio=Math.min(1,700/Math.max(sourceBitmap.width,sourceBitmap.height,targetBitmap.width,targetBitmap.height));
- const source=downsampleGray(sourceBitmap,ratio),target=downsampleGray(targetBitmap,ratio);
+ // Normalize EACH image independently; same absolute ratio makes matching
+ // impossible between low-res Chinese scans and high-res color originals.
+ const rs=Math.min(1,700/Math.max(sourceBitmap.width,sourceBitmap.height));
+ const rt=Math.min(1,700/Math.max(targetBitmap.width,targetBitmap.height));
+ const source=downsampleGray(sourceBitmap,rs),target=downsampleGray(targetBitmap,rt);
  const outcome=await registerAffineGrays(source,target,onProgress);
- // Both images were drawn using the same scale, so the linear part is unchanged.
  const m=outcome.matrix;
- return {...outcome,matrix:[m[0],m[1],m[2],m[3],m[4]/ratio,m[5]/ratio]};
+ const ssx=source.width/sourceBitmap.width,ssy=source.height/sourceBitmap.height;
+ const tsx=target.width/targetBitmap.width,tsy=target.height/targetBitmap.height;
+ return {...outcome,matrix:[m[0]*ssx/tsx,m[1]*ssx/tsy,m[2]*ssy/tsx,m[3]*ssy/tsy,m[4]/tsx,m[5]/tsy]};
 }
