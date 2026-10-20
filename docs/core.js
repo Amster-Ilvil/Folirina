@@ -71,22 +71,28 @@ export function warpedSource(source,targetWidth,targetHeight,pair){
  }
  return c;
 }
-// Infer paper color from the brush itself, then (only if needed) from a
-// tightly bounded halo. This lets fine strokes clear glyph pixels without
-// treating high-frequency screentones as a uniform white background.
+// Infer a flat bubble's paper from the actual stroke, then from progressively
+// larger *local* neighborhoods. A fixed 30px halo is unsafe for small bubbles:
+// it may include characters/panels and incorrectly block BOTH paint modes.
 function sampleSafePaper(ctx,box,mask,pixelData,W,H){
   const direct=samplePaper(pixelData,mask);
   if(direct.safe)return direct;
-  const pad=30;
-  const x=Math.max(0,box.x-pad),y=Math.max(0,box.y-pad);
-  const x2=Math.min(W,box.x+box.w+pad),y2=Math.min(H,box.y+box.h+pad);
-  const w=x2-x,h=y2-y;
-  const halo=ctx.getImageData(x,y,w,h);
-  const sampleMask=new Uint8ClampedArray(w*h*4);
-  for(let i=3;i<sampleMask.length;i+=4)sampleMask[i]=255;
-  const surrounding=samplePaper(halo.data,sampleMask);
-  if(surrounding.safe&&surrounding.coverage>=.80)return surrounding;
-  return direct;
+  let best=direct;
+  for(const pad of [6,12,18,26]){
+    const x=Math.max(0,box.x-pad),y=Math.max(0,box.y-pad);
+    const x2=Math.min(W,box.x+box.w+pad),y2=Math.min(H,box.y+box.h+pad);
+    const w=x2-x,h=y2-y;
+    if(w<2||h<2)continue;
+    const surrounding=ctx.getImageData(x,y,w,h);
+    const sampleMask=new Uint8ClampedArray(w*h*4);
+    for(let k=3;k<sampleMask.length;k+=4)sampleMask[k]=255;
+    const profile=samplePaper(surrounding.data,sampleMask);
+    // Trust the closest coherent flat-color neighborhood, not an arbitrary
+    // distant all-page bright region. Deliberately never force art to white.
+    if(profile.safe)return {...profile,sampledRadius:pad};
+    if(profile.coverage>best.coverage&&profile.luminance>=125)best=profile;
+  }
+  return {...best,safe:false,reason:'此处不是可确认的纯色气泡：请缩小画笔或用克隆修复'};
 }
 export function compose(target,source,pair,settings={}){
  if(!target)throw Error('缺少 TARGET');
@@ -110,8 +116,10 @@ export function compose(target,source,pair,settings={}){
      const result=applyProtectedInk(dst,original,src||new Uint8ClampedArray(dst.length),mask,targetProfile,sourceProfile,edit.mode||'hole',threshold);
      if(!result.applied){
        if(settings.rejectUnsafe)throw Error('背景保护已阻止不安全的文字替换：'+result.reason);
-       settings.onGuard?.(result.reason);
-     } // No paint on uncertain backgrounds; no destructive fallback.
+       settings.onGuard?.(result.reason,edit);
+     }
+     settings.onStrokeResult?.(edit,result);
+     // No paint on uncertain backgrounds; no destructive fallback.
    }else for(let y=0;y<box.h;y++)for(let x=0;x<box.w;x++){
      const i=(y*box.w+x)*4;if(mask[i+3]<128)continue;
      if(edit.kind==='erase'){dst[i]=paper;dst[i+1]=paper;dst[i+2]=paper}

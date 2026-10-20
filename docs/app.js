@@ -198,9 +198,26 @@ async function renderPage(){
    if(cvs.width!==W)cvs.width=W;if(cvs.height!==H)cvs.height=H;
    if(over.width!==W)over.width=W;if(over.height!==H)over.height=H;
    ctx.clearRect(0,0,W,H);
-   if(state.view==='result'){const guarded=[];const composite=compose(target,source,p,{threshold:state.threshold,paper:state.paper,onGuard:r=>guarded.push(r)});
-     if(guarded.length){$('renderHint').textContent='⚠ '+guarded.at(-1)+'。请移至纯色气泡，或使用克隆修复。';}
-     else $('renderHint').textContent='仅对笔刷轨迹内的文字操作；彩色背景自动保留原色，复杂纹理不自动涂白';ctx.drawImage(composite,0,0);composite.width=0;composite.height=0}
+   if(state.view==='result'){const guarded=[],strokeResults=[];const composite=compose(target,source,p,{threshold:state.threshold,paper:state.paper,onGuard:(reason,edit)=>guarded.push({reason,edit}),onStrokeResult:(edit,result)=>strokeResults.push({edit,result})});
+     if(guarded.length){$('renderHint').textContent='⚠ '+guarded.at(-1).reason+'。请移至纯色气泡，或使用克隆修复。';}
+     else $('renderHint').textContent='仅对笔刷轨迹内的文字操作；彩色背景自动保留原色，复杂纹理不自动涂白';
+     ctx.drawImage(composite,0,0);composite.width=0;composite.height=0;
+     const newest=state.pendingStroke;
+     if(newest&&newest.pair===p&&p.edits.at(-1)===newest.edit){
+       state.pendingStroke=null;
+       const failed=guarded.find(x=>x.edit===newest.edit);
+       const stats=strokeResults.find(x=>x.edit===newest.edit)?.result;
+       if(failed||!stats?.applied||stats.changed===0){
+         // Unusable strokes must not enter undo/export history as if valid.
+         p.edits.pop();p.undo.pop();p.redo=[];
+         $('editCount').textContent=p.edits.length+' 次编辑';
+         $('clearEdits').disabled=!p.edits.length;
+         $('undoButton').disabled=!p.undo.length;$('redoButton').disabled=true;
+         toast('本次未替换：'+(failed?.reason||'刷过的区域没有可迁移的不同文字像素')+'。可以调整笔刷位置或尺寸。');
+         queueMicrotask(()=>{if(p===current())renderPage()});
+       }
+     }
+   }
    else if(state.view==='target')ctx.drawImage(target,0,0);
    else if(state.view==='overlay'){ctx.drawImage(target,0,0);if(source){ctx.save();ctx.globalAlpha=.48;const warped=warpedSource(source,W,H,p);ctx.drawImage(warped,0,0);ctx.restore();warped.width=0;warped.height=0;}}
    else {ctx.fillStyle='white';ctx.fillRect(0,0,W,H);if(source)ctx.drawImage(warpedSource(source,W,H,p),0,0);else ctx.drawImage(target,0,0)}
@@ -254,7 +271,7 @@ over.addEventListener('pointerdown',e=>{
 });
 over.addEventListener('pointermove',e=>{const p=pointFromEvent(e);state.hover=p;if(!state.gesture){drawOverlay();return}const g=state.gesture;g.end=p;if(g.shape==='brush'){const prev=g.points.at(-1),d=Math.hypot(prev.x-p.x,prev.y-p.y);if(d>=1.7)g.points.push(p)}drawOverlay()});
 function finishGesture(e){const g=state.gesture;if(!g)return;state.gesture=null;drawOverlay();if(g.shape!=='brush'&&(Math.abs(g.end.x-g.start.x)<10||Math.abs(g.end.y-g.start.y)<10)){toast('选区太小，请拖动较大的气泡内部区域');return}
- const p=current();if(!p)return;p.undo.push(structuredClone(p.edits));if(p.undo.length>50)p.undo.shift();p.redo=[];p.edits.push(g);
+ const p=current();if(!p)return;p.undo.push(structuredClone(p.edits));if(p.undo.length>50)p.undo.shift();p.redo=[];p.edits.push(g);state.pendingStroke=g.kind==='transfer'?{pair:p,edit:g}:null;
  // Keep the zoom, current scroll offset, mouse position and page list stable.
  $('editCount').textContent=p.edits.length+' 次编辑';$('clearEdits').disabled=!p.edits.length;
  $('undoButton').disabled=!p.undo.length;$('redoButton').disabled=true;

@@ -69,16 +69,17 @@ export function applyProtectedInk(dst,original,src,mask,profileTarget,profileSou
     const alpha=diff>24 && (sl<=threshold || diff>53)?cap((diff-24)/50,0,1):0;
     const targetDeviation=dist([original[j],original[j+1],original[j+2]],paper);
     const oldInk=(profileTarget.luminance-tl>19 && targetDeviation>27);
+    const beforeR=dst[j],beforeG=dst[j+1],beforeB=dst[j+2];
     if(mode==='hole' || oldInk){
-      dst[j]=paper[0];dst[j+1]=paper[1];dst[j+2]=paper[2];edited++;
+      dst[j]=paper[0];dst[j+1]=paper[1];dst[j+2]=paper[2];
     }
     if(alpha>.02){
       // Preserve the original SOURCE ink color, not a fixed translucent gray.
       dst[j]=Math.round(dst[j]*(1-alpha)+sr*alpha);
       dst[j+1]=Math.round(dst[j+1]*(1-alpha)+sg*alpha);
       dst[j+2]=Math.round(dst[j+2]*(1-alpha)+sb*alpha);
-      edited++;
     }
+    if(Math.abs(dst[j]-beforeR)+Math.abs(dst[j+1]-beforeG)+Math.abs(dst[j+2]-beforeB)>2)edited++;
     dst[j+3]=255;
   }
   return {applied:true,changed:edited,color:paper,kind:profileTarget.kind};
