@@ -4,3 +4,17 @@
 
 /* Web Lite v0.2.1: variable-size, freehand translation transfer */
 .brush-controls{display:flex;gap:9px;align-items:center}.brush-controls input[type=range]{flex:1;min-width:0}.brush-controls input[type=number]{width:63px;min-width:63px;background:#0c1525;border:1px solid #364b60;border-radius:7px;padding:6px;color:var(--text);font-variant-numeric:tabular-nums}#overlayCanvas{touch-action:none;cursor:crosshair}.help-card p{line-height:1.65}
+
+/* v0.2.3: brush compositing + stable, user-controlled zoom */
+.transfer-mode{display:flex;gap:3px;align-items:center;background:#0c1627;border:1px solid #2c4055;padding:3px;border-radius:9px;white-space:nowrap}
+.mode-btn{background:transparent;color:#a9baca;border:0;border-radius:6px;padding:8px 9px;cursor:pointer;font-size:12px}
+.mode-btn.active{color:#102e35;background:#77e0d2;font-weight:700}
+.zoom-controls{display:flex;align-items:center;gap:5px;margin-left:auto;white-space:nowrap}
+.zoom-controls label,.zoom-controls span{font-size:11px;color:#a7b4c9}
+.zoom-controls select,.zoom-controls input{background:#101e30;color:#e6f3fb;border:1px solid #34485b;border-radius:7px;height:28px;padding:3px 6px;font-size:12px}
+.zoom-controls select{max-width:117px}.zoom-controls input{width:58px}
+#zoomInfo{min-width:39px;text-align:right;font-size:11px}
+#overlayCanvas{touch-action:none}
+@media(max-width:1150px){.transfer-mode{flex-wrap:wrap}.zoom-controls{gap:3px}}
+.canvas-scroller{justify-content:flex-start}
+.canvas-holder{margin-left:auto;margin-right:auto}

@@ -2,9 +2,44 @@ import {unpack,releaseItems,bitmap,defaultPair,compose,smartPairs,canvasBlob,dow
 import {estimateBrowserAffine} from './registration.js';
 
 const $=id=>document.getElementById(id);
-const state={sources:[],targets:[],pairs:[],index:0,view:'result',tool:'paint-transfer',brush:24,threshold:185,paper:255,gesture:null,cloneAnchor:null,stamp:0,rendering:false,hover:null};
+const state={sources:[],targets:[],pairs:[],index:0,view:'result',tool:'paint-transfer',brush:24,threshold:185,paper:255,gesture:null,cloneAnchor:null,stamp:0,rendering:false,hover:null,transferMode:'hole'};
 const cvs=$('editorCanvas'),over=$('overlayCanvas'),ctx=cvs.getContext('2d',{willReadFrequently:true}),oc=over.getContext('2d');
 let toastHandle=null;
+// Display transform is independent of document edits. Never recompute fit on a stroke.
+const zoomState={mode:'fit',percent:100,pageId:null};
+function applyZoom({resetCenter=false}={}){
+ const sc=$('canvasScroller');if(!cvs.width||!cvs.height||sc.classList.contains('hidden'))return;
+ const cw=Math.max(10,sc.clientWidth),ch=Math.max(10,sc.clientHeight);
+ const oldWidth=parseFloat(cvs.style.width)||cvs.width,oldHeight=parseFloat(cvs.style.height)||cvs.height;
+ const relX=(sc.scrollLeft+cw/2)/oldWidth,relY=(sc.scrollTop+ch/2)/oldHeight;
+ let factor=zoomState.mode==='fit'?Math.min((cw-32)/cvs.width,(ch-32)/cvs.height):
+   zoomState.mode==='width'?(cw-32)/cvs.width:zoomState.percent/100;
+ factor=Math.max(.05,Math.min(3,factor));
+ const width=Math.max(1,Math.round(cvs.width*factor)),height=Math.max(1,Math.round(cvs.height*factor));
+ cvs.style.width=over.style.width=$('canvasHolder').style.width=width+'px';
+ cvs.style.height=over.style.height=$('canvasHolder').style.height=height+'px';
+ if(resetCenter){sc.scrollLeft=Math.max(0,(width-cw)/2);sc.scrollTop=0}
+ else{sc.scrollLeft=Math.max(0,relX*width-cw/2);sc.scrollTop=Math.max(0,relY*height-ch/2)}
+ const pct=Math.round(factor*100);$('zoomInfo').textContent=pct+'%';$('zoomPercent').value=pct;
+ $('viewZoom').value=zoomState.mode==='manual'?(Array.from($('viewZoom').options).some(o=>o.value===String(zoomState.percent))?String(zoomState.percent):'custom'):zoomState.mode;
+}
+$('viewZoom').insertAdjacentHTML('beforeend','<option value="custom" hidden>自定义</option>');
+$('viewZoom').addEventListener('change',()=>{const val=$('viewZoom').value;
+ if(val==='fit'||val==='width')zoomState.mode=val;
+ else if(val!=='custom'){zoomState.mode='manual';zoomState.percent=Number(val)}
+ applyZoom();});
+$('zoomPercent').addEventListener('change',()=>{zoomState.mode='manual';zoomState.percent=Math.max(10,Math.min(300,Number($('zoomPercent').value)||100));applyZoom()});
+$('canvasScroller').addEventListener('wheel',e=>{
+ if(!(e.ctrlKey||e.metaKey))return;e.preventDefault();
+ const effective=Math.round((parseFloat(cvs.style.width)||cvs.width)/Math.max(cvs.width,1)*100);
+ zoomState.mode='manual';zoomState.percent=Math.max(10,Math.min(300,effective+(e.deltaY<0?10:-10)));applyZoom();
+},{passive:false});
+for(const btn of document.querySelectorAll('[data-transfer-mode]'))btn.addEventListener('click',()=>{
+ state.transferMode=btn.dataset.transferMode;
+ document.querySelectorAll('[data-transfer-mode]').forEach(b=>b.classList.toggle('active',b===btn));
+ toast(state.transferMode==='hole'?'挖孔替换：严格沿笔刷轨迹清底并迁入中文':'透明叠加：仅显示半透明中文，保留原始日文');
+});
+
 // Matching pages is not image registration. Every selected unedited pair needs a
 // validated transform before displaying/migrating SOURCE. Jobs are per-pair and
 // keyed by object identity so switching pages cannot overwrite a different pair.
@@ -157,7 +192,9 @@ async function renderPage(){
    const target=await bitmap(currentTarget());const source=currentSrc()?await bitmap(currentSrc()):null;
    if(stamp!==state.stamp)return;
    const W=target.width,H=target.height;
-   cvs.width=W;cvs.height=H;over.width=W;over.height=H;
+   const changedPage=zoomState.pageId!==currentTarget()?.id;
+   if(cvs.width!==W)cvs.width=W;if(cvs.height!==H)cvs.height=H;
+   if(over.width!==W)over.width=W;if(over.height!==H)over.height=H;
    ctx.clearRect(0,0,W,H);
    if(state.view==='result'){const composite=compose(target,source,p,{threshold:state.threshold,paper:state.paper});ctx.drawImage(composite,0,0);composite.width=0;composite.height=0}
    else if(state.view==='target')ctx.drawImage(target,0,0);
@@ -165,10 +202,10 @@ async function renderPage(){
    else {ctx.fillStyle='white';ctx.fillRect(0,0,W,H);if(source)ctx.drawImage(warpedSource(source,W,H,p),0,0);else ctx.drawImage(target,0,0)}
    if(stamp!==state.stamp)return;
    $('emptyState').classList.add('hidden');$('canvasScroller').classList.remove('hidden');
-   const rect=$('canvasScroller').getBoundingClientRect(),availableW=Math.max(200,rect.width-60),availableH=Math.max(190,rect.height-55),factor=Math.min(1.35,availableW/W,availableH/H);
-   const width=Math.max(10,Math.round(W*factor)),height=Math.max(10,Math.round(H*factor));
-   cvs.style.width=over.style.width=$('canvasHolder').style.width=width+'px';cvs.style.height=over.style.height=$('canvasHolder').style.height=height+'px';
-   $('emptyState').classList.add('hidden');$('canvasScroller').classList.remove('hidden');$('imageDims').textContent=`${W} × ${H} px · ${p.edits.length} 次编辑`;$('zoomInfo').textContent=`${Math.round(factor*100)}%`;
+   zoomState.pageId=currentTarget()?.id;
+   // Pixel-only redraw after a stroke: never touch CSS size or scroll offsets.
+   if(changedPage||!cvs.style.width)applyZoom({resetCenter:changedPage});
+   $('imageDims').textContent=`${W} × ${H} px · ${p.edits.length} 次编辑`;
    drawOverlay();
  }catch(err){if(stamp===state.stamp)toast(`加载页面失败：${err.message}`);console.error(err)}
 }
@@ -190,24 +227,34 @@ function drawOverlay(){
  else if(e.shape==='ellipse'){const x=(e.start.x+e.end.x)/2,y=(e.start.y+e.end.y)/2;oc.beginPath();oc.ellipse(x,y,Math.max(1,Math.abs(e.start.x-e.end.x)/2),Math.max(1,Math.abs(e.start.y-e.end.y)/2),0,0,Math.PI*2);oc.fill();oc.stroke()}
  else {oc.setLineDash([]);oc.lineWidth=e.brush;oc.lineCap='round';oc.strokeStyle='#00dfca85';oc.beginPath();const pts=e.points||[];if(pts.length){oc.moveTo(pts[0].x,pts[0].y);pts.forEach(p=>oc.lineTo(p.x,p.y));oc.stroke();if(pts.length===1){oc.beginPath();oc.arc(pts[0].x,pts[0].y,e.brush/2,0,2*Math.PI);oc.fill()}}}
 }
+over.addEventListener('contextmenu',e=>e.preventDefault());
 over.addEventListener('pointerdown',e=>{
- if(!currentTarget())return;if(e.button!==0)return;
- const point=pointFromEvent(e);if(state.tool==='clone'&&e.altKey){state.cloneAnchor=point;toast(`克隆取样点 (${point.x}, ${point.y}) 已设定`);return}
- if(state.tool==='clone'&&!state.cloneAnchor){toast('请先按住 Alt，在原图的干净背景处单击取样');return}
- if(['ellipse','rect','paint-transfer'].includes(state.tool)&&!currentSrc()){toast('当前页面尚未配对 SOURCE，无法迁移中文文字');return}
- if(['ellipse','rect','paint-transfer'].includes(state.tool)&&!isRegistered(current())){
+ if(!currentTarget())return;if(e.button!==0&&e.button!==2)return;
+ const rightRestore=e.button===2;
+ const point=pointFromEvent(e);if(!rightRestore&&state.tool==='clone'&&e.altKey){state.cloneAnchor=point;toast(`克隆取样点 (${point.x}, ${point.y}) 已设定`);return}
+ if(!rightRestore&&state.tool==='clone'&&!state.cloneAnchor){toast('请先按住 Alt，在原图的干净背景处单击取样');return}
+ if(!rightRestore&&['ellipse','rect','paint-transfer'].includes(state.tool)&&!currentSrc()){toast('当前页面尚未配对 SOURCE，无法迁移中文文字');return}
+ if(!rightRestore&&['ellipse','rect','paint-transfer'].includes(state.tool)&&!isRegistered(current())){
    const p=current();toast(p.alignError?'配准失败，请检查对应页或使用桌面版':'正在自动配准当前页，完成后才能涂抹迁移');
    if(pairNeedsAlignment(p))void alignPage(p);
    return;
  }
  if(state.view!=='result'){state.view='result';document.querySelectorAll('[data-view]').forEach(b=>b.classList.toggle('active',b.dataset.view==='result'));/* Deferred redraw until stroke completes to retain pointer capture. */}
- const shape=['ellipse','rect'].includes(state.tool)?state.tool:'brush';state.gesture={kind:['ellipse','rect','paint-transfer'].includes(state.tool)?'transfer':state.tool,shape,start:point,end:point,points:shape==='brush'?[point]:undefined,brush:state.brush,threshold:state.threshold,paper:state.paper};
- if(state.tool==='clone')state.gesture.cloneOffset={x:state.cloneAnchor.x-point.x,y:state.cloneAnchor.y-point.y};
+ const tool=rightRestore?'restore':state.tool;
+ const shape=['ellipse','rect'].includes(tool)?tool:'brush';
+ state.gesture={kind:['ellipse','rect','paint-transfer'].includes(tool)?'transfer':tool,
+   mode:state.transferMode,shape,start:point,end:point,points:shape==='brush'?[point]:undefined,
+   brush:state.brush,threshold:state.threshold,paper:state.paper};
+ if(tool==='clone')state.gesture.cloneOffset={x:state.cloneAnchor.x-point.x,y:state.cloneAnchor.y-point.y};
  try{over.setPointerCapture(e.pointerId)}catch{}drawOverlay();e.preventDefault();
 });
 over.addEventListener('pointermove',e=>{const p=pointFromEvent(e);state.hover=p;if(!state.gesture){drawOverlay();return}const g=state.gesture;g.end=p;if(g.shape==='brush'){const prev=g.points.at(-1),d=Math.hypot(prev.x-p.x,prev.y-p.y);if(d>=1.7)g.points.push(p)}drawOverlay()});
 function finishGesture(e){const g=state.gesture;if(!g)return;state.gesture=null;drawOverlay();if(g.shape!=='brush'&&(Math.abs(g.end.x-g.start.x)<10||Math.abs(g.end.y-g.start.y)<10)){toast('选区太小，请拖动较大的气泡内部区域');return}
- const p=current();if(!p)return;p.undo.push(structuredClone(p.edits));if(p.undo.length>50)p.undo.shift();p.redo=[];p.edits.push(g);updateUI();}
+ const p=current();if(!p)return;p.undo.push(structuredClone(p.edits));if(p.undo.length>50)p.undo.shift();p.redo=[];p.edits.push(g);
+ // Keep the zoom, current scroll offset, mouse position and page list stable.
+ $('editCount').textContent=p.edits.length+' 次编辑';$('clearEdits').disabled=!p.edits.length;
+ $('undoButton').disabled=!p.undo.length;$('redoButton').disabled=true;
+ renderPage();}
 over.addEventListener('pointerup',finishGesture);over.addEventListener('pointercancel',()=>{state.gesture=null;drawOverlay()});over.addEventListener('pointerleave',()=>{if(!state.gesture){state.hover=null;drawOverlay()}});
 function undo(){const p=current();if(!p||!p.undo.length)return;p.redo.push(structuredClone(p.edits));p.edits=p.undo.pop();updateUI()}
 function redo(){const p=current();if(!p||!p.redo.length)return;p.undo.push(structuredClone(p.edits));p.edits=p.redo.pop();updateUI()}

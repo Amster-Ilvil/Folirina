@@ -91,8 +91,14 @@ export function compose(target,source,pair,settings={}){
      if(edit.kind==='transfer'){
        if(!src||src[i+3]<1)continue;
        const v=(src[i]*.299+src[i+1]*.587+src[i+2]*.114);
-       // Light bubble interior only. This protects dark target art outside explicit region.
-       if(v<=threshold){dst[i]=src[i];dst[i+1]=src[i+1];dst[i+2]=src[i+2]}
+       if(edit.mode==='transparent'){
+         // Preview/stored semi-transparent source ink, never erase Japanese or expand the mask.
+         if(v>threshold)continue;
+         const alpha=.46;
+         dst[i]=Math.round(dst[i]*(1-alpha)+src[i]*alpha);
+         dst[i+1]=Math.round(dst[i+1]*(1-alpha)+src[i+1]*alpha);
+         dst[i+2]=Math.round(dst[i+2]*(1-alpha)+src[i+2]*alpha);
+       }else if(v<=threshold){dst[i]=src[i];dst[i+1]=src[i+1];dst[i+2]=src[i+2]}
        else{dst[i]=paper;dst[i+1]=paper;dst[i+2]=paper}
      }else if(edit.kind==='erase'){dst[i]=paper;dst[i+1]=paper;dst[i+2]=paper}
      else if(edit.kind==='restore'){dst[i]=original[i];dst[i+1]=original[i+1];dst[i+2]=original[i+2]}
