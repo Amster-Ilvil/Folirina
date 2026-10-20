@@ -39,7 +39,7 @@ $('canvasScroller').addEventListener('wheel',e=>{
 for(const btn of document.querySelectorAll('[data-transfer-mode]'))btn.addEventListener('click',()=>{
  state.transferMode=btn.dataset.transferMode;
  document.querySelectorAll('[data-transfer-mode]').forEach(b=>b.classList.toggle('active',b===btn));
- toast(state.transferMode==='hole'?'挖孔替换：严格沿笔刷轨迹清底并迁入中文':'透明底替换：擦除笔刷内未对应中文的日文墨迹，中文保持原色；适合浅色气泡');
+ toast(state.transferMode==='texture'?'纹理直贴：复杂背景从已配准的中文 SOURCE 迁入纹理和文字，仅作用于笔刷内':state.transferMode==='hole'?'挖孔替换：纯色气泡清底；复杂背景转为配准纹理移植':'透明底替换：纯色气泡清旧字；复杂背景使用柔边 SOURCE 纹理');
 });
 
 // Matching pages is not image registration. Every selected unedited pair needs a
@@ -199,14 +199,17 @@ async function renderPage(){
    if(over.width!==W)over.width=W;if(over.height!==H)over.height=H;
    ctx.clearRect(0,0,W,H);
    if(state.view==='result'){const guarded=[],strokeResults=[];const composite=compose(target,source,p,{threshold:state.threshold,paper:state.paper,onGuard:(reason,edit)=>guarded.push({reason,edit}),onStrokeResult:(edit,result)=>strokeResults.push({edit,result})});
-     if(guarded.length){$('renderHint').textContent='⚠ '+guarded.at(-1).reason+'。请移至纯色气泡，或使用克隆修复。';}
-     else $('renderHint').textContent='仅对笔刷轨迹内的文字操作；彩色背景自动保留原色，复杂纹理不自动涂白';
+     if(guarded.length){$('renderHint').textContent='⚠ '+guarded.at(-1).reason+'。请检查配准或缩小画笔。';}
+     else $('renderHint').textContent='纯色区域贴字；建筑／网点等复杂背景自动采用 SOURCE 配准纹理，不会涂白；纹理色差需要人工检查';
      ctx.drawImage(composite,0,0);composite.width=0;composite.height=0;
      const newest=state.pendingStroke;
      if(newest&&newest.pair===p&&p.edits.at(-1)===newest.edit){
        state.pendingStroke=null;
        const failed=guarded.find(x=>x.edit===newest.edit);
        const stats=strokeResults.find(x=>x.edit===newest.edit)?.result;
+       if(!failed&&stats?.method==='registered-texture'){
+         $('renderHint').textContent='已使用 SOURCE 配准纹理迁移：未清白背景；请检查画笔边缘是否有扫描色差，必要时右键恢复';
+       }
        if(failed||!stats?.applied||stats.changed===0){
          // Unusable strokes must not enter undo/export history as if valid.
          p.edits.pop();p.undo.pop();p.redo=[];

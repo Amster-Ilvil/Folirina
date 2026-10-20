@@ -1,4 +1,4 @@
-import {samplePaper,applyProtectedInk} from './color_composite.js';
+import {samplePaper,applyProtectedInk,applyRegisteredTexturePatch} from './color_composite.js';
 /* Folirina Web Lite. Non-AI port informed by Folirina's page_pairing, registration and direct_patch modules.
    Target is always the immutable original base. No original pixels are overwritten. */
 export const isImageName = s => /\.(png|jpe?g|webp|bmp|gif)$/i.test(s);
@@ -111,9 +111,18 @@ export function compose(target,source,pair,settings={}){
    const offset=edit.cloneOffset||{x:0,y:0};
    const origFull=edit.kind==='clone'?baseCtx.getImageData(0,0,W,H).data:null;
    if(edit.kind==='transfer'){
-     const targetProfile=sampleSafePaper(baseCtx,box,mask,original,W,H);
-     const sourceProfile=src?sampleSafePaper(srcCtx,box,mask,src,W,H):{safe:false,reason:'缺少中文源图'};
-     const result=applyProtectedInk(dst,original,src||new Uint8ClampedArray(dst.length),mask,targetProfile,sourceProfile,edit.mode||'hole',threshold);
+     const targetProfile=edit.mode==='texture'?null:sampleSafePaper(baseCtx,box,mask,original,W,H);
+     const sourceProfile=edit.mode==='texture'?null:(src?sampleSafePaper(srcCtx,box,mask,src,W,H):{safe:false,reason:'缺少中文源图'});
+     let result;
+     if(edit.mode==='texture'){
+       result=src?applyRegisteredTexturePatch(dst,original,src,mask,box.w,box.h,'texture'):{applied:false,reason:'缺少中文 SOURCE'};
+     }else if(!targetProfile.safe || !sourceProfile.safe){
+       // Structured background / screen-tones: never paint it white. Use the
+       // aligned SOURCE image only under the user's explicit brush path.
+       result=src?applyRegisteredTexturePatch(dst,original,src,mask,box.w,box.h,edit.mode||'hole'):{applied:false,reason:'缺少中文 SOURCE'};
+     }else{
+       result=applyProtectedInk(dst,original,src||new Uint8ClampedArray(dst.length),mask,targetProfile,sourceProfile,edit.mode||'hole',threshold);
+     }
      if(!result.applied){
        if(settings.rejectUnsafe)throw Error('背景保护已阻止不安全的文字替换：'+result.reason);
        settings.onGuard?.(result.reason,edit);

@@ -84,3 +84,83 @@ export function applyProtectedInk(dst,original,src,mask,profileTarget,profileSou
   }
   return {applied:true,changed:edited,color:paper,kind:profileTarget.kind};
 }
+
+
+/**
+ * Manual Direct Patch fallback for lettering over real artwork, not flat paper.
+ * Only operates INSIDE the user-painted selection. It uses already-registered
+ * SOURCE artwork as a replacement for the Japanese pixels; this is NOT a
+ * semantic text mask or generative inpainting and may carry SOURCE scan texture.
+ *
+ * transparent -> edge-feathered, locally color-matched registered image patch
+ * hole        -> sharper registered image patch (all colors, no white clear)
+ * texture     -> explicit edge-feathered texture replacement
+ */
+export function applyRegisteredTexturePatch(dst,original,src,mask,w,h,mode='texture'){
+  const length=w*h;
+  let valid=0,selected=0;
+  for(let k=0;k<length;k++){
+    const j=k*4;
+    if(mask[j+3]<128)continue;
+    selected++;
+    if(src[j+3]>=245)valid++;
+  }
+  if(selected<4)return {applied:false,changed:0,reason:'笔刷选区过小'};
+  if(valid/selected<.93)return {applied:false,changed:0,reason:'当前选区有部分超出配准后中文版范围，请检查配准'};
+  // Estimate minor brightness / chroma difference from image structure just
+  // outside the painted region. Restrict to similar, non-ink pixels so the
+  // Japanese glyphs cannot substantially distort the color correction.
+  const delta=[[],[],[]], offsets=[[4,0],[-4,0],[0,4],[0,-4]];
+  const jump=Math.max(1,Math.round(Math.sqrt(selected/1600)));
+  for(let y=0;y<h;y+=jump)for(let x=0;x<w;x+=jump){
+    const j=(y*w+x)*4;
+    if(mask[j+3]<128)continue;
+    let near=false;
+    for(const [dx,dy] of offsets){
+      const xx=x+dx,yy=y+dy;
+      if(xx<0||xx>=w||yy<0||yy>=h||mask[(yy*w+xx)*4+3]<128){near=true;break}
+    }
+    if(!near)continue;
+    const lsrc=luminance(src[j],src[j+1],src[j+2]);
+    const ltgt=luminance(original[j],original[j+1],original[j+2]);
+    // Match only comparably bright image areas, not original-vs-translated text.
+    if(lsrc<135||ltgt<135||Math.abs(lsrc-ltgt)>70)continue;
+    for(let c=0;c<3;c++)delta[c].push(original[j+c]-src[j+c]);
+  }
+  const shifts=delta.map(v=>{
+    if(v.length<10)return 0;
+    v.sort((a,b)=>a-b);
+    return cap(v[Math.floor(v.length/2)],-36,36);
+  });
+  let changed=0;
+  const soft=(mode==='transparent'||mode==='texture');
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){
+    const j=(y*w+x)*4;
+    if(mask[j+3]<128)continue;
+    // No expansion outside the brush. Feather only inward along its edge.
+    let alpha=1;
+    if(soft){
+      // Wide, inward-only feather hides scan/contrast seams without leaking
+      // a single pixel beyond the hand-painted mask.
+      let count=0,all=0;
+      for(const rad of [3,7,12])for(const [dx,dy] of [[rad,0],[-rad,0],[0,rad],[0,-rad]]){
+        const xx=x+dx,yy=y+dy;all++;
+        if(xx>=0&&xx<w&&yy>=0&&yy<h&&mask[(yy*w+xx)*4+3]>=128)count++;
+      }
+      alpha=.35+.65*count/all;
+    }
+    const sl=luminance(src[j],src[j+1],src[j+2]);
+    // Keep dark Chinese text dark; tone compensation is weighted to paper.
+    const weight=cap((sl-35)/180,0,1);
+    let did=false;
+    for(let c=0;c<3;c++){
+      const next=cap(Math.round(src[j+c]+shifts[c]*weight),0,255);
+      const val=Math.round(dst[j+c]*(1-alpha)+next*alpha);
+      if(Math.abs(val-dst[j+c])>2)did=true;
+      dst[j+c]=val;
+    }
+    if(did)changed++;
+    dst[j+3]=255;
+  }
+  return {applied:changed>0,changed,method:'registered-texture',reason:changed?'':'选区内 SOURCE 与 TARGET 像素没有明显差异',shift:shifts};
+}
