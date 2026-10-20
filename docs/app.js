@@ -12,8 +12,8 @@ function applyZoom({resetCenter=false}={}){
  const cw=Math.max(10,sc.clientWidth),ch=Math.max(10,sc.clientHeight);
  const oldWidth=parseFloat(cvs.style.width)||cvs.width,oldHeight=parseFloat(cvs.style.height)||cvs.height;
  const relX=(sc.scrollLeft+cw/2)/oldWidth,relY=(sc.scrollTop+ch/2)/oldHeight;
- let factor=zoomState.mode==='fit'?Math.min((cw-32)/cvs.width,(ch-32)/cvs.height):
-   zoomState.mode==='width'?(cw-32)/cvs.width:zoomState.percent/100;
+ let factor=zoomState.mode==='fit'?Math.min((cw-76)/cvs.width,(ch-60)/cvs.height):
+   zoomState.mode==='width'?(cw-76)/cvs.width:zoomState.percent/100;
  factor=Math.max(.05,Math.min(3,factor));
  const width=Math.max(1,Math.round(cvs.width*factor)),height=Math.max(1,Math.round(cvs.height*factor));
  cvs.style.width=over.style.width=$('canvasHolder').style.width=width+'px';
@@ -29,6 +29,8 @@ $('viewZoom').addEventListener('change',()=>{const val=$('viewZoom').value;
  else if(val!=='custom'){zoomState.mode='manual';zoomState.percent=Number(val)}
  applyZoom();});
 $('zoomPercent').addEventListener('change',()=>{zoomState.mode='manual';zoomState.percent=Math.max(10,Math.min(300,Number($('zoomPercent').value)||100));applyZoom()});
+// Re-fit only when the viewport dimensions change; never during a paint stroke.
+if(typeof ResizeObserver!=='undefined')new ResizeObserver(()=>{if(zoomState.mode!=='manual')applyZoom()}).observe($('canvasScroller'));
 $('canvasScroller').addEventListener('wheel',e=>{
  if(!(e.ctrlKey||e.metaKey))return;e.preventDefault();
  const effective=Math.round((parseFloat(cvs.style.width)||cvs.width)/Math.max(cvs.width,1)*100);
