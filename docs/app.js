@@ -39,7 +39,7 @@ $('canvasScroller').addEventListener('wheel',e=>{
 for(const btn of document.querySelectorAll('[data-transfer-mode]'))btn.addEventListener('click',()=>{
  state.transferMode=btn.dataset.transferMode;
  document.querySelectorAll('[data-transfer-mode]').forEach(b=>b.classList.toggle('active',b===btn));
- toast(state.transferMode==='hole'?'挖孔替换：严格沿笔刷轨迹清底并迁入中文':'透明叠加：仅显示半透明中文，保留原始日文');
+ toast(state.transferMode==='hole'?'挖孔替换：严格沿笔刷轨迹清底并迁入中文':'透明底替换：擦除笔刷内未对应中文的日文墨迹，中文保持原色；适合浅色气泡');
 });
 
 // Matching pages is not image registration. Every selected unedited pair needs a
