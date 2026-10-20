@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#0c1020">
   <meta name="description" content="Folirina Web Lite — 中文漫画 SOURCE 与高清日文 TARGET 本地对齐、遮罩、Direct Patch 和批量导出。无需模型，不上传图片。">
-  <title>Folirina Web Lite · 漫画修复工作台</title>
+  <title>Folirina Web Lite v0.2 · 漫画修复工作台</title>
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="icon" type="image/png" href="icon-192.png">
   <link rel="stylesheet" href="styles.css">
@@ -33,7 +33,7 @@
         <div class="sidebar-footer"><button class="button slim" id="previousPage" type="button">← 上一页</button><span id="pagePosition">— / —</span><button class="button slim" id="nextPage" type="button">下一页 →</button></div>
       </aside>
       <section class="workspace">
-        <div class="editor-toolbar"><div class="toolbar-left"><span class="eyebrow mono">EDITOR / CANVAS</span><strong id="currentPageTitle">尚未选择页面</strong></div><div class="view-tabs" role="group" aria-label="显示模式"><button class="active" data-view="result" type="button">合成预览</button><button data-view="target" type="button">日文原图</button><button data-view="source" type="button">中文版对照</button></div></div>
+        <div class="editor-toolbar"><div class="toolbar-left"><span class="eyebrow mono">EDITOR / CANVAS</span><strong id="currentPageTitle">尚未选择页面</strong></div><div class="view-tabs" role="group" aria-label="显示模式"><button class="active" data-view="result" type="button">合成预览</button><button data-view="overlay" type="button">叠加检查</button><button data-view="target" type="button">日文原图</button><button data-view="source" type="button">中文版对照</button></div></div>
         <div class="toolstrip" role="toolbar" aria-label="修复工具">
           <button class="tool active" data-tool="ellipse" type="button" title="拖动选择气泡椭圆区域"><span>◯</span>气泡迁移</button>
           <button class="tool" data-tool="rect" type="button" title="拖动选择矩形文字区域"><span>▢</span>矩形迁移</button>
@@ -49,10 +49,10 @@
       </section>
       <aside class="sidebar rightbar"><div class="panel-heading"><div class="eyebrow">INSPECTOR</div><h2>局部处理</h2><p>不依赖 OCR / AI。对齐后在 TARGET 画布上标记文字迁移区域。</p></div>
         <div class="inspector-block"><label for="sourceSelect">当前 SOURCE 对应页</label><select id="sourceSelect"><option value="">无对应页</option></select><label class="checkline"><input id="skipPage" type="checkbox"> 导出时跳过此页</label></div>
-        <div class="inspector-block"><div class="inspector-title"><strong>图像对齐</strong><button id="autoAlign" class="link-button" type="button">自动估计</button></div><div class="two-col"><label>水平偏移 X<input id="alignX" type="number" step="1" value="0"></label><label>垂直偏移 Y<input id="alignY" type="number" step="1" value="0"></label></div><label>相对缩放 <span id="scaleValue" class="value">100%</span></label><input id="alignScale" type="range" min="85" max="115" value="100" step="0.2"><p class="field-help">默认按两张图片宽度自动适配。偏移单位为 TARGET 像素；仅支持缩放和平移，不支持透视变换。</p></div>
+        <div class="inspector-block"><div class="inspector-title"><strong>图像对齐</strong><button id="autoAlign" class="link-button" type="button">自动配准</button><button id="resetAlign" class="link-button" type="button">重置</button></div><div class="two-col"><label>水平偏移 X<input id="alignX" type="number" step="1" value="0"></label><label>垂直偏移 Y<input id="alignY" type="number" step="1" value="0"></label></div><label>相对缩放 <span id="scaleValue" class="value">100%</span></label><input id="alignScale" type="range" min="85" max="115" value="100" step="0.2"><p class="field-help">默认按两张图片宽度自动适配。偏移单位为 TARGET 像素；自动配准可识别画面特征，矫正横纵缩放、轻微旋转与剪切；不使用 AI 或 OCR。复杂非刚性变形建议桌面版。</p><p class="field-help" id="alignStatus">尚未自动配准：旧版仅缩放和平移</p></div>
         <div class="inspector-block"><div class="inspector-title"><strong>迁移 / 修复参数</strong></div><label>中文深色像素阈值 <span class="value" id="thresholdValue">185</span></label><input id="threshold" type="range" min="80" max="245" value="185" step="1"><label>画笔尺寸 <span class="value" id="brushValue">24 px</span></label><input id="brushSize" type="range" min="2" max="120" value="24" step="2"><label>清除底色 <span class="value" id="paperValue">255</span></label><input id="paperColor" type="range" min="180" max="255" value="255" step="1"><p class="field-help">迁移选区会先填充底色，再提取 SOURCE 的深色文字。只推荐用于浅色气泡内部。</p></div>
         <div class="inspector-block"><div class="inspector-title"><strong>当前页面</strong><span id="editCount">0 次编辑</span></div><button id="clearEdits" class="button secondary wide" type="button">清空本页编辑</button><button id="exportPage" class="button secondary wide" type="button">导出当前页 PNG</button></div>
-        <div class="help-card"><strong>使用提示</strong><p>① 调整中日图片对应和偏移，查看对照。</p><p>② 用气泡 / 矩形选择内部，迁移 SOURCE 文字。</p><p>③ 用清除、克隆、恢复画笔微调。克隆笔先按住 Alt 点击取样。</p><p>④ 保存工作区 ZIP 可在下次继续编辑。</p></div>
+        <div class="help-card"><strong>使用提示</strong><p>① 调整中日图片对应和偏移，查看对照。</p><p>② 点击「自动配准」，再用「叠加检查」核对画框；最后用气泡 / 矩形迁移文字。</p><p>③ 用清除、克隆、恢复画笔微调。克隆笔先按住 Alt 点击取样。</p><p>④ 保存工作区 ZIP 可在下次继续编辑。</p></div>
       </aside>
     </main>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>

@@ -28,7 +28,7 @@ export async function unpack(files,prefix){
  return out.sort((a,b)=>naturalCompare(a.name,b.name));
 }
 export function releaseItems(items){items.forEach(i=>URL.revokeObjectURL(i.url));clearBitmaps()}
-export function defaultPair(targetIndex,sourceCount){return {tgt:targetIndex,src:targetIndex<sourceCount?targetIndex:null,skip:false,dx:0,dy:0,scale:1,edits:[],undo:[],redo:[],score:null}}
+export function defaultPair(targetIndex,sourceCount){return {tgt:targetIndex,src:targetIndex<sourceCount?targetIndex:null,skip:false,dx:0,dy:0,scale:1,affine:null,alignDiagnostics:null,edits:[],undo:[],redo:[],score:null}}
 export function nativeCanvas(w,h){const c=document.createElement('canvas');c.width=w;c.height=h;return c}
 export function brushOrSelectionMask(edit,x,y,w,h){
  const c=nativeCanvas(w,h),cx=c.getContext('2d');cx.fillStyle='#fff';cx.strokeStyle='#fff';cx.lineCap='round';cx.lineJoin='round';
@@ -56,7 +56,18 @@ export function getBounds(edit,W,H){
 }
 export function warpedSource(source,targetWidth,targetHeight,pair){
  const c=nativeCanvas(targetWidth,targetHeight);const ctx=c.getContext('2d',{willReadFrequently:true});
- if(source){const s=targetWidth/source.width*(pair.scale||1);ctx.drawImage(source,pair.dx||0,pair.dy||0,source.width*s,source.height*s)}
+ if(source){
+  if(Array.isArray(pair.affine)&&pair.affine.length===6&&pair.affine.every(Number.isFinite)){
+   const [a,b,c,d,e,f]=pair.affine,zoom=pair.scale||1;
+   const midX=targetWidth/2,midY=targetHeight/2;
+   ctx.setTransform(a*zoom,b*zoom,c*zoom,d*zoom,midX+zoom*(e-midX)+(pair.dx||0),midY+zoom*(f-midY)+(pair.dy||0));
+   ctx.drawImage(source,0,0);ctx.resetTransform();
+  }else{
+   // Compatibility with workspaces created before non-AI affine registration.
+   const s=targetWidth/source.width*(pair.scale||1);
+   ctx.drawImage(source,pair.dx||0,pair.dy||0,source.width*s,source.height*s);
+  }
+ }
  return c;
 }
 export function compose(target,source,pair,settings={}){
