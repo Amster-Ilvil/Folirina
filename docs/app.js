@@ -2,7 +2,7 @@ import {unpack,releaseItems,bitmap,defaultPair,compose,smartPairs,canvasBlob,dow
 import {estimateBrowserAffine} from './registration.js';
 
 const $=id=>document.getElementById(id);
-const state={sources:[],targets:[],pairs:[],index:0,view:'result',tool:'ellipse',brush:24,threshold:185,paper:255,gesture:null,cloneAnchor:null,stamp:0,rendering:false};
+const state={sources:[],targets:[],pairs:[],index:0,view:'result',tool:'paint-transfer',brush:24,threshold:185,paper:255,gesture:null,cloneAnchor:null,stamp:0,rendering:false,hover:null};
 const cvs=$('editorCanvas'),over=$('overlayCanvas'),ctx=cvs.getContext('2d',{willReadFrequently:true}),oc=over.getContext('2d');
 let toastHandle=null;
 function toast(message){$('toast').textContent=message;$('toast').classList.add('show');clearTimeout(toastHandle);toastHandle=setTimeout(()=>$('toast').classList.remove('show'),3900)}
@@ -64,17 +64,22 @@ function updateUI(){
  $('pairSummary').textContent=state.targets.length?`${state.pairs.filter(x=>x.src!==null).length} / ${state.pairs.length} 页已配对 · ${state.pairs.filter(x=>x.skip).length} 页跳过`:'按自然文件名顺序配对；请手工核对。';
  refreshPageList();renderPage();
 }
-function goPage(index){if(index<0||index>=state.pairs.length)return;state.index=index;state.cloneAnchor=null;updateUI()}
+function goPage(index){if(index<0||index>=state.pairs.length)return;state.index=index;state.cloneAnchor=null;state.hover=null;updateUI()}
 $('previousPage').addEventListener('click',()=>goPage(state.index-1));$('nextPage').addEventListener('click',()=>goPage(state.index+1));
 $('sourceSelect').addEventListener('change',e=>{const p=current();if(!p)return;if(p.edits.length&&!confirm('修改 SOURCE 配对会改变本页已有迁移结果，确定继续？')){e.target.value=String(p.src??'');return}p.src=e.target.value===''?null:Number(e.target.value);p.affine=null;p.alignDiagnostics=null;p.dx=0;p.dy=0;p.scale=1;updateUI()});
 $('skipPage').addEventListener('change',e=>{const p=current();if(p){p.skip=e.target.checked;updateUI()}});
 for(const name of ['alignX','alignY'])$(name).addEventListener('change',()=>{const p=current();if(!p)return;p.dx=Number($('alignX').value)||0;p.dy=Number($('alignY').value)||0;updateUI()});
 $('alignScale').addEventListener('input',()=>{$('scaleValue').textContent=Number($('alignScale').value).toFixed(1)+'%'});
 $('alignScale').addEventListener('change',()=>{const p=current();if(!p)return;p.scale=Number($('alignScale').value)/100;updateUI()});
-for(const type of ['threshold','brushSize','paperColor'])$(type).addEventListener('input',()=>{
- state.threshold=Number($('threshold').value);state.brush=Number($('brushSize').value);state.paper=Number($('paperColor').value);
- $('thresholdValue').textContent=String(state.threshold);$('brushValue').textContent=state.brush+' px';$('paperValue').textContent=String(state.paper);
-});
+function updateBrushSize(next){
+ const size=Math.max(2,Math.min(240,Math.round(Number(next)||24)));
+ state.brush=size;$('brushSize').value=size;$('brushSizeNumber').value=size;
+ $('brushValue').textContent=size+' px';drawOverlay();
+}
+$('brushSize').addEventListener('input',()=>updateBrushSize($('brushSize').value));
+$('brushSizeNumber').addEventListener('change',()=>updateBrushSize($('brushSizeNumber').value));
+$('threshold').addEventListener('input',()=>{state.threshold=Number($('threshold').value);$('thresholdValue').textContent=state.threshold});
+$('paperColor').addEventListener('input',()=>{state.paper=Number($('paperColor').value);$('paperValue').textContent=state.paper});
 for(const button of document.querySelectorAll('[data-view]'))button.addEventListener('click',()=>{state.view=button.dataset.view;document.querySelectorAll('[data-view]').forEach(b=>b.classList.toggle('active',b===button));renderPage()});
 for(const button of document.querySelectorAll('[data-tool]'))button.addEventListener('click',()=>{state.tool=button.dataset.tool;document.querySelectorAll('[data-tool]').forEach(b=>b.classList.toggle('active',b===button));drawOverlay()});
 $('autoAlign').addEventListener('click',async()=>{
@@ -128,7 +133,16 @@ async function renderPage(){
 function pointFromEvent(e){const r=over.getBoundingClientRect();return{x:Math.round((e.clientX-r.left)*over.width/r.width),y:Math.round((e.clientY-r.top)*over.height/r.height)}}
 function drawOverlay(){
  oc.clearRect(0,0,over.width,over.height);
- const e=state.gesture;if(!e)return;
+ const e=state.gesture;
+ if(!e){
+  const pointer=state.hover;
+  if(pointer && ['paint-transfer','erase','clone','restore'].includes(state.tool)){
+   oc.save();oc.setLineDash([5,4]);oc.strokeStyle='#21c9bd';oc.fillStyle='#00dfca1b';
+   oc.lineWidth=Math.max(2,over.width/700);
+   oc.beginPath();oc.arc(pointer.x,pointer.y,state.brush/2,0,Math.PI*2);oc.fill();oc.stroke();oc.restore();
+  }
+  return;
+ }
  oc.lineWidth=Math.max(2,over.width/450);oc.strokeStyle='#00dfca';oc.fillStyle='#00dfca24';oc.setLineDash([8,6]);
  if(e.shape==='rect'){const x=Math.min(e.start.x,e.end.x),y=Math.min(e.start.y,e.end.y),w=Math.abs(e.start.x-e.end.x),h=Math.abs(e.start.y-e.end.y);oc.fillRect(x,y,w,h);oc.strokeRect(x,y,w,h)}
  else if(e.shape==='ellipse'){const x=(e.start.x+e.end.x)/2,y=(e.start.y+e.end.y)/2;oc.beginPath();oc.ellipse(x,y,Math.max(1,Math.abs(e.start.x-e.end.x)/2),Math.max(1,Math.abs(e.start.y-e.end.y)/2),0,0,Math.PI*2);oc.fill();oc.stroke()}
@@ -138,21 +152,21 @@ over.addEventListener('pointerdown',e=>{
  if(!currentTarget())return;if(e.button!==0)return;
  const point=pointFromEvent(e);if(state.tool==='clone'&&e.altKey){state.cloneAnchor=point;toast(`克隆取样点 (${point.x}, ${point.y}) 已设定`);return}
  if(state.tool==='clone'&&!state.cloneAnchor){toast('请先按住 Alt，在原图的干净背景处单击取样');return}
- if(['ellipse','rect'].includes(state.tool)&&!currentSrc()){toast('当前页面尚未配对 SOURCE，无法迁移中文文字');return}
- if(state.view!=='result'){state.view='result';document.querySelectorAll('[data-view]').forEach(b=>b.classList.toggle('active',b.dataset.view==='result'));renderPage()}
- const shape=['ellipse','rect'].includes(state.tool)?state.tool:'brush';state.gesture={kind:['ellipse','rect'].includes(state.tool)?'transfer':state.tool,shape,start:point,end:point,points:shape==='brush'?[point]:undefined,brush:state.brush,threshold:state.threshold,paper:state.paper};
+ if(['ellipse','rect','paint-transfer'].includes(state.tool)&&!currentSrc()){toast('当前页面尚未配对 SOURCE，无法迁移中文文字');return}
+ if(state.view!=='result'){state.view='result';document.querySelectorAll('[data-view]').forEach(b=>b.classList.toggle('active',b.dataset.view==='result'));/* Deferred redraw until stroke completes to retain pointer capture. */}
+ const shape=['ellipse','rect'].includes(state.tool)?state.tool:'brush';state.gesture={kind:['ellipse','rect','paint-transfer'].includes(state.tool)?'transfer':state.tool,shape,start:point,end:point,points:shape==='brush'?[point]:undefined,brush:state.brush,threshold:state.threshold,paper:state.paper};
  if(state.tool==='clone')state.gesture.cloneOffset={x:state.cloneAnchor.x-point.x,y:state.cloneAnchor.y-point.y};
  try{over.setPointerCapture(e.pointerId)}catch{}drawOverlay();e.preventDefault();
 });
-over.addEventListener('pointermove',e=>{if(!state.gesture)return;const p=pointFromEvent(e),g=state.gesture;g.end=p;if(g.shape==='brush'){const prev=g.points.at(-1),d=Math.hypot(prev.x-p.x,prev.y-p.y);if(d>=1.7)g.points.push(p)}drawOverlay()});
+over.addEventListener('pointermove',e=>{const p=pointFromEvent(e);state.hover=p;if(!state.gesture){drawOverlay();return}const g=state.gesture;g.end=p;if(g.shape==='brush'){const prev=g.points.at(-1),d=Math.hypot(prev.x-p.x,prev.y-p.y);if(d>=1.7)g.points.push(p)}drawOverlay()});
 function finishGesture(e){const g=state.gesture;if(!g)return;state.gesture=null;drawOverlay();if(g.shape!=='brush'&&(Math.abs(g.end.x-g.start.x)<10||Math.abs(g.end.y-g.start.y)<10)){toast('选区太小，请拖动较大的气泡内部区域');return}
  const p=current();if(!p)return;p.undo.push(structuredClone(p.edits));if(p.undo.length>50)p.undo.shift();p.redo=[];p.edits.push(g);updateUI();}
-over.addEventListener('pointerup',finishGesture);over.addEventListener('pointercancel',()=>{state.gesture=null;drawOverlay()});
+over.addEventListener('pointerup',finishGesture);over.addEventListener('pointercancel',()=>{state.gesture=null;drawOverlay()});over.addEventListener('pointerleave',()=>{if(!state.gesture){state.hover=null;drawOverlay()}});
 function undo(){const p=current();if(!p||!p.undo.length)return;p.redo.push(structuredClone(p.edits));p.edits=p.undo.pop();updateUI()}
 function redo(){const p=current();if(!p||!p.redo.length)return;p.undo.push(structuredClone(p.edits));p.edits=p.redo.pop();updateUI()}
 $('undoButton').addEventListener('click',undo);$('redoButton').addEventListener('click',redo);
 $('clearEdits').addEventListener('click',()=>{const p=current();if(!p||!p.edits.length)return;if(!confirm('清空本页全部编辑？可以用撤销恢复。'))return;p.undo.push(structuredClone(p.edits));p.edits=[];p.redo=[];updateUI()});
-document.addEventListener('keydown',e=>{if(['INPUT','SELECT','TEXTAREA'].includes(document.activeElement.tagName))return;if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='z'){e.preventDefault();e.shiftKey?redo():undo()}if(e.key==='ArrowRight')goPage(state.index+1);if(e.key==='ArrowLeft')goPage(state.index-1)});
+document.addEventListener('keydown',e=>{if(['INPUT','SELECT','TEXTAREA'].includes(document.activeElement.tagName))return;if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='z'){e.preventDefault();e.shiftKey?redo():undo()}if(e.key==='ArrowRight')goPage(state.index+1);if(e.key==='ArrowLeft')goPage(state.index-1);if(e.key==='['||e.key===']'){e.preventDefault();updateBrushSize(state.brush+(e.key===']'?8:-8))}});
 async function exportOne(){const p=current();if(!p)return;busy(true,'生成 PNG','按原始 TARGET 分辨率合成...');try{const [t,s]=await Promise.all([bitmap(currentTarget()),currentSrc()?bitmap(currentSrc()):null]);const c=compose(t,s,p);const blob=await canvasBlob(c);c.width=0;c.height=0;download(blob,safeName(currentTarget().name).replace(/\.[^.]+$/,'')+'_folirina.png');toast('本页 PNG 已生成')}catch(e){toast(`导出失败：${e.message}`);console.error(e)}finally{busy(false)}}
 $('exportPage').addEventListener('click',exportOne);
 $('exportAll').addEventListener('click',async()=>{
