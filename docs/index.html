@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#0c1020">
+  <meta name="description" content="Folirina Web Lite — 中文漫画 SOURCE 与高清日文 TARGET 本地对齐、遮罩、Direct Patch 和批量导出。无需模型，不上传图片。">
+  <title>Folirina Web Lite · 漫画修复工作台</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" type="image/png" href="icon-192.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand"><div class="brand-mark">F<span>✦</span></div><div><strong>Folirina <em>Web Lite</em></strong><small>漫画文字迁移 · 浏览器本地工作台</small></div></div>
+      <div class="top-actions"><span class="privacy"><span class="live-dot"></span> 本地处理 · 不上传图片</span><button id="openProject" class="button ghost" type="button">打开工作区</button><button id="saveProject" class="button ghost" type="button">保存工作区</button><button id="exportAll" class="button primary" type="button">导出整册 ZIP <span class="btn-arrow">↗</span></button></div>
+    </header>
+    <main class="layout">
+      <aside class="sidebar leftbar">
+        <div class="panel-heading"><div class="eyebrow">PROJECT</div><h2>项目素材</h2><p>分别导入两个版本的漫画。原始文件只留在你的浏览器中。</p></div>
+        <div class="upload-card" id="srcDrop" tabindex="0" role="button" aria-label="导入中文版 SOURCE"><div class="upload-top"><span class="icon-circle chinese">中</span><div><strong>SOURCE</strong><span>已有中文译文</span></div></div><div class="upload-message"><b>＋</b><span>点击或拖放图片 / ZIP / CBZ</span></div><div class="upload-bottom"><span id="sourceCount">0 页</span><span>原始译文</span></div></div>
+        <div class="upload-card" id="tgtDrop" tabindex="0" role="button" aria-label="导入日文 TARGET"><div class="upload-top"><span class="icon-circle japanese">日</span><div><strong>TARGET</strong><span>高清日文底图</span></div></div><div class="upload-message"><b>＋</b><span>点击或拖放图片 / ZIP / CBZ</span></div><div class="upload-bottom"><span id="targetCount">0 页</span><span>最终底图</span></div></div>
+        <input id="sourceInput" type="file" accept="image/png,image/jpeg,image/webp,image/bmp,image/gif,.zip,.cbz" multiple hidden>
+        <input id="targetInput" type="file" accept="image/png,image/jpeg,image/webp,image/bmp,image/gif,.zip,.cbz" multiple hidden>
+        <input id="projectInput" type="file" accept=".zip,.folirinaweb" hidden>
+        <input id="sourceFolderInput" type="file" webkitdirectory multiple hidden>
+        <input id="targetFolderInput" type="file" webkitdirectory multiple hidden>
+        <div class="folder-links"><button class="link-button" id="sourceFolder" type="button">＋ 中文版文件夹</button><button class="link-button" id="targetFolder" type="button">＋ 日文版文件夹</button></div>
+        <div class="section-title"><h3>页面配对</h3><button id="autoPair" class="link-button" type="button">智能校验 / 配对</button></div>
+        <div class="pair-note" id="pairSummary">按自然文件名顺序配对；不确定的页面请手工核对。</div>
+        <div id="pageList" class="page-list" aria-label="配对页面列表"><div class="empty-page">导入两个版本后显示页面</div></div>
+        <div class="sidebar-footer"><button class="button slim" id="previousPage" type="button">← 上一页</button><span id="pagePosition">— / —</span><button class="button slim" id="nextPage" type="button">下一页 →</button></div>
+      </aside>
+      <section class="workspace">
+        <div class="editor-toolbar"><div class="toolbar-left"><span class="eyebrow mono">EDITOR / CANVAS</span><strong id="currentPageTitle">尚未选择页面</strong></div><div class="view-tabs" role="group" aria-label="显示模式"><button class="active" data-view="result" type="button">合成预览</button><button data-view="target" type="button">日文原图</button><button data-view="source" type="button">中文版对照</button></div></div>
+        <div class="toolstrip" role="toolbar" aria-label="修复工具">
+          <button class="tool active" data-tool="ellipse" type="button" title="拖动选择气泡椭圆区域"><span>◯</span>气泡迁移</button>
+          <button class="tool" data-tool="rect" type="button" title="拖动选择矩形文字区域"><span>▢</span>矩形迁移</button>
+          <span class="tool-separator"></span>
+          <button class="tool" data-tool="erase" type="button" title="画笔涂白日文 / 底色填充"><span>✎</span>遮罩清除</button>
+          <button class="tool" data-tool="clone" type="button" title="Alt + 单击取样，再画笔克隆"><span>▤</span>克隆修复</button>
+          <button class="tool" data-tool="restore" type="button" title="画笔恢复原始 TARGET 像素"><span>↶</span>恢复原图</button>
+          <span class="tool-separator"></span>
+          <button class="tool smalltool" id="undoButton" type="button" title="撤销 Ctrl+Z">↶</button>
+          <button class="tool smalltool" id="redoButton" type="button" title="重做 Ctrl+Shift+Z">↷</button>
+        </div>
+        <div class="canvas-area" id="canvasArea"><div class="empty-state" id="emptyState"><div class="empty-icon">◈</div><h2>开始你的高清漫画文字迁移</h2><p>左侧导入 SOURCE 中文版与 TARGET 日文原图<br>完成配对后即可在画布上指定迁移与修复区域</p><div class="empty-tags"><span>无 AI 模型</span><span>高清底图保护</span><span>纯浏览器运行</span></div></div><div id="canvasScroller" class="canvas-scroller hidden"><div class="canvas-holder" id="canvasHolder"><canvas id="editorCanvas" aria-label="漫画图像编辑画布"></canvas><canvas id="overlayCanvas" aria-hidden="true"></canvas></div></div><div class="canvas-footer" id="canvasFooter"><span id="imageDims">未加载图片</span><span id="renderHint">选择迁移区域时请避开气泡边框和人物线条</span><span id="zoomInfo">适应窗口</span></div></div>
+      </section>
+      <aside class="sidebar rightbar"><div class="panel-heading"><div class="eyebrow">INSPECTOR</div><h2>局部处理</h2><p>不依赖 OCR / AI。对齐后在 TARGET 画布上标记文字迁移区域。</p></div>
+        <div class="inspector-block"><label for="sourceSelect">当前 SOURCE 对应页</label><select id="sourceSelect"><option value="">无对应页</option></select><label class="checkline"><input id="skipPage" type="checkbox"> 导出时跳过此页</label></div>
+        <div class="inspector-block"><div class="inspector-title"><strong>图像对齐</strong><button id="autoAlign" class="link-button" type="button">自动估计</button></div><div class="two-col"><label>水平偏移 X<input id="alignX" type="number" step="1" value="0"></label><label>垂直偏移 Y<input id="alignY" type="number" step="1" value="0"></label></div><label>相对缩放 <span id="scaleValue" class="value">100%</span></label><input id="alignScale" type="range" min="85" max="115" value="100" step="0.2"><p class="field-help">默认按两张图片宽度自动适配。偏移单位为 TARGET 像素；仅支持缩放和平移，不支持透视变换。</p></div>
+        <div class="inspector-block"><div class="inspector-title"><strong>迁移 / 修复参数</strong></div><label>中文深色像素阈值 <span class="value" id="thresholdValue">185</span></label><input id="threshold" type="range" min="80" max="245" value="185" step="1"><label>画笔尺寸 <span class="value" id="brushValue">24 px</span></label><input id="brushSize" type="range" min="2" max="120" value="24" step="2"><label>清除底色 <span class="value" id="paperValue">255</span></label><input id="paperColor" type="range" min="180" max="255" value="255" step="1"><p class="field-help">迁移选区会先填充底色，再提取 SOURCE 的深色文字。只推荐用于浅色气泡内部。</p></div>
+        <div class="inspector-block"><div class="inspector-title"><strong>当前页面</strong><span id="editCount">0 次编辑</span></div><button id="clearEdits" class="button secondary wide" type="button">清空本页编辑</button><button id="exportPage" class="button secondary wide" type="button">导出当前页 PNG</button></div>
+        <div class="help-card"><strong>使用提示</strong><p>① 调整中日图片对应和偏移，查看对照。</p><p>② 用气泡 / 矩形选择内部，迁移 SOURCE 文字。</p><p>③ 用清除、克隆、恢复画笔微调。克隆笔先按住 Alt 点击取样。</p><p>④ 保存工作区 ZIP 可在下次继续编辑。</p></div>
+      </aside>
+    </main>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <div id="busy" class="busy hidden" role="alert"><div class="loader"></div><div><strong id="busyTitle">处理中</strong><small id="busyDetail">请不要关闭页面</small></div></div>
+    <footer class="statusbar"><span>Folirina Web Lite · 基于 <a href="https://github.com/Amster-Ilvil/Folirina" target="_blank" rel="noopener noreferrer">Folirina</a> 的非 AI 图像工作流</span><span>GitHub main 基线：<code>b87edcd</code> · 图片不经过服务器</span></footer>
+  </div>
+  <script src="vendor/jszip.min.js"></script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
