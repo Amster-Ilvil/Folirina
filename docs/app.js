@@ -198,7 +198,9 @@ async function renderPage(){
    if(cvs.width!==W)cvs.width=W;if(cvs.height!==H)cvs.height=H;
    if(over.width!==W)over.width=W;if(over.height!==H)over.height=H;
    ctx.clearRect(0,0,W,H);
-   if(state.view==='result'){const composite=compose(target,source,p,{threshold:state.threshold,paper:state.paper});ctx.drawImage(composite,0,0);composite.width=0;composite.height=0}
+   if(state.view==='result'){const guarded=[];const composite=compose(target,source,p,{threshold:state.threshold,paper:state.paper,onGuard:r=>guarded.push(r)});
+     if(guarded.length){$('renderHint').textContent='⚠ '+guarded.at(-1)+'。请移至纯色气泡，或使用克隆修复。';}
+     else $('renderHint').textContent='仅对笔刷轨迹内的文字操作；彩色背景自动保留原色，复杂纹理不自动涂白';ctx.drawImage(composite,0,0);composite.width=0;composite.height=0}
    else if(state.view==='target')ctx.drawImage(target,0,0);
    else if(state.view==='overlay'){ctx.drawImage(target,0,0);if(source){ctx.save();ctx.globalAlpha=.48;const warped=warpedSource(source,W,H,p);ctx.drawImage(warped,0,0);ctx.restore();warped.width=0;warped.height=0;}}
    else {ctx.fillStyle='white';ctx.fillRect(0,0,W,H);if(source)ctx.drawImage(warpedSource(source,W,H,p),0,0);else ctx.drawImage(target,0,0)}
@@ -265,7 +267,7 @@ $('clearEdits').addEventListener('click',()=>{const p=current();if(!p||!p.edits.
 document.addEventListener('keydown',e=>{if(['INPUT','SELECT','TEXTAREA'].includes(document.activeElement.tagName))return;if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='z'){e.preventDefault();e.shiftKey?redo():undo()}if(e.key==='ArrowRight')goPage(state.index+1);if(e.key==='ArrowLeft')goPage(state.index-1);if(e.key==='['||e.key===']'){e.preventDefault();updateBrushSize(state.brush+(e.key===']'?8:-8))}});
 async function exportOne(){const p=current();if(!p)return;
  if(p.edits.some(e=>e.kind==='transfer')&&!isRegistered(p)){toast('本页含未配准的迁移操作，禁止错位导出；请先自动配准');return;}
- busy(true,'生成 PNG','按原始 TARGET 分辨率合成...');try{const [t,s]=await Promise.all([bitmap(currentTarget()),currentSrc()?bitmap(currentSrc()):null]);const c=compose(t,s,p);const blob=await canvasBlob(c);c.width=0;c.height=0;download(blob,safeName(currentTarget().name).replace(/\.[^.]+$/,'')+'_folirina.png');toast('本页 PNG 已生成')}catch(e){toast(`导出失败：${e.message}`);console.error(e)}finally{busy(false)}}
+ busy(true,'生成 PNG','按原始 TARGET 分辨率合成...');try{const [t,s]=await Promise.all([bitmap(currentTarget()),currentSrc()?bitmap(currentSrc()):null]);const c=compose(t,s,p,{rejectUnsafe:true});const blob=await canvasBlob(c);c.width=0;c.height=0;download(blob,safeName(currentTarget().name).replace(/\.[^.]+$/,'')+'_folirina.png');toast('本页 PNG 已生成')}catch(e){toast(`导出失败：${e.message}`);console.error(e)}finally{busy(false)}}
 $('exportPage').addEventListener('click',exportOne);
 $('exportAll').addEventListener('click',async()=>{
  if(!state.targets.length)return;busy(true,'导出整册','正在生成 PNG 文件...');try{
@@ -275,7 +277,7 @@ $('exportAll').addEventListener('click',async()=>{
   if(p.edits.some(e=>e.kind==='transfer')&&!isRegistered(p))throw Error(`第 ${i+1} 页包含未配准文字迁移，请先自动配准，避免错位导出`);
   $('busyDetail').textContent=`合成页面 ${i+1}/${state.pairs.length}`;
   const t=await bitmap(state.targets[p.tgt]),s=p.src===null?null:await bitmap(state.sources[p.src]);
-  const c=compose(t,s,p),blob=await canvasBlob(c);c.width=0;c.height=0;
+  const c=compose(t,s,p,{rejectUnsafe:true}),blob=await canvasBlob(c);c.width=0;c.height=0;
   dir.file(`${String(i+1).padStart(4,'0')}_${safeName(state.targets[p.tgt].name).replace(/\.[^.]+$/,'')}.png`,blob);count++;
   await new Promise(r=>setTimeout(r,0));
  }

@@ -1,3 +1,4 @@
+import {samplePaper,applyProtectedInk} from './color_composite.js';
 /* Folirina Web Lite. Non-AI port informed by Folirina's page_pairing, registration and direct_patch modules.
    Target is always the immutable original base. No original pixels are overwritten. */
 export const isImageName = s => /\.(png|jpe?g|webp|bmp|gif)$/i.test(s);
@@ -70,6 +71,23 @@ export function warpedSource(source,targetWidth,targetHeight,pair){
  }
  return c;
 }
+// Infer paper color from the brush itself, then (only if needed) from a
+// tightly bounded halo. This lets fine strokes clear glyph pixels without
+// treating high-frequency screentones as a uniform white background.
+function sampleSafePaper(ctx,box,mask,pixelData,W,H){
+  const direct=samplePaper(pixelData,mask);
+  if(direct.safe)return direct;
+  const pad=30;
+  const x=Math.max(0,box.x-pad),y=Math.max(0,box.y-pad);
+  const x2=Math.min(W,box.x+box.w+pad),y2=Math.min(H,box.y+box.h+pad);
+  const w=x2-x,h=y2-y;
+  const halo=ctx.getImageData(x,y,w,h);
+  const sampleMask=new Uint8ClampedArray(w*h*4);
+  for(let i=3;i<sampleMask.length;i+=4)sampleMask[i]=255;
+  const surrounding=samplePaper(halo.data,sampleMask);
+  if(surrounding.safe&&surrounding.coverage>=.80)return surrounding;
+  return direct;
+}
 export function compose(target,source,pair,settings={}){
  if(!target)throw Error('缺少 TARGET');
  const W=target.width,H=target.height;const canvas=nativeCanvas(W,H);const ctx=canvas.getContext('2d',{willReadFrequently:true});ctx.drawImage(target,0,0);
@@ -86,28 +104,17 @@ export function compose(target,source,pair,settings={}){
    const paper=edit.paper??settings.paper??255;
    const offset=edit.cloneOffset||{x:0,y:0};
    const origFull=edit.kind==='clone'?baseCtx.getImageData(0,0,W,H).data:null;
-   for(let y=0;y<box.h;y++)for(let x=0;x<box.w;x++){
+   if(edit.kind==='transfer'){
+     const targetProfile=sampleSafePaper(baseCtx,box,mask,original,W,H);
+     const sourceProfile=src?sampleSafePaper(srcCtx,box,mask,src,W,H):{safe:false,reason:'缺少中文源图'};
+     const result=applyProtectedInk(dst,original,src||new Uint8ClampedArray(dst.length),mask,targetProfile,sourceProfile,edit.mode||'hole',threshold);
+     if(!result.applied){
+       if(settings.rejectUnsafe)throw Error('背景保护已阻止不安全的文字替换：'+result.reason);
+       settings.onGuard?.(result.reason);
+     } // No paint on uncertain backgrounds; no destructive fallback.
+   }else for(let y=0;y<box.h;y++)for(let x=0;x<box.w;x++){
      const i=(y*box.w+x)*4;if(mask[i+3]<128)continue;
-     if(edit.kind==='transfer'){
-       if(!src||src[i+3]<1)continue;
-       const v=(src[i]*.299+src[i+1]*.587+src[i+2]*.114);
-       if(edit.mode==='transparent'){
-         // Transparent *SOURCE paper*, not transparent text. Opaque Chinese
-         // ink replaces Japanese inside the explicit stroke, and the source
-         // background removes unmatched Japanese ink. Unlike hole mode, keep
-         // near-white TARGET shading/paper texture instead of punching out
-         // the entire stroke. Restrict to light balloon interiors.
-         if(v<=threshold){
-           dst[i]=src[i];dst[i+1]=src[i+1];dst[i+2]=src[i+2];
-         }else{
-           const targetLuma=original[i]*.299+original[i+1]*.587+original[i+2]*.114;
-           if(targetLuma<Math.min(248,paper-7)){
-             dst[i]=paper;dst[i+1]=paper;dst[i+2]=paper;
-           } // Retain near-paper TARGET pixels/texture that was never ink.
-         }
-       }else if(v<=threshold){dst[i]=src[i];dst[i+1]=src[i+1];dst[i+2]=src[i+2]}
-       else{dst[i]=paper;dst[i+1]=paper;dst[i+2]=paper}
-     }else if(edit.kind==='erase'){dst[i]=paper;dst[i+1]=paper;dst[i+2]=paper}
+     if(edit.kind==='erase'){dst[i]=paper;dst[i+1]=paper;dst[i+2]=paper}
      else if(edit.kind==='restore'){dst[i]=original[i];dst[i+1]=original[i+1];dst[i+2]=original[i+2]}
      else if(edit.kind==='clone'){
        const sx=clamp(Math.round(box.x+x+offset.x),0,W-1),sy=clamp(Math.round(box.y+y+offset.y),0,H-1),j=(sy*W+sx)*4;
