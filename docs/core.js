@@ -1,4 +1,5 @@
 import {invertH} from './homography.js';
+import {applyReviewedTransfer} from './reviewed_masks.js';
 import {samplePaper,applyProtectedInk,applyRegisteredTexturePatch} from './color_composite.js';
 /* Folirina Web Lite. Non-AI port informed by Folirina's page_pairing, registration and direct_patch modules.
    Target is always the immutable original base. No original pixels are overwritten. */
@@ -136,11 +137,16 @@ export function compose(target,source,pair,settings={}){
  const base=nativeCanvas(W,H),baseCtx=base.getContext('2d',{willReadFrequently:true});baseCtx.drawImage(target,0,0);
  const srcC=warpedSource(source,W,H,pair),srcCtx=srcC.getContext('2d',{willReadFrequently:true});
  for(const edit of pair.edits){
-   const box=getBounds(edit,W,H);if(!box)continue;
-   const mask=brushOrSelectionMask(edit,box.x,box.y,box.w,box.h);
+   const box=edit.kind==='reviewed'?edit.box:getBounds(edit,W,H);if(!box)continue;
+   if(edit.kind==='reviewed'&&(box.x<0||box.y<0||box.w<1||box.h<1||box.x+box.w>W||box.y+box.h>H||box.w*box.h>4_000_000))throw Error('人工掩码区域越界');
+   const mask=edit.kind==='reviewed'?null:brushOrSelectionMask(edit,box.x,box.y,box.w,box.h);
    const current=ctx.getImageData(box.x,box.y,box.w,box.h),dst=current.data;
    const original=baseCtx.getImageData(box.x,box.y,box.w,box.h).data;
-   const src=edit.kind==='transfer'?srcCtx.getImageData(box.x,box.y,box.w,box.h).data:null;
+   const src=['transfer','reviewed'].includes(edit.kind)?srcCtx.getImageData(box.x,box.y,box.w,box.h).data:null;
+   if(edit.kind==='reviewed'){
+     const result=applyReviewedTransfer(dst,original,src,edit,box.w,box.h);
+     settings.onStrokeResult?.(edit,result);ctx.putImageData(current,box.x,box.y);continue;
+   }
    const threshold=edit.threshold??settings.threshold??185;
    const paper=edit.paper??settings.paper??255;
    const offset=edit.cloneOffset||{x:0,y:0};

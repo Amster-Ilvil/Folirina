@@ -19,4 +19,4 @@
 .canvas-scroller{justify-content:flex-start}
 .canvas-holder{margin-left:auto;margin-right:auto}
 
-.engine-status{font-size:11px;color:#8fdcd3;white-space:nowrap}.engine-help{font-size:11px;color:#8ac7df;white-space:nowrap;text-decoration:underline}.mode-btn:disabled{opacity:.35;cursor:not-allowed}.mode-btn:disabled:hover{background:inherit}
+.mask-review-tools{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px;margin:10px 0}.mask-review-tools .tool{white-space:normal;font-size:10px;padding:7px 4px;border:1px solid #315263}.mask-review-actions{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:10px 0}.mask-review-actions .button{padding:8px 4px;font-size:10px}.mask-review-panel select{margin:8px 0;min-height:34px}.engine-status{font-size:11px;color:#8fdcd3;white-space:nowrap}.engine-help{font-size:11px;color:#8ac7df;white-space:nowrap;text-decoration:underline}.mode-btn:disabled{opacity:.35;cursor:not-allowed}.mode-btn:disabled:hover{background:inherit}

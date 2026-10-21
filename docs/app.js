@@ -2,9 +2,10 @@ import {unpack,releaseItems,bitmap,defaultPair,compose,smartPairs,canvasBlob,dow
 import {estimateBrowserAffine} from './registration.js';
 import {getBounds,brushOrSelectionMask} from './core.js';
 import {inspectTextDifferences,maskOverlay} from './glyph_masks.js';
+import {reviewedEdit} from './reviewed_masks.js';
 
 const $=id=>document.getElementById(id);
-const state={sources:[],targets:[],pairs:[],index:0,view:'result',tool:'paint-transfer',brush:24,threshold:185,paper:255,gesture:null,inspection:null,cloneAnchor:null,stamp:0,rendering:false,hover:null,transferMode:'hole'};
+const state={sources:[],targets:[],pairs:[],index:0,view:'result',tool:'paint-transfer',brush:24,threshold:185,paper:255,gesture:null,inspection:null,review:null,reviewPreview:false,cloneAnchor:null,stamp:0,rendering:false,hover:null,transferMode:'hole'};
 const cvs=$('editorCanvas'),over=$('overlayCanvas'),ctx=cvs.getContext('2d',{willReadFrequently:true}),oc=over.getContext('2d');
 let toastHandle=null;
 // Optional, local-only native backend. GitHub Pages always remains fully Lite.
@@ -304,6 +305,68 @@ function oneMaskPng(mask,w,h){
  for(let i=0;i<mask.length;i++){let j=i*4;const value=mask[i]?255:0;image.data[j]=image.data[j+1]=image.data[j+2]=value;image.data[j+3]=255}
  context.putImageData(image,0,0);return canvas;
 }
+const reviewTools=new Set(['mask-source-add','mask-source-remove','mask-target-add','mask-target-remove']);
+function reviewFor(target,source,pair){
+ const selection=maskSelectionFor(pair);
+ if(!selection)throw Error('请先使用「差异检查」框出需要处理的区域');
+ if(state.review?.pair===pair&&state.review.edit===selection)return state.review;
+ const {box,inspection}=inspectCurrentMask(target,source,pair,selection);
+ state.review={pair,edit:selection,box,
+   sourceMask:new Uint8Array(inspection.sourceMask),targetMask:new Uint8Array(inspection.targetMask),
+   summary:inspection.summary,history:[],touched:0};
+ state.reviewPreview=false;
+ return state.review;
+}
+function updateReviewMask(review,gesture,mode){
+ const {box}=review;if(!box)throw Error('缺少审阅区域');
+ const brushBox=getBounds(gesture,box.x+box.w,box.y+box.h);
+ if(!brushBox)return 0;
+ const patch=brushOrSelectionMask(gesture,box.x,box.y,box.w,box.h);
+ const key=mode.startsWith('mask-source')?'sourceMask':'targetMask';
+ const value=mode.endsWith('add')?1:0;
+ review.history.push({sourceMask:new Uint8Array(review.sourceMask),targetMask:new Uint8Array(review.targetMask)});
+ if(review.history.length>15)review.history.shift();
+ let changed=0;
+ for(let i=0;i<box.w*box.h;i++)if(patch[i*4+3]>=128&&review[key][i]!==value){review[key][i]=value;changed++}
+ if(!changed)review.history.pop();else {review.touched++;state.reviewPreview=false;} 
+ return changed;
+}
+function reviewEdit(){
+ if(nativeEngine.enabled)throw Error('人工掩码审阅目前仅支持免安装 Lite 引擎。请切换 Lite 后使用');
+ const r=state.review;
+ if(!r||r.pair!==current())throw Error('当前页没有掩码审阅');
+ if(!r.touched)throw Error('请先用红绿掩码补画/擦除工具进行人工修正，再申请修复');
+ return reviewedEdit(r,$('maskRepairMode').value);
+}
+function showReviewButtons(){
+ const has=!!state.review&&state.review.pair===current();
+ for(const id of ['previewReview','applyReview','resetReview','reviewUndo']){
+  const el=$(id);if(el)el.disabled=!has||(id==='reviewUndo'&&!state.review.history.length);
+ }
+}
+$('reviewUndo').addEventListener('click',()=>{
+ const r=state.review;if(!r?.history.length)return;
+ const h=r.history.pop();r.sourceMask=h.sourceMask;r.targetMask=h.targetMask;r.touched=Math.max(0,r.touched-1);
+ showReviewButtons();renderPage();
+});
+$('maskRepairMode').addEventListener('change',()=>{state.reviewPreview=false;});
+$('resetReview').addEventListener('click',()=>{state.review=null;state.reviewPreview=false;showReviewButtons();renderPage();});
+$('previewReview').addEventListener('click',()=>{
+ try{reviewEdit();state.reviewPreview=true;state.view='result';
+ document.querySelectorAll('[data-view]').forEach(b=>b.classList.toggle('active',b.dataset.view==='result'));
+ renderPage();toast('这是临时修复预览，尚未保存为正式编辑；确认画质后再点击应用');}
+ catch(e){toast(e.message)}
+});
+$('applyReview').addEventListener('click',()=>{
+ try{
+  const edit=reviewEdit(),p=current();
+  if(!state.reviewPreview){toast('先点击「预览修复」，检查原始线条有没有受损');return}
+  if(!confirm('确认应用人工修正的 SOURCE/TARGET 掩码？复杂网点的修补仍可能有痕迹；之后可撤销或右键恢复。'))return;
+  p.undo.push(structuredClone(p.edits));if(p.undo.length>50)p.undo.shift();p.redo=[];p.edits.push(edit);
+  state.reviewPreview=false;state.review=null;state.inspection=null;state.view='result';
+  state.pendingStroke=null;updateUI();toast('已应用人工审阅掩码，可 Ctrl/⌘+Z 撤销');
+ }catch(e){toast(e.message)}
+});
 async function renderPage(){
  const stamp=++state.stamp;const p=current();if(!p){$('emptyState').classList.remove('hidden');$('canvasScroller').classList.add('hidden');$('imageDims').textContent='未加载图片';return}
  try{
@@ -322,10 +385,13 @@ async function renderPage(){
      const tail=response.receipts.at(-1);
      $('renderHint').textContent='原生 Python 处理 · '+(tail?tail.mode+' · '+(tail.changed??0)+' 处像素变更':'已处理')+
        '；预览与导出调用同一原生区域处理函数；画笔越界写入由桌面源码校验';
-   }else if(state.view==='result'){const guarded=[],strokeResults=[];const composite=compose(target,source,p,{threshold:state.threshold,paper:state.paper,onGuard:(reason,edit)=>guarded.push({reason,edit}),onStrokeResult:(edit,result)=>strokeResults.push({edit,result})});
+   }else if(state.view==='result'){const guarded=[],strokeResults=[];
+     const renderedPair=state.reviewPreview&&state.review?.pair===p?{...p,edits:[...p.edits,reviewEdit()]}:p;
+     const composite=compose(target,source,renderedPair,{threshold:state.threshold,paper:state.paper,onGuard:(reason,edit)=>guarded.push({reason,edit}),onStrokeResult:(edit,result)=>strokeResults.push({edit,result})});
      if(guarded.length){$('renderHint').textContent='⚠ '+guarded.at(-1).reason+'。请检查配准或缩小画笔。';}
      else $('renderHint').textContent='纯色区域贴字；建筑／网点等复杂背景自动采用 SOURCE 配准纹理，不会涂白；纹理色差需要人工检查';
      ctx.drawImage(composite,0,0);composite.width=0;composite.height=0;
+     if(state.reviewPreview&&state.review?.pair===p)$('renderHint').textContent='人工掩码临时预览（尚未应用）·请逐一检查彩色线条、灰度网点与文字完整度；不满意返回差异掩码修改';
      const newest=state.pendingStroke;
      if(newest&&newest.pair===p&&p.edits.at(-1)===newest.edit){
        state.pendingStroke=null;
@@ -348,13 +414,15 @@ async function renderPage(){
    else if(state.view==='masks'){
      ctx.drawImage(target,0,0);
      try{
-       const {box,inspection}=inspectCurrentMask(target,source,p,maskSelectionFor(p));
+       const review=reviewFor(target,source,p),{box}=review;
+       const inspection={sourceMask:review.sourceMask,targetMask:review.targetMask,summary:review.summary};
+       showReviewButtons();
        const maskCanvas=document.createElement('canvas');maskCanvas.width=box.w;maskCanvas.height=box.h;
        const mc=maskCanvas.getContext('2d');const image=mc.createImageData(box.w,box.h);
        image.data.set(maskOverlay(inspection,box.w,box.h));mc.putImageData(image,0,0);
        ctx.drawImage(maskCanvas,box.x,box.y);maskCanvas.width=maskCanvas.height=0;
        const x=inspection.summary;
-       $('renderHint').textContent=`只读掩码 · 绿 SOURCE 中文候选 ${x.sourceCandidates}px · 红 TARGET 日文候选 ${x.targetCandidates}px · 公共结构 ${Math.round(x.structuralSupport*100)}% · ⚠ ${x.caution}`;
+       $('renderHint').textContent=`人工审阅掩码 · 绿 SOURCE 中文候选 ${x.sourceCandidates}px · 红 TARGET 日文候选 ${x.targetCandidates}px · 公共结构 ${Math.round(x.structuralSupport*100)}% · ⚠ ${x.caution}`;
      }catch(error){$('renderHint').textContent='掩码尚未生成：'+error.message;}
    }
    else if(state.view==='target')ctx.drawImage(target,0,0);
@@ -396,7 +464,7 @@ function drawOverlay(){
  const e=state.gesture;
  if(!e){
   const pointer=state.hover;
-  if(pointer && ['paint-transfer','erase','clone','restore','mask-inspect'].includes(state.tool)){
+  if(pointer && ['paint-transfer','erase','clone','restore','mask-inspect',...reviewTools].includes(state.tool)){
    oc.save();oc.setLineDash([5,4]);oc.strokeStyle='#21c9bd';oc.fillStyle='#00dfca1b';
    oc.lineWidth=Math.max(2,over.width/700);
    oc.beginPath();oc.arc(pointer.x,pointer.y,state.brush/2,0,Math.PI*2);oc.fill();oc.stroke();oc.restore();
@@ -420,8 +488,9 @@ over.addEventListener('pointerdown',e=>{
    if(pairNeedsAlignment(p))void alignPage(p);
    return;
  }
- if(state.view!=='result'){state.view='result';document.querySelectorAll('[data-view]').forEach(b=>b.classList.toggle('active',b.dataset.view==='result'));/* Deferred redraw until stroke completes to retain pointer capture. */}
- const tool=rightRestore?'restore':state.tool;
+ if(state.view!=='result'&&!reviewTools.has(state.tool)&&!(rightRestore&&state.view==='masks')){state.view='result';document.querySelectorAll('[data-view]').forEach(b=>b.classList.toggle('active',b.dataset.view==='result'));/* Deferred redraw until stroke completes to retain pointer capture. */}
+ const tool=rightRestore?(state.view==='masks'?'mask-target-remove':'restore'):state.tool;
+ if(reviewTools.has(tool)&&(!state.review||state.review.pair!==current())){toast('请先使用差异检查圈选区域');return}
  const shape=['ellipse','rect'].includes(tool)?tool:'brush';
  state.gesture={kind:['ellipse','rect','paint-transfer'].includes(tool)?'transfer':tool,
    mode:state.transferMode,shape,start:point,end:point,points:shape==='brush'?[point]:undefined,
@@ -435,7 +504,12 @@ function finishGesture(e){const g=state.gesture;if(!g)return;state.gesture=null;
    const p=current();if(!p)return;
    state.inspection={pair:p,edit:g};state.view='masks';
    document.querySelectorAll('[data-view]').forEach(b=>b.classList.toggle('active',b.dataset.view==='masks'));
-   renderPage();toast('差异掩码：绿色候选中文、红色候选日文；只是诊断，不会修改或清除漫画');return;
+   renderPage();toast('差异候选已生成。先调整红绿掩码，预览修复，再显式确认应用。');return;
+ }
+ if(reviewTools.has(g.kind)){
+   const r=state.review;if(!r||r.pair!==current()){toast('请先绘制差异检查选区');return}
+   const n=updateReviewMask(r,g,g.kind);showReviewButtons();renderPage();
+   toast(n?`已${g.kind.includes('source')?'修改 SOURCE 中文':'修改 TARGET 日文'}掩码 ${n} 像素`:'这次笔画未改变候选掩码');return;
  }
  if(g.shape!=='brush'&&(Math.abs(g.end.x-g.start.x)<10||Math.abs(g.end.y-g.start.y)<10)){toast('选区太小，请拖动较大的气泡内部区域');return}
  const p=current();if(!p)return;p.undo.push(structuredClone(p.edits));if(p.undo.length>50)p.undo.shift();p.redo=[];p.edits.push(g);state.pendingStroke=g.kind==='transfer'?{pair:p,edit:g}:null;
@@ -450,7 +524,7 @@ $('undoButton').addEventListener('click',undo);$('redoButton').addEventListener(
 $('clearEdits').addEventListener('click',()=>{const p=current();if(!p||!p.edits.length)return;if(!confirm('清空本页全部编辑？可以用撤销恢复。'))return;p.undo.push(structuredClone(p.edits));p.edits=[];p.redo=[];updateUI()});
 document.addEventListener('keydown',e=>{if(['INPUT','SELECT','TEXTAREA'].includes(document.activeElement.tagName))return;if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='z'){e.preventDefault();e.shiftKey?redo():undo()}if(e.key==='ArrowRight')goPage(state.index+1);if(e.key==='ArrowLeft')goPage(state.index-1);if(e.key==='['||e.key===']'){e.preventDefault();updateBrushSize(state.brush+(e.key===']'?8:-8))}});
 async function exportOne(){const p=current();if(!p)return;
- if(p.edits.some(e=>e.kind==='transfer')&&!isRegistered(p)){toast('本页含未配准的迁移操作，禁止错位导出；请先自动配准');return;}
+ if(p.edits.some(e=>['transfer','reviewed'].includes(e.kind))&&!isRegistered(p)){toast('本页含未配准的迁移操作，禁止错位导出；请先自动配准');return;}
  busy(true,'生成 PNG','按原始 TARGET 分辨率合成...');try{
    let blob;
    if(nativeEngine.enabled && p.edits.length){
@@ -467,7 +541,7 @@ $('exportAll').addEventListener('click',async()=>{
  const zip=new JSZip(),dir=zip.folder('Folirina_Output');let count=0;
  for(let i=0;i<state.pairs.length;i++){
   const p=state.pairs[i];if(p.skip)continue;
-  if(p.edits.some(e=>e.kind==='transfer')&&!isRegistered(p))throw Error(`第 ${i+1} 页包含未配准文字迁移，请先自动配准，避免错位导出`);
+  if(p.edits.some(e=>['transfer','reviewed'].includes(e.kind))&&!isRegistered(p))throw Error(`第 ${i+1} 页包含未配准文字迁移，请先自动配准，避免错位导出`);
   $('busyDetail').textContent=`合成页面 ${i+1}/${state.pairs.length}`;
   const t=await bitmap(state.targets[p.tgt]),s=p.src===null?null:await bitmap(state.sources[p.src]);
   let blob;
@@ -485,10 +559,11 @@ $('exportMasks').addEventListener('click',async()=>{
  busy(true,'导出差异掩码','分别提取 SOURCE / TARGET 的候选字形...');
  try{
   const [target,source]=await Promise.all([bitmap(currentTarget()),currentSrc()?bitmap(currentSrc()):null]);
-  const {box,inspection}=inspectCurrentMask(target,source,p,maskSelectionFor(p));
+  const review=state.review?.pair===p?state.review:null;
+  const {box,inspection}=review?{box:review.box,inspection:{sourceMask:review.sourceMask,targetMask:review.targetMask,summary:review.summary}}:inspectCurrentMask(target,source,p,maskSelectionFor(p));
   const zip=new JSZip();const files=[['source_candidates.png',inspection.sourceMask],['target_candidates.png',inspection.targetMask]];
   for(const [name,mask] of files){const image=oneMaskPng(mask,box.w,box.h);const blob=await canvasBlob(image);zip.file(name,blob);image.width=image.height=0}
-  zip.file('diagnostic.json',JSON.stringify({page:currentTarget().name,bounds:box,summary:inspection.summary,warning:'仅候选区域，非可靠的文字识别；不得未经检查直接擦除'},null,2));
+  zip.file('diagnostic.json',JSON.stringify({page:currentTarget().name,bounds:box,summary:inspection.summary,reviewed:!!review,warning:review?'包含人工作出的掩码修订；背景重建仍可能失真':'仅候选区域，未经检查不得直接擦除'},null,2));
   download(await zip.generateAsync({type:'blob',compression:'DEFLATE'}),safeName(currentTarget().name)+'_dual_masks.zip');
   toast('已导出 SOURCE／TARGET 独立候选掩码，仅供人工对照');
  }catch(err){toast('掩码导出失败：'+err.message)}finally{busy(false)}
@@ -516,8 +591,15 @@ $('projectInput').addEventListener('change',async e=>{
   const items=[];for(let i=0;i<descs.length;i++){const d=descs[i],entry=zip.file(d.path);if(!entry||!/^(source|target)\/\d{4,}\.(png|jpe?g|webp|bmp|gif)$/i.test(d.path))throw Error('工作区图像缺失或路径非法');const blob=await entry.async('blob');items.push({id:`workspace-${kind}-${i}-${Date.now()}`,name:d.name,blob,url:URL.createObjectURL(blob)})}
   if(kind==='source')newSources=items;else newTargets=items;
  }
- const pairs=data.pairs.map((p,i)=>{if((p.homography!=null&&(!Array.isArray(p.homography)||p.homography.length!==9||p.homography.some(n=>typeof n!=='number'||!Number.isFinite(n)||Math.abs(n)>100000)))||p.tgt!==i||!(p.src===null||Number.isInteger(p.src)&&p.src>=0&&p.src<newSources.length)||!Array.isArray(p.edits)||p.edits.length>5000||p.edits.some(e=>!'transfer erase clone restore'.split(' ').includes(e.kind)||!'rect ellipse brush'.split(' ').includes(e.shape))||(p.affine!==null&&p.affine!==undefined&&(!Array.isArray(p.affine)||p.affine.length!==6||p.affine.some(n=>typeof n!=='number'||!Number.isFinite(n)||Math.abs(n)>100000))))throw Error('配对数据错误');return {...defaultPair(i,newSources.length),...p,undo:[],redo:[]}});
- releaseItems(state.sources);releaseItems(state.targets);state.sources=newSources;state.targets=newTargets;state.pairs=pairs;state.index=Math.min(Math.max(0,data.index||0),pairs.length-1);newSources=[];newTargets=[];updateUI();toast(`工作区加载成功，共 ${pairs.length} 页`);
+ const pairs=data.pairs.map((p,i)=>{if((p.homography!=null&&(!Array.isArray(p.homography)||p.homography.length!==9||p.homography.some(n=>typeof n!=='number'||!Number.isFinite(n)||Math.abs(n)>100000)))||p.tgt!==i||!(p.src===null||Number.isInteger(p.src)&&p.src>=0&&p.src<newSources.length)||!Array.isArray(p.edits)||p.edits.length>5000||p.edits.some(e=>!'transfer erase clone restore reviewed'.split(' ').includes(e.kind)||!'rect ellipse brush'.split(' ').includes(e.shape))||(p.affine!==null&&p.affine!==undefined&&(!Array.isArray(p.affine)||p.affine.length!==6||p.affine.some(n=>typeof n!=='number'||!Number.isFinite(n)||Math.abs(n)>100000))))throw Error('配对数据错误');for(const edit of p.edits){
+ if(edit.kind==='reviewed'){
+   const b=edit.box;
+   if(!b||![b.x,b.y,b.w,b.h].every(Number.isInteger)||b.x<0||b.y<0||b.w<1||b.h<1||b.w*b.h>4_000_000||
+      !['neighbors','source'].includes(edit.repairMode)||!['sourceBits','targetBits'].every(k=>typeof edit[k]==='string'&&edit[k].length<=700000&&edit[k].length===4*Math.ceil(Math.ceil(b.w*b.h/8)/3)))
+      throw Error('工作区包含无效或过大的人工审核掩码');
+ }
+ }return {...defaultPair(i,newSources.length),...p,undo:[],redo:[]}});
+ releaseItems(state.sources);releaseItems(state.targets);state.sources=newSources;state.targets=newTargets;state.pairs=pairs;state.inspection=null;state.review=null;state.reviewPreview=false;state.index=Math.min(Math.max(0,data.index||0),pairs.length-1);newSources=[];newTargets=[];updateUI();toast(`工作区加载成功，共 ${pairs.length} 页`);
  }catch(err){releaseItems(newSources);releaseItems(newTargets);toast(`加载失败：${err.message}`);console.error(err)}finally{busy(false)}
 });
 if('serviceWorker' in navigator && location.protocol.startsWith('http'))navigator.serviceWorker.register('./sw.js').catch(()=>{});
