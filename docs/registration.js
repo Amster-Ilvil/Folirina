@@ -1,3 +1,4 @@
+import {fitHomography,toFullResolution,mapH} from './homography.js';
 /* Non-AI browser image registration.
  * Gradient corners + local normalized cross-correlation + 3-point affine RANSAC.
  * Unlike the legacy translation-only estimate, X and Y scaling are independent;
@@ -136,13 +137,21 @@ export async function registerAffineGrays(source,target,onProgress){
   const hit=nccMatch(a,b,corners[i]);if(hit)matches.push(hit);
   if(i%18===17){onProgress?.(`匹配画面特征 ${i+1}/${corners.length}`);await new Promise(resolve=>setTimeout(resolve,0));}
  }
- const result=fitAffineRansac(matches,source.width,source.height);
- if(!result)throw Error(`特征匹配无法通过安全验证（匹配 ${matches.length} 处），请检查 SOURCE 配对页或使用桌面版`);
+ let result=fitAffineRansac(matches,source.width,source.height);
+ if(!result){
+   const fallback=fitHomography(matches,source.width,source.height,target.width,target.height,null);
+   if(!fallback)throw Error(`仿射与透视配准都未通过验证（匹配 ${matches.length} 处），请核对中日页面是否对应`);
+   const inliers=matches.filter(p=>{const [u,v]=mapH(fallback.matrix,p.x,p.y);return Math.hypot(u-p.u,v-p.v)<2.8});
+   const approx=refineAffine(inliers);
+   if(!approx)throw Error('透视配准几何退化，未应用不可靠的变换');
+   result={matrix:approx,inliers:inliers.length,total:matches.length,medianError:fallback.medianError,coverage:[1,1],homography:fallback};
+ }
  // Reject narrow, ambiguous clusters (e.g. mostly text-only low-coverage pages).
  // A few good-looking matches are not proof of safe whole-page registration.
  if(result.inliers<35 || result.inliers/Math.max(1,matches.length)<.35)
    throw Error(`可靠配准证据不足（${result.inliers}/${matches.length} 个一致特征）；需要人工核对或桌面版`);
- return {...result,features:corners.length};
+ const homography=result.homography||fitHomography(matches,source.width,source.height,target.width,target.height,result.matrix);
+ return {...result,homography,features:corners.length};
 }
 export async function estimateBrowserAffine(sourceBitmap,targetBitmap,onProgress){
  // Normalize EACH image independently; same absolute ratio makes matching
@@ -154,5 +163,6 @@ export async function estimateBrowserAffine(sourceBitmap,targetBitmap,onProgress
  const m=outcome.matrix;
  const ssx=source.width/sourceBitmap.width,ssy=source.height/sourceBitmap.height;
  const tsx=target.width/targetBitmap.width,tsy=target.height/targetBitmap.height;
- return {...outcome,matrix:[m[0]*ssx/tsx,m[1]*ssx/tsy,m[2]*ssy/tsx,m[3]*ssy/tsy,m[4]/tsx,m[5]/tsy]};
+ const fullH=outcome.homography?.matrix?toFullResolution(outcome.homography.matrix,source.width,source.height,target.width,target.height,sourceBitmap.width,sourceBitmap.height,targetBitmap.width,targetBitmap.height):null;
+ return {...outcome,homography:fullH,matrix:[m[0]*ssx/tsx,m[1]*ssx/tsy,m[2]*ssy/tsx,m[3]*ssy/tsy,m[4]/tsx,m[5]/tsy]};
 }

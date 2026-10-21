@@ -68,11 +68,21 @@ $('engineToggle').addEventListener('click',()=>{
  document.querySelector('[data-transfer-mode=precision]').disabled=!nativeEngine.enabled;
  if(!nativeEngine.enabled&&state.transferMode==='precision'){state.transferMode='hole';document.querySelectorAll('[data-transfer-mode]').forEach(b=>b.classList.toggle('active',b.dataset.transferMode==='hole'));}
  $('engineToggle').textContent='引擎：'+(nativeEngine.enabled?'原生 Python':'浏览器 Lite');
- for(const p of state.pairs){if(!p.edits.length){p.affine=null;p.nativeMatrix=null;p.alignDiagnostics=null;p.alignError=null;}}
+ for(const p of state.pairs){if(!p.edits.length){p.affine=null;p.homography=null;p.nativeMatrix=null;p.alignDiagnostics=null;p.alignError=null;}}
  toast(nativeEngine.enabled?'原生引擎模式：配准及区域合成使用桌面 Python 代码':'已返回纯浏览器 Lite 模式');
  updateUI();
 });
-void engineInit();
+// GitHub Pages is a self-contained browser tool. Keep the optional native
+// engine available ONLY when a user intentionally opens the local server.
+// Public visitors should not see a disabled Python-only processing option.
+const runningLocal=/^(localhost|127\.0\.0\.1)$/.test(location.hostname);
+if(runningLocal){void engineInit();}
+else{
+ for(const el of [$('engineToggle'),$('engineStatus'),document.querySelector('.engine-help'),document.querySelector('[data-transfer-mode="precision"]')]){
+   if(el)el.style.display='none';
+ }
+}
+
 
 // Display transform is independent of document edits. Never recompute fit on a stroke.
 const zoomState={mode:'fit',percent:100,pageId:null};
@@ -145,7 +155,7 @@ async function importImages(kind,files){
    if(items.length>1000)throw Error('单批最多导入 1000 页');
    const old=kind==='source'?state.sources:state.targets;
    releaseItems(old);
-   if(kind==='source'){state.sources=items;state.pairs.forEach(p=>{p.edits=[];p.undo=[];p.redo=[];p.dx=0;p.dy=0;p.scale=1;p.affine=null;p.nativeMatrix=null;p.alignDiagnostics=null;p.alignError=null});freshPairsForSources()}else{state.targets=items;createPairs()}
+   if(kind==='source'){state.sources=items;state.pairs.forEach(p=>{p.edits=[];p.undo=[];p.redo=[];p.dx=0;p.dy=0;p.scale=1;p.affine=null;p.homography=null;p.nativeMatrix=null;p.alignDiagnostics=null;p.alignError=null});freshPairsForSources()}else{state.targets=items;createPairs()}
    toast(`已导入 ${items.length} 张${kind==='source'?'中文 SOURCE':'日文 TARGET'}图片`);
  }catch(err){toast(`导入失败：${err.message}`);console.error(err)}finally{busy(false);updateUI()}
 }
@@ -175,9 +185,9 @@ function updateUI(){
  $('sourceSelect').value=p&&p.src!==null?String(p.src):'';
  $('skipPage').checked=!!p?.skip;
  $('alignX').value=p?.dx||0;$('alignY').value=p?.dy||0;$('alignScale').value=100*(p?.scale||1);$('scaleValue').textContent=((p?.scale||1)*100).toFixed(1)+'%';
- $('alignStatus').textContent=isRegistered(p)?`已配准 · 一致特征 ${p.alignDiagnostics?.inliers??'?'} 组 · 中位误差 ${(p.alignDiagnostics?.medianError??0).toFixed(2)} px`:
+ $('alignStatus').textContent=isRegistered(p)?`已配准${p.homography?'（透视）':'（仿射）'} · 一致特征 ${p.alignDiagnostics?.inliers??'?'} 组 · 中位误差 ${(p.alignDiagnostics?.medianError??0).toFixed(2)} px`:
    pendingAlignment.has(p)?'正在自动配准当前页，请等待完成后再涂抹迁移':
-   p?.alignError?`配准失败：${p.alignError}。请核对 SOURCE 页面，或使用桌面版`:
+   p?.alignError?`配准失败：${p.alignError}。请核对 SOURCE 页面、重试或手动调整`:
    p?.src===null?'尚未配对中文 SOURCE':'尚未对齐：系统将自动计算，未对齐前禁止文字迁移';
  $('editCount').textContent=(p?.edits.length||0)+' 次编辑';$('clearEdits').disabled=!p||!p.edits.length;$('undoButton').disabled=!p||!p.undo.length;$('redoButton').disabled=!p||!p.redo.length;
  $('pairSummary').textContent=state.targets.length?`${state.pairs.filter(x=>x.src!==null).length} / ${state.pairs.length} 页已配对 · ${state.pairs.filter(x=>x.skip).length} 页跳过`:'按自然文件名顺序配对；请手工核对。';
@@ -188,7 +198,7 @@ function updateUI(){
 }
 function goPage(index){if(index<0||index>=state.pairs.length)return;state.index=index;state.cloneAnchor=null;state.hover=null;updateUI()}
 $('previousPage').addEventListener('click',()=>goPage(state.index-1));$('nextPage').addEventListener('click',()=>goPage(state.index+1));
-$('sourceSelect').addEventListener('change',e=>{const p=current();if(!p)return;if(p.edits.length&&!confirm('修改 SOURCE 配对会改变本页已有迁移结果，确定继续？')){e.target.value=String(p.src??'');return}p.src=e.target.value===''?null:Number(e.target.value);p.affine=null;p.nativeMatrix=null;p.alignDiagnostics=null;p.alignError=null;p.dx=0;p.dy=0;p.scale=1;updateUI()});
+$('sourceSelect').addEventListener('change',e=>{const p=current();if(!p)return;if(p.edits.length&&!confirm('修改 SOURCE 配对会改变本页已有迁移结果，确定继续？')){e.target.value=String(p.src??'');return}p.src=e.target.value===''?null:Number(e.target.value);p.affine=null;p.homography=null;p.nativeMatrix=null;p.alignDiagnostics=null;p.alignError=null;p.dx=0;p.dy=0;p.scale=1;updateUI()});
 $('skipPage').addEventListener('change',e=>{const p=current();if(p){p.skip=e.target.checked;updateUI()}});
 for(const name of ['alignX','alignY'])$(name).addEventListener('change',()=>{const p=current();if(!p)return;p.dx=Number($('alignX').value)||0;p.dy=Number($('alignY').value)||0;updateUI()});
 $('alignScale').addEventListener('input',()=>{$('scaleValue').textContent=Number($('alignScale').value).toFixed(1)+'%'});
@@ -224,11 +234,12 @@ async function alignPage(pair,{manual=false}={}){
      // Never use an outdated result if the user imported/re-paired another page.
      if(!state.pairs.includes(pair)||pair.src!==sourceIndex||pair.tgt!==targetIndex)return false;
      pair.affine=nativeEngine.enabled?result.affine:result.matrix;
+     pair.homography=nativeEngine.enabled?null:(result.homography||null);
      pair.nativeMatrix=nativeEngine.enabled?result.matrix:null;
      pair.alignDiagnostics={inliers:result.inliers,total:result.total,medianError:result.medianError,coverage:result.coverage,
-       method:result.method||'browser',confidence:result.confidence??null};
+       method:result.method||(result.homography?'browser-projective':'browser-affine'),confidence:result.confidence??null};
      pair.dx=0;pair.dy=0;pair.scale=1;pair.alignError=null;
-     if(pair===current())toast(`本页已自动配准（${result.inliers} 组特征）；请在叠加检查中确认线条重合`);
+     if(pair===current())toast(`本页已${result.homography?'透视':'仿射'}配准（${result.inliers} 组特征）；请在叠加检查中确认线条重合`);
      return true;
    }catch(e){
      if(state.pairs.includes(pair)&&pair.src===sourceIndex){
@@ -253,13 +264,13 @@ $('autoAlign').addEventListener('click',()=>{
 });
 $('resetAlign').addEventListener('click',()=>{
  const p=current();if(!p)return;if(p.edits.length&&!confirm('重置对齐会影响当前页的已有文字迁移，确定继续？'))return;
- p.affine=null;p.nativeMatrix=null;p.alignDiagnostics=null;p.alignError=null;p.dx=0;p.dy=0;p.scale=1;updateUI();toast('已重置对齐');
+ p.affine=null;p.homography=null;p.nativeMatrix=null;p.alignDiagnostics=null;p.alignError=null;p.dx=0;p.dy=0;p.scale=1;updateUI();toast('已重置对齐');
 });
 $('autoPair').addEventListener('click',async()=>{
  if(!state.sources.length||!state.targets.length)return;
  if(state.pairs.some(p=>p.edits.length)&&!confirm('智能配对会改变页面对应关系，从而影响已编辑页面的迁移效果。是否继续？'))return;
  busy(true,'非 AI 页面结构配对','提取小尺寸结构特征...');
- try{const oldPairs=state.pairs;state.pairs=await smartPairs(state.sources,state.targets,state.pairs,text=>$('busyDetail').textContent=text);state.pairs.forEach((p,i)=>{if(p.src!==oldPairs[i]?.src){p.affine=null;p.nativeMatrix=null;p.alignDiagnostics=null;p.alignError=null;p.dx=0;p.dy=0;p.scale=1}});toast('智能配对已完成；相似图片或封面仍可能配错，请核对后导出');updateUI()}
+ try{const oldPairs=state.pairs;state.pairs=await smartPairs(state.sources,state.targets,state.pairs,text=>$('busyDetail').textContent=text);state.pairs.forEach((p,i)=>{if(p.src!==oldPairs[i]?.src){p.affine=null;p.homography=null;p.nativeMatrix=null;p.alignDiagnostics=null;p.alignError=null;p.dx=0;p.dy=0;p.scale=1}});toast('智能配对已完成；相似图片或封面仍可能配错，请核对后导出');updateUI()}
  catch(e){toast(`智能配对失败：${e.message}`);console.error(e)}finally{busy(false)}
 });
 async function renderPage(){
@@ -442,7 +453,7 @@ $('projectInput').addEventListener('change',async e=>{
   const items=[];for(let i=0;i<descs.length;i++){const d=descs[i],entry=zip.file(d.path);if(!entry||!/^(source|target)\/\d{4,}\.(png|jpe?g|webp|bmp|gif)$/i.test(d.path))throw Error('工作区图像缺失或路径非法');const blob=await entry.async('blob');items.push({id:`workspace-${kind}-${i}-${Date.now()}`,name:d.name,blob,url:URL.createObjectURL(blob)})}
   if(kind==='source')newSources=items;else newTargets=items;
  }
- const pairs=data.pairs.map((p,i)=>{if(p.tgt!==i||!(p.src===null||Number.isInteger(p.src)&&p.src>=0&&p.src<newSources.length)||!Array.isArray(p.edits)||p.edits.length>5000||p.edits.some(e=>!'transfer erase clone restore'.split(' ').includes(e.kind)||!'rect ellipse brush'.split(' ').includes(e.shape))||(p.affine!==null&&p.affine!==undefined&&(!Array.isArray(p.affine)||p.affine.length!==6||p.affine.some(n=>typeof n!=='number'||!Number.isFinite(n)||Math.abs(n)>100000))))throw Error('配对数据错误');return {...defaultPair(i,newSources.length),...p,undo:[],redo:[]}});
+ const pairs=data.pairs.map((p,i)=>{if((p.homography!=null&&(!Array.isArray(p.homography)||p.homography.length!==9||p.homography.some(n=>typeof n!=='number'||!Number.isFinite(n)||Math.abs(n)>100000)))||p.tgt!==i||!(p.src===null||Number.isInteger(p.src)&&p.src>=0&&p.src<newSources.length)||!Array.isArray(p.edits)||p.edits.length>5000||p.edits.some(e=>!'transfer erase clone restore'.split(' ').includes(e.kind)||!'rect ellipse brush'.split(' ').includes(e.shape))||(p.affine!==null&&p.affine!==undefined&&(!Array.isArray(p.affine)||p.affine.length!==6||p.affine.some(n=>typeof n!=='number'||!Number.isFinite(n)||Math.abs(n)>100000))))throw Error('配对数据错误');return {...defaultPair(i,newSources.length),...p,undo:[],redo:[]}});
  releaseItems(state.sources);releaseItems(state.targets);state.sources=newSources;state.targets=newTargets;state.pairs=pairs;state.index=Math.min(Math.max(0,data.index||0),pairs.length-1);newSources=[];newTargets=[];updateUI();toast(`工作区加载成功，共 ${pairs.length} 页`);
  }catch(err){releaseItems(newSources);releaseItems(newTargets);toast(`加载失败：${err.message}`);console.error(err)}finally{busy(false)}
 });

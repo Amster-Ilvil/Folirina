@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#0c1020">
-  <meta name="description" content="Folirina Web Lite — 中文漫画 SOURCE 与高清日文 TARGET 本地对齐、遮罩、Direct Patch 和批量导出。无需模型，不上传图片。">
-  <title>Folirina Web v0.3.0 · 漫画修复工作台</title>
+  <meta name="description" content="Folirina Web Lite — 中文漫画 SOURCE 与高清日文 TARGET 本地对齐、遮罩、Direct Patch 和批量导出。不需要 AI 模型、不上传漫画图片；按质量门槛选择仿射或透视配准。">
+  <title>Folirina Web v0.3.1 · 漫画修复工作台</title>
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="icon" type="image/png" href="icon-192.png">
   <link rel="stylesheet" href="styles.css">
@@ -13,7 +13,7 @@
 <body>
   <div class="app-shell">
     <header class="topbar">
-      <div class="brand"><div class="brand-mark">F<span>✦</span></div><div><strong>Folirina <em>Web v0.3.0</em></strong><small>漫画文字迁移 · 浏览器本地工作台</small></div></div>
+      <div class="brand"><div class="brand-mark">F<span>✦</span></div><div><strong>Folirina <em>Web v0.3.1</em></strong><small>漫画文字迁移 · 浏览器本地工作台</small></div></div>
       <div class="top-actions"><button id="engineToggle" class="button ghost" type="button" disabled title="原生功能需要启动本机 Folirina Python 服务。GitHub Pages 仍为免费纯浏览器 Lite 版。">引擎：浏览器 Lite</button><span class="engine-status" id="engineStatus" title="原生功能需要从本机启动 python tools/web_bridge.py">仅浏览器</span><a class="engine-help" href="native.html" target="_blank" rel="noopener">原生引擎说明</a><span class="privacy"><span class="live-dot"></span> 本地处理 · 不上传图片</span><button id="openProject" class="button ghost" type="button">打开工作区</button><button id="saveProject" class="button ghost" type="button">保存工作区</button><button id="exportAll" class="button primary" type="button">导出整册 ZIP <span class="btn-arrow">↗</span></button></div>
     </header>
     <main class="layout">
@@ -58,7 +58,7 @@
     </main>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
     <div id="busy" class="busy hidden" role="alert"><div class="loader"></div><div><strong id="busyTitle">处理中</strong><small id="busyDetail">请不要关闭页面</small></div></div>
-    <footer class="statusbar"><span>Folirina Web Lite · 基于 <a href="https://github.com/Amster-Ilvil/Folirina" target="_blank" rel="noopener noreferrer">Folirina</a> 的非 AI 图像工作流</span><span>GitHub main 基线：<code>b87edcd</code> · 图片不经过服务器</span></footer>
+    <footer class="statusbar"><span>Folirina Web Lite · 基于 <a href="https://github.com/Amster-Ilvil/Folirina" target="_blank" rel="noopener noreferrer">Folirina</a> 的非 AI 图像工作流</span><span>浏览器端仿射／透视配准 · 图片不经过服务器</span></footer>
   </div>
   <script src="vendor/jszip.min.js"></script>
   <script type="module" src="app.js"></script>

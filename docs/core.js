@@ -1,3 +1,4 @@
+import {invertH} from './homography.js';
 import {samplePaper,applyProtectedInk,applyRegisteredTexturePatch} from './color_composite.js';
 /* Folirina Web Lite. Non-AI port informed by Folirina's page_pairing, registration and direct_patch modules.
    Target is always the immutable original base. No original pixels are overwritten. */
@@ -29,7 +30,7 @@ export async function unpack(files,prefix){
  return out.sort((a,b)=>naturalCompare(a.name,b.name));
 }
 export function releaseItems(items){items.forEach(i=>URL.revokeObjectURL(i.url));clearBitmaps()}
-export function defaultPair(targetIndex,sourceCount){return {tgt:targetIndex,src:targetIndex<sourceCount?targetIndex:null,skip:false,dx:0,dy:0,scale:1,affine:null,alignDiagnostics:null,edits:[],undo:[],redo:[],score:null}}
+export function defaultPair(targetIndex,sourceCount){return {tgt:targetIndex,src:targetIndex<sourceCount?targetIndex:null,skip:false,dx:0,dy:0,scale:1,affine:null,homography:null,alignDiagnostics:null,edits:[],undo:[],redo:[],score:null}}
 export function nativeCanvas(w,h){const c=document.createElement('canvas');c.width=w;c.height=h;return c}
 export function brushOrSelectionMask(edit,x,y,w,h){
  const c=nativeCanvas(w,h),cx=c.getContext('2d');cx.fillStyle='#fff';cx.strokeStyle='#fff';cx.lineCap='round';cx.lineJoin='round';
@@ -55,9 +56,43 @@ export function getBounds(edit,W,H){
  const xx=clamp(Math.ceil(Math.max(...pts.map(p=>p.x))+r),0,W),yy=clamp(Math.ceil(Math.max(...pts.map(p=>p.y))+r),0,H);
  return xx>x&&yy>y?{x,y,w:xx-x,h:yy-y}:null;
 }
+const projectiveCache=new WeakMap();
+function projectiveSourceCanvas(source,W,H,pair){
+ const H0=pair.homography,zoom=pair.scale||1,midX=W/2,midY=H/2;
+ const sx=midX*(1-zoom)+(pair.dx||0),sy=midY*(1-zoom)+(pair.dy||0);
+ const h=[zoom*H0[0]+sx*H0[6],zoom*H0[1]+sx*H0[7],zoom*H0[2]+sx*H0[8],
+  zoom*H0[3]+sy*H0[6],zoom*H0[4]+sy*H0[7],zoom*H0[5]+sy*H0[8],H0[6],H0[7],H0[8]];
+ const key=W+'/'+H+'/'+h.map(n=>n.toFixed(8)).join('/');
+ const old=projectiveCache.get(source);
+ if(old?.key===key)return old.canvas;
+ const inv=invertH(h);if(!inv)throw Error('透视配准矩阵不可逆');
+ const from=nativeCanvas(source.width,source.height),fc=from.getContext('2d',{willReadFrequently:true});fc.drawImage(source,0,0);
+ const pixels=fc.getImageData(0,0,source.width,source.height).data;
+ const out=nativeCanvas(W,H),oc=out.getContext('2d',{willReadFrequently:true});
+ const image=oc.createImageData(W,H),data=image.data,sw=source.width,sh=source.height;
+ // Incremental projective coordinates avoid 9 multiplications per output pixel.
+ // Bilinear filtering is essential for gray screentones / fine manga contours.
+ for(let y=0;y<H;y++){
+  let ax=inv[1]*y+inv[2],ay=inv[4]*y+inv[5],aw=inv[7]*y+inv[8];
+  for(let x=0;x<W;x++,ax+=inv[0],ay+=inv[3],aw+=inv[6]){
+   if(aw<=1e-10)continue;
+   const fx=ax/aw,fy=ay/aw;
+   if(fx<0||fy<0||fx>=sw-1||fy>=sh-1)continue;
+   const xx=Math.floor(fx),yy=Math.floor(fy),rx=fx-xx,ry=fy-yy;
+   const i=(yy*sw+xx)*4,j=(y*W+x)*4;
+   const a=(1-rx)*(1-ry),b=rx*(1-ry),c=(1-rx)*ry,d=rx*ry;
+   for(let k=0;k<4;k++)data[j+k]=Math.round(pixels[i+k]*a+pixels[i+4+k]*b+pixels[i+sw*4+k]*c+pixels[i+sw*4+4+k]*d);
+  }
+ }
+ oc.putImageData(image,0,0);from.width=from.height=0;
+ // One cached high-resolution warp per loaded bitmap; repeated brush strokes
+ // do not reprocess the entire page unless registration settings change.
+ projectiveCache.set(source,{key,canvas:out});return out;
+}
 export function warpedSource(source,targetWidth,targetHeight,pair){
  const c=nativeCanvas(targetWidth,targetHeight);const ctx=c.getContext('2d',{willReadFrequently:true});
  if(source){
+  if(Array.isArray(pair.homography)&&pair.homography.length===9&&pair.homography.every(Number.isFinite))return projectiveSourceCanvas(source,targetWidth,targetHeight,pair);
   if(Array.isArray(pair.affine)&&pair.affine.length===6&&pair.affine.every(Number.isFinite)){
    const [a,b,c,d,e,f]=pair.affine,zoom=pair.scale||1;
    const midX=targetWidth/2,midY=targetHeight/2;
