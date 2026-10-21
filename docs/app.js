@@ -601,7 +601,7 @@ $('projectInput').addEventListener('change',async e=>{
  if(edit.kind==='reviewed'){
    const b=edit.box;
    if(!b||![b.x,b.y,b.w,b.h].every(Number.isInteger)||b.x<0||b.y<0||b.w<1||b.h<1||b.w*b.h>4_000_000||
-      !['neighbors','source'].includes(edit.repairMode)||!['sourceBits','targetBits'].every(k=>typeof edit[k]==='string'&&edit[k].length<=700000&&edit[k].length===4*Math.ceil(Math.ceil(b.w*b.h/8)/3)))
+      !['neighbors','source','directional'].includes(edit.repairMode)||!['sourceBits','targetBits'].every(k=>typeof edit[k]==='string'&&edit[k].length<=700000&&edit[k].length===4*Math.ceil(Math.ceil(b.w*b.h/8)/3)))
       throw Error('工作区包含无效或过大的人工审核掩码');
  }
  }return {...defaultPair(i,newSources.length),...p,undo:[],redo:[]}});
