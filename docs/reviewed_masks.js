@@ -1,3 +1,4 @@
+import {repairDirectionalTarget} from './structure_repair.js';
 /**
  * Fully client-side, explicitly HUMAN-APPROVED text masks.
  * No automatic destructive authority: only separately reviewed source-writing
@@ -22,7 +23,7 @@ export function reviewedEdit(draft,repairMode='neighbors'){
  const {box,sourceMask,targetMask}=draft;
  if(box.w*box.h>4_000_000||sourceMask.length!==box.w*box.h||targetMask.length!==box.w*box.h)throw Error('掩码尺寸无效');
  if(!sourceMask.some(Boolean)||!targetMask.some(Boolean))throw Error('SOURCE 与 TARGET 掩码不能留空');
- if(!['neighbors','source'].includes(repairMode))throw Error('不支持的背景恢复方式');
+ if(!['neighbors','source','directional'].includes(repairMode))throw Error('不支持的背景恢复方式');
  return {kind:'reviewed',shape:'brush',box:{...box},repairMode,
    sourceBits:encodeBitMask(sourceMask),targetBits:encodeBitMask(targetMask)};
 }
@@ -35,9 +36,13 @@ export function applyReviewedTransfer(current,original,source,edit,w,h){
  if(!source||source.length!==n*4||original.length!==n*4||current.length!==n*4)throw Error('掩码源图/底图尺寸不匹配');
  const sourceMask=decodeBitMask(edit.sourceBits,n),targetMask=decodeBitMask(edit.targetBits,n);
  const next=new Uint8ClampedArray(current);
- let cleared=0,written=0,noDonor=0;
+ let cleared=0,written=0,noDonor=0,lineBridges=0,uncertain=0;
+ if(edit.repairMode==='directional'){
+   const stats=repairDirectionalTarget(next,original,targetMask,w,h);
+   ({cleared,noDonor,lineBridges,uncertain}=stats);
+ }
  for(let y=0;y<h;y++)for(let x=0;x<w;x++){
-   const p=y*w+x;if(!targetMask[p])continue;
+   const p=y*w+x;if(!targetMask[p]||edit.repairMode==='directional')continue;
    const j=p*4;
    if(edit.repairMode==='source' && source[j+3]>=240 && !sourceMask[p]){
      for(let c=0;c<3;c++)next[j+c]=source[j+c];
@@ -66,5 +71,5 @@ export function applyReviewedTransfer(current,original,source,edit,w,h){
  }
  let changed=0;for(let p=0;p<n;p++){const j=p*4;if(next[j]!==current[j]||next[j+1]!==current[j+1]||next[j+2]!==current[j+2])changed++}
  current.set(next);
- return {applied:changed>0,changed,cleared,written,noDonor,method:'reviewed-source-target-masks'};
+ return {applied:changed>0,changed,cleared,written,noDonor,lineBridges,uncertain,method:'reviewed-source-target-masks'};
 }

@@ -391,7 +391,13 @@ async function renderPage(){
      if(guarded.length){$('renderHint').textContent='⚠ '+guarded.at(-1).reason+'。请检查配准或缩小画笔。';}
      else $('renderHint').textContent='纯色区域贴字；建筑／网点等复杂背景自动采用 SOURCE 配准纹理，不会涂白；纹理色差需要人工检查';
      ctx.drawImage(composite,0,0);composite.width=0;composite.height=0;
-     if(state.reviewPreview&&state.review?.pair===p)$('renderHint').textContent='人工掩码临时预览（尚未应用）·请逐一检查彩色线条、灰度网点与文字完整度；不满意返回差异掩码修改';
+     if(state.reviewPreview&&state.review?.pair===p){
+       const result=strokeResults.find(r=>r.edit.kind==='reviewed')?.result;
+       const extra=$('maskRepairMode').value==='directional'&&result
+         ?` · 定向连接 ${result.lineBridges??0} 像素，普通邻域修复 ${result.uncertain??0} 像素`
+         :'';
+       $('renderHint').textContent='人工掩码临时预览（尚未应用）'+extra+' · 请检查彩色线条、网点与文字完整度；不满意返回差异掩码修改';
+     }
      const newest=state.pendingStroke;
      if(newest&&newest.pair===p&&p.edits.at(-1)===newest.edit){
        state.pendingStroke=null;
