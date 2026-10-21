@@ -194,6 +194,14 @@ def process_warp(source,target,matrix):
 
 def serve(host='127.0.0.1',port=8765,quiet=False):
     if host!='127.0.0.1':raise ValueError('安全限制：仅允许监听 127.0.0.1')
+    # Fail before advertising engine health if desktop dependencies are missing.
+    try:
+        import numpy
+        import cv2
+        from manga_hd_transfer.registration import register_images
+        from manga_hd_transfer.region_composite import apply_region_action
+    except ImportError as exc:
+        raise RuntimeError('缺少 Folirina 桌面 Python 环境依赖，请先安装项目依赖：'+str(exc)) from exc
     token=secrets.token_urlsafe(32)
     class Handler(SimpleHTTPRequestHandler):
         def __init__(self,*args,**kwargs):super().__init__(*args,directory=str(DOCS),**kwargs)
