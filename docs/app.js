@@ -96,7 +96,10 @@ function applyZoom({resetCenter=false}={}){
  const relX=(sc.scrollLeft+cw/2)/oldWidth,relY=(sc.scrollTop+ch/2)/oldHeight;
  let factor=zoomState.mode==='fit'?Math.min((cw-76)/cvs.width,(ch-60)/cvs.height):
    zoomState.mode==='width'?(cw-76)/cvs.width:zoomState.percent/100;
- factor=Math.max(.05,Math.min(3,factor));
+ // Extremely small auto-fit is unusable for hand painting. Keep a minimum
+  // visual scale and allow canvas scrolling instead of shrinking to 5%.
+  const minFactor=zoomState.mode==='manual'?.10:.17;
+  factor=Math.max(minFactor,Math.min(3,factor));
  const width=Math.max(1,Math.round(cvs.width*factor)),height=Math.max(1,Math.round(cvs.height*factor));
  cvs.style.width=over.style.width=$('canvasHolder').style.width=width+'px';
  cvs.style.height=over.style.height=$('canvasHolder').style.height=height+'px';

@@ -20,3 +20,44 @@
 .canvas-holder{margin-left:auto;margin-right:auto}
 
 .mask-review-tools{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px;margin:10px 0}.mask-review-tools .tool{white-space:normal;font-size:10px;padding:7px 4px;border:1px solid #315263}.mask-review-actions{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:10px 0}.mask-review-actions .button{padding:8px 4px;font-size:10px}.mask-review-panel select{margin:8px 0;min-height:34px}.engine-status{font-size:11px;color:#8fdcd3;white-space:nowrap}.engine-help{font-size:11px;color:#8ac7df;white-space:nowrap;text-decoration:underline}.mode-btn:disabled{opacity:.35;cursor:not-allowed}.mode-btn:disabled:hover{background:inherit}
+
+
+/* Folirina Web 0.3.6 – restore the tested three-column editor on desktops.
+   Do not use the historical <=900px "mobile" stack: at increased page zoom,
+   it collapses the canvas to ~100px and fit-to-window becomes 5%.
+   A genuinely narrow viewport instead scrolls horizontally rather than
+   silently moving source/inspector above and below the editor. */
+html,body{min-width:965px;overflow-x:auto}
+.app-shell{min-height:780px;height:max(100vh,780px)}
+.layout{display:grid!important;grid-template-columns:230px minmax(480px,1fr) 248px!important;min-width:965px;flex:1;min-height:0;overflow:hidden}
+.leftbar,.rightbar{position:static!important;display:flex!important;flex-direction:column!important;min-height:0;min-width:0;width:auto!important;max-height:none!important;box-shadow:none!important;order:initial!important}
+.leftbar{border-right:1px solid var(--line)!important;border-bottom:0!important}
+.rightbar{border-left:1px solid var(--line)!important;border-top:0!important}
+.leftbar .upload-card{display:block!important;width:auto!important;margin-right:0!important}
+.leftbar .page-list{min-height:120px;max-height:none!important;overflow-y:auto!important}
+.rightbar .inspector-block{display:block!important;width:auto!important;margin-right:0!important}
+.workspace{order:initial!important;display:flex!important;flex-direction:column!important;min-height:0!important;height:auto!important;overflow:hidden}
+.canvas-area{flex:1;min-height:0}
+.canvas-scroller{flex:1;min-height:0;overflow:auto;justify-content:flex-start;align-items:flex-start}
+.canvas-holder{margin-left:auto;margin-right:auto}
+.canvas-footer{flex:none}
+@media(max-width:1170px){
+ .layout{grid-template-columns:210px minmax(520px,1fr) 235px!important}
+ .topbar{flex-wrap:wrap;height:auto;min-height:75px}
+ .editor-toolbar{flex-direction:row!important;align-items:center!important}
+}
+@media(max-width:900px){
+ .app-shell{min-height:780px;height:max(100vh,780px)!important}
+ .layout{display:grid!important;flex-direction:initial!important;overflow:hidden!important}
+ .sidebar{padding:13px 10px;overflow-y:auto;max-height:none!important}
+ .workspace{height:auto!important;min-height:0!important;flex:initial!important}
+ .rightbar{position:static!important}
+ .toolstrip{overflow-x:auto}
+ .canvas-footer{flex-wrap:wrap}
+ .statusbar{min-height:24px}
+}
+@media(max-width:550px){
+ .app-shell{min-height:780px;height:max(100vh,780px)!important}
+ .workspace{height:auto!important}
+ .rightbar .inspector-block{display:block!important;width:auto!important}
+}
