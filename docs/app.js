@@ -5,6 +5,40 @@ import {inspectTextDifferences,maskOverlay} from './glyph_masks.js';
 import {reviewedEdit} from './reviewed_masks.js';
 
 const $=id=>document.getElementById(id);
+// UI-only preferences: theme and panel visibility never change edit pixels.
+const THEME_KEY='folirina.web.theme.v1';
+const PANELS_KEY='folirina.web.panels.v1';
+function safePref(key){try{return localStorage.getItem(key)}catch(_){return null}}
+function savePref(key,value){try{localStorage.setItem(key,value)}catch(_){}}
+function applyTheme(theme){
+ const next=theme==='dark'?'dark':'light';
+ document.documentElement.dataset.theme=next;
+ const dark=next==='dark',button=document.getElementById('themeToggle');
+ button.textContent=dark?'☀ 白色':'☾ 深色';
+ button.setAttribute('aria-label',dark?'切换为白色主题':'切换为深色主题');
+ button.setAttribute('aria-pressed',String(dark));
+ document.querySelector('meta[name="theme-color"]')?.setAttribute('content',dark?'#11192a':'#f7f9fc');
+ savePref(THEME_KEY,next);
+}
+const appShell=document.querySelector('.app-shell');
+function setPanelVisibility(side,visible){
+ const hidden=side==='left'?'hide-left':'hide-right';
+ appShell.classList.toggle(hidden,!visible);
+ const btn=document.getElementById(side==='left'?'toggleLeftPanel':'toggleRightPanel');
+ btn.setAttribute('aria-expanded',String(visible));
+ btn.classList.toggle('active',visible);
+ btn.setAttribute('aria-label',(visible?'收起':'展开')+(side==='left'?'素材':'处理参数')+'面板');
+ savePref(PANELS_KEY,JSON.stringify({left:!appShell.classList.contains('hide-left'),right:!appShell.classList.contains('hide-right')}));
+}
+applyTheme(safePref(THEME_KEY)==='dark'?'dark':'light');
+let panelPrefs={left:true,right:true};
+try{const p=JSON.parse(safePref(PANELS_KEY)||'null');if(p&&typeof p.left==='boolean'&&typeof p.right==='boolean')panelPrefs=p}catch(_){}
+setPanelVisibility('left',panelPrefs.left);
+setPanelVisibility('right',panelPrefs.right);
+document.getElementById('themeToggle').addEventListener('click',()=>applyTheme(document.documentElement.dataset.theme==='light'?'dark':'light'));
+document.getElementById('toggleLeftPanel').addEventListener('click',()=>setPanelVisibility('left',appShell.classList.contains('hide-left')));
+document.getElementById('toggleRightPanel').addEventListener('click',()=>setPanelVisibility('right',appShell.classList.contains('hide-right')));
+
 const state={sources:[],targets:[],pairs:[],index:0,view:'result',tool:'paint-transfer',brush:24,threshold:185,paper:255,gesture:null,inspection:null,review:null,reviewPreview:false,cloneAnchor:null,stamp:0,rendering:false,hover:null,transferMode:'hole'};
 const cvs=$('editorCanvas'),over=$('overlayCanvas'),ctx=cvs.getContext('2d',{willReadFrequently:true}),oc=over.getContext('2d');
 let toastHandle=null;
@@ -94,8 +128,8 @@ function applyZoom({resetCenter=false}={}){
  const cw=Math.max(10,sc.clientWidth),ch=Math.max(10,sc.clientHeight);
  const oldWidth=parseFloat(cvs.style.width)||cvs.width,oldHeight=parseFloat(cvs.style.height)||cvs.height;
  const relX=(sc.scrollLeft+cw/2)/oldWidth,relY=(sc.scrollTop+ch/2)/oldHeight;
- let factor=zoomState.mode==='fit'?Math.min((cw-76)/cvs.width,(ch-60)/cvs.height):
-   zoomState.mode==='width'?(cw-76)/cvs.width:zoomState.percent/100;
+ let factor=zoomState.mode==='fit'?Math.min((cw-36)/cvs.width,(ch-28)/cvs.height):
+   zoomState.mode==='width'?(cw-36)/cvs.width:zoomState.percent/100;
  factor=Math.max(.05,Math.min(3,factor));
  const width=Math.max(1,Math.round(cvs.width*factor)),height=Math.max(1,Math.round(cvs.height*factor));
  cvs.style.width=over.style.width=$('canvasHolder').style.width=width+'px';
