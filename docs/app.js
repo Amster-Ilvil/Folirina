@@ -1,8 +1,10 @@
 import {unpack,releaseItems,bitmap,defaultPair,compose,smartPairs,canvasBlob,download,naturalCompare,safeName,warpedSource} from './core.js';
 import {estimateBrowserAffine} from './registration.js';
+import {getBounds,brushOrSelectionMask} from './core.js';
+import {inspectTextDifferences,maskOverlay} from './glyph_masks.js';
 
 const $=id=>document.getElementById(id);
-const state={sources:[],targets:[],pairs:[],index:0,view:'result',tool:'paint-transfer',brush:24,threshold:185,paper:255,gesture:null,cloneAnchor:null,stamp:0,rendering:false,hover:null,transferMode:'hole'};
+const state={sources:[],targets:[],pairs:[],index:0,view:'result',tool:'paint-transfer',brush:24,threshold:185,paper:255,gesture:null,inspection:null,cloneAnchor:null,stamp:0,rendering:false,hover:null,transferMode:'hole'};
 const cvs=$('editorCanvas'),over=$('overlayCanvas'),ctx=cvs.getContext('2d',{willReadFrequently:true}),oc=over.getContext('2d');
 let toastHandle=null;
 // Optional, local-only native backend. GitHub Pages always remains fully Lite.
@@ -196,7 +198,7 @@ function updateUI(){
  // page after import, pairing, page navigation or loading an old workspace.
  if(pairNeedsAlignment(p))void alignPage(p).catch(err=>console.error(err));
 }
-function goPage(index){if(index<0||index>=state.pairs.length)return;state.index=index;state.cloneAnchor=null;state.hover=null;updateUI()}
+function goPage(index){if(index<0||index>=state.pairs.length)return;state.inspection=null;state.index=index;state.cloneAnchor=null;state.hover=null;updateUI()}
 $('previousPage').addEventListener('click',()=>goPage(state.index-1));$('nextPage').addEventListener('click',()=>goPage(state.index+1));
 $('sourceSelect').addEventListener('change',e=>{const p=current();if(!p)return;if(p.edits.length&&!confirm('修改 SOURCE 配对会改变本页已有迁移结果，确定继续？')){e.target.value=String(p.src??'');return}p.src=e.target.value===''?null:Number(e.target.value);p.affine=null;p.homography=null;p.nativeMatrix=null;p.alignDiagnostics=null;p.alignError=null;p.dx=0;p.dy=0;p.scale=1;updateUI()});
 $('skipPage').addEventListener('change',e=>{const p=current();if(p){p.skip=e.target.checked;updateUI()}});
@@ -273,6 +275,35 @@ $('autoPair').addEventListener('click',async()=>{
  try{const oldPairs=state.pairs;state.pairs=await smartPairs(state.sources,state.targets,state.pairs,text=>$('busyDetail').textContent=text);state.pairs.forEach((p,i)=>{if(p.src!==oldPairs[i]?.src){p.affine=null;p.homography=null;p.nativeMatrix=null;p.alignDiagnostics=null;p.alignError=null;p.dx=0;p.dy=0;p.scale=1}});toast('智能配对已完成；相似图片或封面仍可能配错，请核对后导出');updateUI()}
  catch(e){toast(`智能配对失败：${e.message}`);console.error(e)}finally{busy(false)}
 });
+// Independently inspect the SOURCE Chinese-ink and TARGET Japanese-ink
+// candidates under an explicit user selection. No pixels are modified here.
+function maskSelectionFor(pair){
+ if(state.inspection?.pair===pair)return state.inspection.edit;
+ return [...(pair?.edits||[])].reverse().find(e=>e.kind==='transfer')||null;
+}
+function inspectCurrentMask(target,source,p,edit){
+ if(!source||!isRegistered(p))throw Error('请先配对并自动配准这一页');
+ if(!edit)throw Error('先用「◉ 差异检查」涂抹需要分析的区域');
+ const box=getBounds(edit,target.width,target.height);
+ if(!box||box.w*box.h>4_000_000)throw Error('选区太大，请分成较小区域检查（上限400万像素）');
+ const sourceWarp=warpedSource(source,target.width,target.height,p);
+ const sc=sourceWarp.getContext('2d',{willReadFrequently:true});
+ const tc=document.createElement('canvas');tc.width=box.w;tc.height=box.h;
+ const tctx=tc.getContext('2d',{willReadFrequently:true});
+ tctx.drawImage(target,-box.x,-box.y);
+ const sourcePixels=sc.getImageData(box.x,box.y,box.w,box.h).data;
+ const targetPixels=tctx.getImageData(0,0,box.w,box.h).data;
+ const selection=brushOrSelectionMask(edit,box.x,box.y,box.w,box.h);
+ const inspection=inspectTextDifferences(sourcePixels,targetPixels,selection,box.w,box.h);
+ tc.width=tc.height=0;
+ return {box,inspection};
+}
+function oneMaskPng(mask,w,h){
+ const canvas=document.createElement('canvas');canvas.width=w;canvas.height=h;
+ const context=canvas.getContext('2d');const image=context.createImageData(w,h);
+ for(let i=0;i<mask.length;i++){let j=i*4;const value=mask[i]?255:0;image.data[j]=image.data[j+1]=image.data[j+2]=value;image.data[j+3]=255}
+ context.putImageData(image,0,0);return canvas;
+}
 async function renderPage(){
  const stamp=++state.stamp;const p=current();if(!p){$('emptyState').classList.remove('hidden');$('canvasScroller').classList.add('hidden');$('imageDims').textContent='未加载图片';return}
  try{
@@ -314,6 +345,18 @@ async function renderPage(){
        }
      }
    }
+   else if(state.view==='masks'){
+     ctx.drawImage(target,0,0);
+     try{
+       const {box,inspection}=inspectCurrentMask(target,source,p,maskSelectionFor(p));
+       const maskCanvas=document.createElement('canvas');maskCanvas.width=box.w;maskCanvas.height=box.h;
+       const mc=maskCanvas.getContext('2d');const image=mc.createImageData(box.w,box.h);
+       image.data.set(maskOverlay(inspection,box.w,box.h));mc.putImageData(image,0,0);
+       ctx.drawImage(maskCanvas,box.x,box.y);maskCanvas.width=maskCanvas.height=0;
+       const x=inspection.summary;
+       $('renderHint').textContent=`只读掩码 · 绿 SOURCE 中文候选 ${x.sourceCandidates}px · 红 TARGET 日文候选 ${x.targetCandidates}px · 公共结构 ${Math.round(x.structuralSupport*100)}% · ⚠ ${x.caution}`;
+     }catch(error){$('renderHint').textContent='掩码尚未生成：'+error.message;}
+   }
    else if(state.view==='target')ctx.drawImage(target,0,0);
    else if(state.view==='overlay'||state.view==='source'){
      if(state.view==='overlay')ctx.drawImage(target,0,0);else{ctx.fillStyle='white';ctx.fillRect(0,0,W,H)}
@@ -353,7 +396,7 @@ function drawOverlay(){
  const e=state.gesture;
  if(!e){
   const pointer=state.hover;
-  if(pointer && ['paint-transfer','erase','clone','restore'].includes(state.tool)){
+  if(pointer && ['paint-transfer','erase','clone','restore','mask-inspect'].includes(state.tool)){
    oc.save();oc.setLineDash([5,4]);oc.strokeStyle='#21c9bd';oc.fillStyle='#00dfca1b';
    oc.lineWidth=Math.max(2,over.width/700);
    oc.beginPath();oc.arc(pointer.x,pointer.y,state.brush/2,0,Math.PI*2);oc.fill();oc.stroke();oc.restore();
@@ -371,8 +414,8 @@ over.addEventListener('pointerdown',e=>{
  const rightRestore=e.button===2;
  const point=pointFromEvent(e);if(!rightRestore&&state.tool==='clone'&&e.altKey){state.cloneAnchor=point;toast(`克隆取样点 (${point.x}, ${point.y}) 已设定`);return}
  if(!rightRestore&&state.tool==='clone'&&!state.cloneAnchor){toast('请先按住 Alt，在原图的干净背景处单击取样');return}
- if(!rightRestore&&['ellipse','rect','paint-transfer'].includes(state.tool)&&!currentSrc()){toast('当前页面尚未配对 SOURCE，无法迁移中文文字');return}
- if(!rightRestore&&['ellipse','rect','paint-transfer'].includes(state.tool)&&!isRegistered(current())){
+ if(!rightRestore&&['ellipse','rect','paint-transfer','mask-inspect'].includes(state.tool)&&!currentSrc()){toast('当前页面尚未配对 SOURCE，无法迁移中文文字');return}
+ if(!rightRestore&&['ellipse','rect','paint-transfer','mask-inspect'].includes(state.tool)&&!isRegistered(current())){
    const p=current();toast(p.alignError?'配准失败，请检查对应页或使用桌面版':'正在自动配准当前页，完成后才能涂抹迁移');
    if(pairNeedsAlignment(p))void alignPage(p);
    return;
@@ -387,7 +430,14 @@ over.addEventListener('pointerdown',e=>{
  try{over.setPointerCapture(e.pointerId)}catch{}drawOverlay();e.preventDefault();
 });
 over.addEventListener('pointermove',e=>{const p=pointFromEvent(e);state.hover=p;if(!state.gesture){drawOverlay();return}const g=state.gesture;g.end=p;if(g.shape==='brush'){const prev=g.points.at(-1),d=Math.hypot(prev.x-p.x,prev.y-p.y);if(d>=1.7)g.points.push(p)}drawOverlay()});
-function finishGesture(e){const g=state.gesture;if(!g)return;state.gesture=null;drawOverlay();if(g.shape!=='brush'&&(Math.abs(g.end.x-g.start.x)<10||Math.abs(g.end.y-g.start.y)<10)){toast('选区太小，请拖动较大的气泡内部区域');return}
+function finishGesture(e){const g=state.gesture;if(!g)return;state.gesture=null;drawOverlay();
+ if(state.tool==='mask-inspect'&&g.kind==='mask-inspect'){
+   const p=current();if(!p)return;
+   state.inspection={pair:p,edit:g};state.view='masks';
+   document.querySelectorAll('[data-view]').forEach(b=>b.classList.toggle('active',b.dataset.view==='masks'));
+   renderPage();toast('差异掩码：绿色候选中文、红色候选日文；只是诊断，不会修改或清除漫画');return;
+ }
+ if(g.shape!=='brush'&&(Math.abs(g.end.x-g.start.x)<10||Math.abs(g.end.y-g.start.y)<10)){toast('选区太小，请拖动较大的气泡内部区域');return}
  const p=current();if(!p)return;p.undo.push(structuredClone(p.edits));if(p.undo.length>50)p.undo.shift();p.redo=[];p.edits.push(g);state.pendingStroke=g.kind==='transfer'?{pair:p,edit:g}:null;
  // Keep the zoom, current scroll offset, mouse position and page list stable.
  $('editCount').textContent=p.edits.length+' 次编辑';$('clearEdits').disabled=!p.edits.length;
@@ -429,6 +479,19 @@ $('exportAll').addEventListener('click',async()=>{
  if(!count)throw Error('所有页面均被跳过');
  $('busyDetail').textContent='压缩 ZIP...';const out=await zip.generateAsync({type:'blob',compression:'STORE'},meta=>{$('busyDetail').textContent=`压缩 ZIP ${Math.round(meta.percent)}%`});download(out,'Folirina_Web_Export.zip');toast(`已导出 ${count} 页 PNG，按 TARGET 原分辨率保存`);
  }catch(e){toast(`导出失败：${e.message}`);console.error(e)}finally{busy(false)}
+});
+$('exportMasks').addEventListener('click',async()=>{
+ const p=current();if(!p)return;
+ busy(true,'导出差异掩码','分别提取 SOURCE / TARGET 的候选字形...');
+ try{
+  const [target,source]=await Promise.all([bitmap(currentTarget()),currentSrc()?bitmap(currentSrc()):null]);
+  const {box,inspection}=inspectCurrentMask(target,source,p,maskSelectionFor(p));
+  const zip=new JSZip();const files=[['source_candidates.png',inspection.sourceMask],['target_candidates.png',inspection.targetMask]];
+  for(const [name,mask] of files){const image=oneMaskPng(mask,box.w,box.h);const blob=await canvasBlob(image);zip.file(name,blob);image.width=image.height=0}
+  zip.file('diagnostic.json',JSON.stringify({page:currentTarget().name,bounds:box,summary:inspection.summary,warning:'仅候选区域，非可靠的文字识别；不得未经检查直接擦除'},null,2));
+  download(await zip.generateAsync({type:'blob',compression:'DEFLATE'}),safeName(currentTarget().name)+'_dual_masks.zip');
+  toast('已导出 SOURCE／TARGET 独立候选掩码，仅供人工对照');
+ }catch(err){toast('掩码导出失败：'+err.message)}finally{busy(false)}
 });
 $('saveProject').addEventListener('click',async()=>{
  if(!state.targets.length)return;busy(true,'打包工作区','保存原图、配对关系、编辑记录...');
