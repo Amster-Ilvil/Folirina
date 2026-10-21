@@ -18,3 +18,5 @@
 @media(max-width:1150px){.transfer-mode{flex-wrap:wrap}.zoom-controls{gap:3px}}
 .canvas-scroller{justify-content:flex-start}
 .canvas-holder{margin-left:auto;margin-right:auto}
+
+.engine-status{font-size:11px;color:#8fdcd3;white-space:nowrap}.engine-help{font-size:11px;color:#8ac7df;white-space:nowrap;text-decoration:underline}.mode-btn:disabled{opacity:.35;cursor:not-allowed}.mode-btn:disabled:hover{background:inherit}

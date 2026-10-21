@@ -5,6 +5,75 @@ const $=id=>document.getElementById(id);
 const state={sources:[],targets:[],pairs:[],index:0,view:'result',tool:'paint-transfer',brush:24,threshold:185,paper:255,gesture:null,cloneAnchor:null,stamp:0,rendering:false,hover:null,transferMode:'hole'};
 const cvs=$('editorCanvas'),over=$('overlayCanvas'),ctx=cvs.getContext('2d',{willReadFrequently:true}),oc=over.getContext('2d');
 let toastHandle=null;
+// Optional, local-only native backend. GitHub Pages always remains fully Lite.
+const nativeEngine={ready:false,enabled:false,token:null};
+const nativeData=new WeakMap();
+function dataURL(item){
+ if(!item)throw Error('没有已导入的图片');
+ if(nativeData.has(item))return nativeData.get(item);
+ const promise=new Promise((resolve,reject)=>{
+   const rd=new FileReader();rd.onload=()=>resolve(rd.result);rd.onerror=()=>reject(Error('图片读取失败'));rd.readAsDataURL(item.blob)
+ });nativeData.set(item,promise);return promise;
+}
+async function nativePost(op,data){
+ if(!nativeEngine.ready||!nativeEngine.token)throw Error('原生引擎未连接');
+ const res=await fetch('/api/engine/'+op,{method:'POST',credentials:'same-origin',
+   headers:{'Content-Type':'application/json','X-Folirina-Token':nativeEngine.token},
+   body:JSON.stringify(data)});
+ const out=await res.json();if(!res.ok||out.error)throw Error(out.error||'原生引擎操作失败');return out;
+}
+async function nativeRegister(sourceItem,targetItem){
+ return nativePost('register',{source:await dataURL(sourceItem),target:await dataURL(targetItem)});
+}
+function nativeEffectiveMatrix(pair,tgtWidth,tgtHeight){
+ if(!Array.isArray(pair.nativeMatrix))throw Error('当前页没有原生透视配准矩阵，请重新执行自动配准');
+ const H=pair.nativeMatrix,z=pair.scale||1;
+ const shiftX=tgtWidth*(1-z)*.5+(pair.dx||0),shiftY=tgtHeight*(1-z)*.5+(pair.dy||0);
+ return [
+  H[0].map((v,i)=>z*v+shiftX*H[2][i]),
+  H[1].map((v,i)=>z*v+shiftY*H[2][i]),H[2].slice()
+ ];
+}
+async function nativeRender(pair,srcItem,tgtItem){
+ const target=await bitmap(tgtItem);
+ const matrix=Array.isArray(pair.nativeMatrix)?nativeEffectiveMatrix(pair,target.width,target.height):
+   (pair.edits.some(e=>e.kind==='transfer')?null:[[1,0,0],[0,1,0],[0,0,1]]);
+ if(!matrix)throw Error('当前页未完成原生配准，不能迁移文字');
+ return nativePost('render',{source:await dataURL(srcItem||tgtItem),target:await dataURL(tgtItem),matrix,
+   edits:pair.edits.map(e=>({kind:e.kind,mode:e.mode,shape:e.shape,start:e.start,end:e.end,
+    points:e.points,brush:e.brush,paper:e.paper,cloneOffset:e.cloneOffset}))});
+}
+async function nativeWarp(pair,srcItem,tgtItem){
+ const target=await bitmap(tgtItem);
+ return nativePost('warp',{source:await dataURL(srcItem),target:await dataURL(tgtItem),matrix:nativeEffectiveMatrix(pair,target.width,target.height)});
+}
+function decodedPNG(data){return new Promise((resolve,reject)=>{const img=new Image();img.onload=()=>resolve(img);img.onerror=()=>reject(Error('原生 PNG 解码失败'));img.src=data});}
+async function engineInit(){
+ try{
+   const res=await fetch('/api/engine/health',{cache:'no-store'});
+   if(!res.ok)throw Error('not local');const info=await res.json();if(!info.ok||!info.token)throw Error('no local engine');
+   nativeEngine.ready=true;nativeEngine.enabled=true;nativeEngine.token=info.token;
+   $('engineToggle').disabled=false;$('engineToggle').textContent='引擎：原生 Python';
+   document.querySelector('[data-transfer-mode=precision]').disabled=false;
+   $('engineStatus').textContent='已连接本机原生引擎';
+   $('engineStatus').title='本机 OpenCV 配准 + 原版 Folirina 区域函数，所有图片仅发送到 127.0.0.1';
+ }catch(_){nativeEngine.ready=false;nativeEngine.enabled=false;document.querySelector('[data-transfer-mode=precision]').disabled=true;
+   $('engineStatus').textContent='免安装 Lite';
+   $('engineToggle').title='完整版：在安装了 Folirina 的电脑运行 python tools/web_bridge.py，访问 http://127.0.0.1:8765/';}
+}
+$('engineToggle').addEventListener('click',()=>{
+ if(!nativeEngine.ready)return;
+ if(state.pairs.some(p=>p.edits.length)&&!confirm('切换引擎会改变现有编辑的合成效果。建议先保存工作区，确认切换？'))return;
+ nativeEngine.enabled=!nativeEngine.enabled;
+ document.querySelector('[data-transfer-mode=precision]').disabled=!nativeEngine.enabled;
+ if(!nativeEngine.enabled&&state.transferMode==='precision'){state.transferMode='hole';document.querySelectorAll('[data-transfer-mode]').forEach(b=>b.classList.toggle('active',b.dataset.transferMode==='hole'));}
+ $('engineToggle').textContent='引擎：'+(nativeEngine.enabled?'原生 Python':'浏览器 Lite');
+ for(const p of state.pairs){if(!p.edits.length){p.affine=null;p.nativeMatrix=null;p.alignDiagnostics=null;p.alignError=null;}}
+ toast(nativeEngine.enabled?'原生引擎模式：配准及区域合成使用桌面 Python 代码':'已返回纯浏览器 Lite 模式');
+ updateUI();
+});
+void engineInit();
+
 // Display transform is independent of document edits. Never recompute fit on a stroke.
 const zoomState={mode:'fit',percent:100,pageId:null};
 function applyZoom({resetCenter=false}={}){
@@ -37,16 +106,17 @@ $('canvasScroller').addEventListener('wheel',e=>{
  zoomState.mode='manual';zoomState.percent=Math.max(10,Math.min(300,effective+(e.deltaY<0?10:-10)));applyZoom();
 },{passive:false});
 for(const btn of document.querySelectorAll('[data-transfer-mode]'))btn.addEventListener('click',()=>{
+ if(btn.dataset.transferMode==='precision'&&!nativeEngine.enabled){toast('精准蒙版需要本地原生 Python 引擎，请先启动 web_bridge.py');return;}
  state.transferMode=btn.dataset.transferMode;
  document.querySelectorAll('[data-transfer-mode]').forEach(b=>b.classList.toggle('active',b===btn));
- toast(state.transferMode==='texture'?'纹理直贴：复杂背景从已配准的中文 SOURCE 迁入纹理和文字，仅作用于笔刷内':state.transferMode==='hole'?'挖孔替换：纯色气泡清底；复杂背景转为配准纹理移植':'透明底替换：纯色气泡清旧字；复杂背景使用柔边 SOURCE 纹理');
+ toast(state.transferMode==='precision'?'精准蒙版：直接使用桌面 Python 的 Precise Region 处理器':state.transferMode==='texture'?'纹理直贴：复杂背景从已配准的中文 SOURCE 迁入纹理和文字，仅作用于笔刷内':state.transferMode==='hole'?'挖孔替换：纯色气泡清底；复杂背景转为配准纹理移植':'透明底替换：纯色气泡清旧字；复杂背景使用柔边 SOURCE 纹理');
 });
 
 // Matching pages is not image registration. Every selected unedited pair needs a
 // validated transform before displaying/migrating SOURCE. Jobs are per-pair and
 // keyed by object identity so switching pages cannot overwrite a different pair.
 const pendingAlignment=new WeakMap();
-function isRegistered(p){return !!(p && Array.isArray(p.affine) && p.affine.length===6 && p.affine.every(Number.isFinite))}
+function isRegistered(p){return !!(p && Array.isArray(p.affine) && p.affine.length===6 && p.affine.every(Number.isFinite) && (!nativeEngine.enabled||Array.isArray(p.nativeMatrix)))}
 function pairNeedsAlignment(p){return !!(p && p.src!==null && !p.skip && !isRegistered(p) && !p.edits.length && !p.alignError)}
 
 function toast(message){$('toast').textContent=message;$('toast').classList.add('show');clearTimeout(toastHandle);toastHandle=setTimeout(()=>$('toast').classList.remove('show'),3900)}
@@ -75,7 +145,7 @@ async function importImages(kind,files){
    if(items.length>1000)throw Error('单批最多导入 1000 页');
    const old=kind==='source'?state.sources:state.targets;
    releaseItems(old);
-   if(kind==='source'){state.sources=items;state.pairs.forEach(p=>{p.edits=[];p.undo=[];p.redo=[];p.dx=0;p.dy=0;p.scale=1;p.affine=null;p.alignDiagnostics=null;p.alignError=null});freshPairsForSources()}else{state.targets=items;createPairs()}
+   if(kind==='source'){state.sources=items;state.pairs.forEach(p=>{p.edits=[];p.undo=[];p.redo=[];p.dx=0;p.dy=0;p.scale=1;p.affine=null;p.nativeMatrix=null;p.alignDiagnostics=null;p.alignError=null});freshPairsForSources()}else{state.targets=items;createPairs()}
    toast(`已导入 ${items.length} 张${kind==='source'?'中文 SOURCE':'日文 TARGET'}图片`);
  }catch(err){toast(`导入失败：${err.message}`);console.error(err)}finally{busy(false);updateUI()}
 }
@@ -118,7 +188,7 @@ function updateUI(){
 }
 function goPage(index){if(index<0||index>=state.pairs.length)return;state.index=index;state.cloneAnchor=null;state.hover=null;updateUI()}
 $('previousPage').addEventListener('click',()=>goPage(state.index-1));$('nextPage').addEventListener('click',()=>goPage(state.index+1));
-$('sourceSelect').addEventListener('change',e=>{const p=current();if(!p)return;if(p.edits.length&&!confirm('修改 SOURCE 配对会改变本页已有迁移结果，确定继续？')){e.target.value=String(p.src??'');return}p.src=e.target.value===''?null:Number(e.target.value);p.affine=null;p.alignDiagnostics=null;p.alignError=null;p.dx=0;p.dy=0;p.scale=1;updateUI()});
+$('sourceSelect').addEventListener('change',e=>{const p=current();if(!p)return;if(p.edits.length&&!confirm('修改 SOURCE 配对会改变本页已有迁移结果，确定继续？')){e.target.value=String(p.src??'');return}p.src=e.target.value===''?null:Number(e.target.value);p.affine=null;p.nativeMatrix=null;p.alignDiagnostics=null;p.alignError=null;p.dx=0;p.dy=0;p.scale=1;updateUI()});
 $('skipPage').addEventListener('change',e=>{const p=current();if(p){p.skip=e.target.checked;updateUI()}});
 for(const name of ['alignX','alignY'])$(name).addEventListener('change',()=>{const p=current();if(!p)return;p.dx=Number($('alignX').value)||0;p.dy=Number($('alignY').value)||0;updateUI()});
 $('alignScale').addEventListener('input',()=>{$('scaleValue').textContent=Number($('alignScale').value).toFixed(1)+'%'});
@@ -146,13 +216,17 @@ async function alignPage(pair,{manual=false}={}){
    else if(pair===current())$('alignStatus').textContent='正在自动配准，暂不可涂抹迁移...';
    try{
      const [src,tgt]=await Promise.all([bitmap(state.sources[sourceIndex]),bitmap(state.targets[targetIndex])]);
-     const result=await estimateBrowserAffine(src,tgt,detail=>{
+     const result=nativeEngine.enabled?
+       await nativeRegister(state.sources[sourceIndex],state.targets[targetIndex]):
+       await estimateBrowserAffine(src,tgt,detail=>{
        if(manual)$('busyDetail').textContent=detail;
      });
      // Never use an outdated result if the user imported/re-paired another page.
      if(!state.pairs.includes(pair)||pair.src!==sourceIndex||pair.tgt!==targetIndex)return false;
-     pair.affine=result.matrix;
-     pair.alignDiagnostics={inliers:result.inliers,total:result.total,medianError:result.medianError,coverage:result.coverage};
+     pair.affine=nativeEngine.enabled?result.affine:result.matrix;
+     pair.nativeMatrix=nativeEngine.enabled?result.matrix:null;
+     pair.alignDiagnostics={inliers:result.inliers,total:result.total,medianError:result.medianError,coverage:result.coverage,
+       method:result.method||'browser',confidence:result.confidence??null};
      pair.dx=0;pair.dy=0;pair.scale=1;pair.alignError=null;
      if(pair===current())toast(`本页已自动配准（${result.inliers} 组特征）；请在叠加检查中确认线条重合`);
      return true;
@@ -179,13 +253,13 @@ $('autoAlign').addEventListener('click',()=>{
 });
 $('resetAlign').addEventListener('click',()=>{
  const p=current();if(!p)return;if(p.edits.length&&!confirm('重置对齐会影响当前页的已有文字迁移，确定继续？'))return;
- p.affine=null;p.alignDiagnostics=null;p.alignError=null;p.dx=0;p.dy=0;p.scale=1;updateUI();toast('已重置对齐');
+ p.affine=null;p.nativeMatrix=null;p.alignDiagnostics=null;p.alignError=null;p.dx=0;p.dy=0;p.scale=1;updateUI();toast('已重置对齐');
 });
 $('autoPair').addEventListener('click',async()=>{
  if(!state.sources.length||!state.targets.length)return;
  if(state.pairs.some(p=>p.edits.length)&&!confirm('智能配对会改变页面对应关系，从而影响已编辑页面的迁移效果。是否继续？'))return;
  busy(true,'非 AI 页面结构配对','提取小尺寸结构特征...');
- try{const oldPairs=state.pairs;state.pairs=await smartPairs(state.sources,state.targets,state.pairs,text=>$('busyDetail').textContent=text);state.pairs.forEach((p,i)=>{if(p.src!==oldPairs[i]?.src){p.affine=null;p.alignDiagnostics=null;p.alignError=null;p.dx=0;p.dy=0;p.scale=1}});toast('智能配对已完成；相似图片或封面仍可能配错，请核对后导出');updateUI()}
+ try{const oldPairs=state.pairs;state.pairs=await smartPairs(state.sources,state.targets,state.pairs,text=>$('busyDetail').textContent=text);state.pairs.forEach((p,i)=>{if(p.src!==oldPairs[i]?.src){p.affine=null;p.nativeMatrix=null;p.alignDiagnostics=null;p.alignError=null;p.dx=0;p.dy=0;p.scale=1}});toast('智能配对已完成；相似图片或封面仍可能配错，请核对后导出');updateUI()}
  catch(e){toast(`智能配对失败：${e.message}`);console.error(e)}finally{busy(false)}
 });
 async function renderPage(){
@@ -198,7 +272,15 @@ async function renderPage(){
    if(cvs.width!==W)cvs.width=W;if(cvs.height!==H)cvs.height=H;
    if(over.width!==W)over.width=W;if(over.height!==H)over.height=H;
    ctx.clearRect(0,0,W,H);
-   if(state.view==='result'){const guarded=[],strokeResults=[];const composite=compose(target,source,p,{threshold:state.threshold,paper:state.paper,onGuard:(reason,edit)=>guarded.push({reason,edit}),onStrokeResult:(edit,result)=>strokeResults.push({edit,result})});
+   if(state.view==='result' && nativeEngine.enabled && p.edits.length){
+     const response=await nativeRender(p,currentSrc(),currentTarget());
+     if(stamp!==state.stamp)return;
+     const img=await decodedPNG(response.png);if(stamp!==state.stamp)return;
+     ctx.drawImage(img,0,0);state.pendingStroke=null;
+     const tail=response.receipts.at(-1);
+     $('renderHint').textContent='原生 Python 处理 · '+(tail?tail.mode+' · '+(tail.changed??0)+' 处像素变更':'已处理')+
+       '；预览与导出调用同一原生区域处理函数；画笔越界写入由桌面源码校验';
+   }else if(state.view==='result'){const guarded=[],strokeResults=[];const composite=compose(target,source,p,{threshold:state.threshold,paper:state.paper,onGuard:(reason,edit)=>guarded.push({reason,edit}),onStrokeResult:(edit,result)=>strokeResults.push({edit,result})});
      if(guarded.length){$('renderHint').textContent='⚠ '+guarded.at(-1).reason+'。请检查配准或缩小画笔。';}
      else $('renderHint').textContent='纯色区域贴字；建筑／网点等复杂背景自动采用 SOURCE 配准纹理，不会涂白；纹理色差需要人工检查';
      ctx.drawImage(composite,0,0);composite.width=0;composite.height=0;
@@ -222,8 +304,19 @@ async function renderPage(){
      }
    }
    else if(state.view==='target')ctx.drawImage(target,0,0);
-   else if(state.view==='overlay'){ctx.drawImage(target,0,0);if(source){ctx.save();ctx.globalAlpha=.48;const warped=warpedSource(source,W,H,p);ctx.drawImage(warped,0,0);ctx.restore();warped.width=0;warped.height=0;}}
-   else {ctx.fillStyle='white';ctx.fillRect(0,0,W,H);if(source)ctx.drawImage(warpedSource(source,W,H,p),0,0);else ctx.drawImage(target,0,0)}
+   else if(state.view==='overlay'||state.view==='source'){
+     if(state.view==='overlay')ctx.drawImage(target,0,0);else{ctx.fillStyle='white';ctx.fillRect(0,0,W,H)}
+     if(source){
+       if(nativeEngine.enabled && Array.isArray(p.nativeMatrix)){
+         const warped=await nativeWarp(p,currentSrc(),currentTarget());if(stamp!==state.stamp)return;
+         const img=await decodedPNG(warped.png);if(stamp!==state.stamp)return;
+         ctx.save();if(state.view==='overlay')ctx.globalAlpha=.48;ctx.drawImage(img,0,0);ctx.restore();
+       }else{
+         const warped=warpedSource(source,W,H,p);
+         ctx.save();if(state.view==='overlay')ctx.globalAlpha=.48;ctx.drawImage(warped,0,0);ctx.restore();warped.width=0;warped.height=0;
+       }
+     }else if(state.view==='source')ctx.drawImage(target,0,0);
+   }
    if(stamp!==state.stamp)return;
    $('emptyState').classList.add('hidden');$('canvasScroller').classList.remove('hidden');
    zoomState.pageId=currentTarget()?.id;
@@ -231,7 +324,17 @@ async function renderPage(){
    if(changedPage||!cvs.style.width)applyZoom({resetCenter:changedPage});
    $('imageDims').textContent=`${W} × ${H} px · ${p.edits.length} 次编辑`;
    drawOverlay();
- }catch(err){if(stamp===state.stamp)toast(`加载页面失败：${err.message}`);console.error(err)}
+ }catch(err){
+   if(stamp===state.stamp){
+     toast(`加载页面失败：${err.message}`);
+     if(nativeEngine.enabled&&state.pendingStroke?.pair===p&&p.edits.at(-1)===state.pendingStroke.edit){
+       p.edits.pop();p.undo.pop();p.redo=[];state.pendingStroke=null;
+       $('editCount').textContent=p.edits.length+' 次编辑';
+       queueMicrotask(()=>{if(p===current())renderPage()});
+     }
+   }
+   console.error(err)
+ }
 }
 function pointFromEvent(e){const r=over.getBoundingClientRect();return{x:Math.round((e.clientX-r.left)*over.width/r.width),y:Math.round((e.clientY-r.top)*over.height/r.height)}}
 function drawOverlay(){
@@ -287,7 +390,16 @@ $('clearEdits').addEventListener('click',()=>{const p=current();if(!p||!p.edits.
 document.addEventListener('keydown',e=>{if(['INPUT','SELECT','TEXTAREA'].includes(document.activeElement.tagName))return;if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='z'){e.preventDefault();e.shiftKey?redo():undo()}if(e.key==='ArrowRight')goPage(state.index+1);if(e.key==='ArrowLeft')goPage(state.index-1);if(e.key==='['||e.key===']'){e.preventDefault();updateBrushSize(state.brush+(e.key===']'?8:-8))}});
 async function exportOne(){const p=current();if(!p)return;
  if(p.edits.some(e=>e.kind==='transfer')&&!isRegistered(p)){toast('本页含未配准的迁移操作，禁止错位导出；请先自动配准');return;}
- busy(true,'生成 PNG','按原始 TARGET 分辨率合成...');try{const [t,s]=await Promise.all([bitmap(currentTarget()),currentSrc()?bitmap(currentSrc()):null]);const c=compose(t,s,p,{rejectUnsafe:true});const blob=await canvasBlob(c);c.width=0;c.height=0;download(blob,safeName(currentTarget().name).replace(/\.[^.]+$/,'')+'_folirina.png');toast('本页 PNG 已生成')}catch(e){toast(`导出失败：${e.message}`);console.error(e)}finally{busy(false)}}
+ busy(true,'生成 PNG','按原始 TARGET 分辨率合成...');try{
+   let blob;
+   if(nativeEngine.enabled && p.edits.length){
+     const r=await nativeRender(p,currentSrc(),currentTarget());blob=await(await fetch(r.png)).blob();
+   }else{
+     const [t,s]=await Promise.all([bitmap(currentTarget()),currentSrc()?bitmap(currentSrc()):null]);
+     const c=compose(t,s,p,{rejectUnsafe:true});blob=await canvasBlob(c);c.width=0;c.height=0;
+   }
+   download(blob,safeName(currentTarget().name).replace(/\.[^.]+$/,'')+'_folirina.png');toast('本页 PNG 已生成')
+ }catch(e){toast(`导出失败：${e.message}`);console.error(e)}finally{busy(false)}}
 $('exportPage').addEventListener('click',exportOne);
 $('exportAll').addEventListener('click',async()=>{
  if(!state.targets.length)return;busy(true,'导出整册','正在生成 PNG 文件...');try{
@@ -297,7 +409,9 @@ $('exportAll').addEventListener('click',async()=>{
   if(p.edits.some(e=>e.kind==='transfer')&&!isRegistered(p))throw Error(`第 ${i+1} 页包含未配准文字迁移，请先自动配准，避免错位导出`);
   $('busyDetail').textContent=`合成页面 ${i+1}/${state.pairs.length}`;
   const t=await bitmap(state.targets[p.tgt]),s=p.src===null?null:await bitmap(state.sources[p.src]);
-  const c=compose(t,s,p,{rejectUnsafe:true}),blob=await canvasBlob(c);c.width=0;c.height=0;
+  let blob;
+  if(nativeEngine.enabled&&p.edits.length){const r=await nativeRender(p,state.sources[p.src],state.targets[p.tgt]);blob=await(await fetch(r.png)).blob();}
+  else{const c=compose(t,s,p,{rejectUnsafe:true});blob=await canvasBlob(c);c.width=0;c.height=0;}
   dir.file(`${String(i+1).padStart(4,'0')}_${safeName(state.targets[p.tgt].name).replace(/\.[^.]+$/,'')}.png`,blob);count++;
   await new Promise(r=>setTimeout(r,0));
  }
@@ -335,4 +449,4 @@ $('projectInput').addEventListener('change',async e=>{
 if('serviceWorker' in navigator && location.protocol.startsWith('http'))navigator.serviceWorker.register('./sw.js').catch(()=>{});
 updateUI();
 // For smoke/regression tests only: no privileged APIs or network actions.
-window.__folirinaTest={state,composeCurrent:async()=>{const p=current();return compose(await bitmap(currentTarget()),currentSrc()?await bitmap(currentSrc()):null,p)},goPage};
+window.__folirinaTest={state,nativeEngine,nativeRender,nativeWarp,composeCurrent:async()=>{const p=current();return compose(await bitmap(currentTarget()),currentSrc()?await bitmap(currentSrc()):null,p)},goPage};

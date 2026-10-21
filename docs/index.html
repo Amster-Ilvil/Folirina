@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#0c1020">
   <meta name="description" content="Folirina Web Lite — 中文漫画 SOURCE 与高清日文 TARGET 本地对齐、遮罩、Direct Patch 和批量导出。无需模型，不上传图片。">
-  <title>Folirina Web Lite v0.2.8 · 漫画修复工作台</title>
+  <title>Folirina Web v0.3.0 · 漫画修复工作台</title>
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="icon" type="image/png" href="icon-192.png">
   <link rel="stylesheet" href="styles.css">
@@ -13,8 +13,8 @@
 <body>
   <div class="app-shell">
     <header class="topbar">
-      <div class="brand"><div class="brand-mark">F<span>✦</span></div><div><strong>Folirina <em>Web Lite v0.2.5</em></strong><small>漫画文字迁移 · 浏览器本地工作台</small></div></div>
-      <div class="top-actions"><span class="privacy"><span class="live-dot"></span> 本地处理 · 不上传图片</span><button id="openProject" class="button ghost" type="button">打开工作区</button><button id="saveProject" class="button ghost" type="button">保存工作区</button><button id="exportAll" class="button primary" type="button">导出整册 ZIP <span class="btn-arrow">↗</span></button></div>
+      <div class="brand"><div class="brand-mark">F<span>✦</span></div><div><strong>Folirina <em>Web v0.3.0</em></strong><small>漫画文字迁移 · 浏览器本地工作台</small></div></div>
+      <div class="top-actions"><button id="engineToggle" class="button ghost" type="button" disabled title="原生功能需要启动本机 Folirina Python 服务。GitHub Pages 仍为免费纯浏览器 Lite 版。">引擎：浏览器 Lite</button><span class="engine-status" id="engineStatus" title="原生功能需要从本机启动 python tools/web_bridge.py">仅浏览器</span><a class="engine-help" href="native.html" target="_blank" rel="noopener">原生引擎说明</a><span class="privacy"><span class="live-dot"></span> 本地处理 · 不上传图片</span><button id="openProject" class="button ghost" type="button">打开工作区</button><button id="saveProject" class="button ghost" type="button">保存工作区</button><button id="exportAll" class="button primary" type="button">导出整册 ZIP <span class="btn-arrow">↗</span></button></div>
     </header>
     <main class="layout">
       <aside class="sidebar leftbar">
@@ -35,7 +35,7 @@
       <section class="workspace">
         <div class="editor-toolbar"><div class="toolbar-left"><span class="eyebrow mono">EDITOR / CANVAS</span><strong id="currentPageTitle">尚未选择页面</strong></div><div class="view-tabs" role="group" aria-label="显示模式"><button class="active" data-view="result" type="button">合成预览</button><button data-view="overlay" type="button">叠加检查</button><button data-view="target" type="button">日文原图</button><button data-view="source" type="button">中文版对照</button></div></div>
         <div class="toolstrip" role="toolbar" aria-label="修复工具">
-          <button class="tool active" data-tool="paint-transfer" type="button" title="左键按笔刷轨迹迁移；右键拖动恢复日文"><span>🖌</span>自由涂抹</button><span class="tool-separator"></span><div class="transfer-mode" role="group" aria-label="涂抹迁移方式"><button class="mode-btn" data-transfer-mode="transparent" type="button" title="使用局部背景颜色清除原日文，中文保持原色；黑白和彩色纯色气泡均可用，复杂纹理自动保护">透明底替换</button><button class="mode-btn active" data-transfer-mode="hole" type="button" title="严格在笔刷覆盖区域内清除 TARGET 并迁入中文">挖孔替换</button><button class="mode-btn" data-transfer-mode="texture" type="button" title="使用配准后的 SOURCE 真实纹理覆盖手工涂抹区域，仅作用于笔刷内，非纯色气泡也能使用；可能带入 SOURCE 扫描纹理">纹理直贴</button></div>
+          <button class="tool active" data-tool="paint-transfer" type="button" title="左键按笔刷轨迹迁移；右键拖动恢复日文"><span>🖌</span>自由涂抹</button><span class="tool-separator"></span><div class="transfer-mode" role="group" aria-label="涂抹迁移方式"><button class="mode-btn" data-transfer-mode="transparent" type="button" title="使用局部背景颜色清除原日文，中文保持原色；黑白和彩色纯色气泡均可用，复杂纹理自动保护">透明底替换</button><button class="mode-btn active" data-transfer-mode="hole" type="button" title="严格在笔刷覆盖区域内清除 TARGET 并迁入中文">挖孔替换</button><button class="mode-btn" data-transfer-mode="texture" type="button" title="使用配准后的 SOURCE 真实纹理覆盖手工涂抹区域，仅作用于笔刷内，非纯色气泡也能使用；可能带入 SOURCE 扫描纹理">纹理直贴</button><button class="mode-btn" data-transfer-mode="precision" type="button" title="原生精准蒙版区域处理（需要本机 Python 桌面引擎）；与桌面版同一 renderer">精准蒙版(原生)</button></div>
           <button class="tool" data-tool="ellipse" type="button" title="拖动选择气泡椭圆区域"><span>◯</span>气泡迁移</button>
           <button class="tool" data-tool="rect" type="button" title="拖动选择矩形文字区域"><span>▢</span>矩形迁移</button>
           <span class="tool-separator"></span>
@@ -51,7 +51,7 @@
       <aside class="sidebar rightbar"><div class="panel-heading"><div class="eyebrow">INSPECTOR</div><h2>局部处理</h2><p>不依赖 OCR / AI。对齐后在 TARGET 画布上标记文字迁移区域。</p></div>
         <div class="inspector-block"><label for="sourceSelect">当前 SOURCE 对应页</label><select id="sourceSelect"><option value="">无对应页</option></select><label class="checkline"><input id="skipPage" type="checkbox"> 导出时跳过此页</label></div>
         <div class="inspector-block"><div class="inspector-title"><strong>图像对齐</strong><button id="autoAlign" class="link-button" type="button">自动配准</button><button id="resetAlign" class="link-button" type="button">重置</button></div><div class="two-col"><label>水平偏移 X<input id="alignX" type="number" step="1" value="0"></label><label>垂直偏移 Y<input id="alignY" type="number" step="1" value="0"></label></div><label>相对缩放 <span id="scaleValue" class="value">100%</span></label><input id="alignScale" type="range" min="85" max="115" value="100" step="0.2"><p class="field-help">页面配对不等于图像配准：选择页面后自动计算特征配准。未对齐前禁止迁移；偏移单位为 TARGET 像素。自动配准可识别画面特征，矫正横纵缩放、轻微旋转与剪切；不使用 AI 或 OCR。复杂非刚性变形建议桌面版。</p><p class="field-help" id="alignStatus">未配准，选中页面后将自动计算</p></div>
-        <div class="inspector-block"><div class="inspector-title"><strong>迁移 / 修复参数</strong></div><label>中文深色像素阈值 <span class="value" id="thresholdValue">185</span></label><input id="threshold" type="range" min="80" max="245" value="185" step="1"><label for="brushSize">涂抹 / 修复画笔大小 <span class="value" id="brushValue">24 px</span></label><div class="brush-controls"><input id="brushSize" type="range" min="2" max="240" value="24" step="2"><input id="brushSizeNumber" type="number" min="2" max="240" step="2" value="24" aria-label="直接输入画笔大小，单位像素"></div><p class="field-help">左键拖动：透明底替换或挖孔替换；右键拖动：直接恢复日文原图。两种模式严格限制在画笔覆盖范围，画笔 2–240 px；[ / ] 调整大小。</p><label>清除底色 <span class="value" id="paperValue">255</span></label><input id="paperColor" type="range" min="180" max="255" value="255" step="1"><p class="field-help">「透明底替换」自动估计原图背景色，只清除疑似日文墨迹，并贴上不褪色的中文；「挖孔替换」以估计的原始背景色清除笔刷区域再迁移中文。非纯色背景会改用配准后的 SOURCE 局部纹理（不涂白），边缘做柔和过渡；也可主动选择「纹理直贴」。纹理移植可能带入 SOURCE 的扫描色差，请在叠加检查中先确保配准精确。两种编辑都会保存到工作区/导出，切换模式不会自动改写以前的笔画。右键可恢复原始日文。</p></div>
+        <div class="inspector-block"><div class="inspector-title"><strong>迁移 / 修复参数</strong></div><label>中文深色像素阈值 <span class="value" id="thresholdValue">185</span></label><input id="threshold" type="range" min="80" max="245" value="185" step="1"><label for="brushSize">涂抹 / 修复画笔大小 <span class="value" id="brushValue">24 px</span></label><div class="brush-controls"><input id="brushSize" type="range" min="2" max="240" value="24" step="2"><input id="brushSizeNumber" type="number" min="2" max="240" step="2" value="24" aria-label="直接输入画笔大小，单位像素"></div><p class="field-help">左键拖动：透明底替换或挖孔替换；右键拖动：直接恢复日文原图。两种模式严格限制在画笔覆盖范围，画笔 2–240 px；[ / ] 调整大小。</p><label>清除底色 <span class="value" id="paperValue">255</span></label><input id="paperColor" type="range" min="180" max="255" value="255" step="1"><p class="field-help">「透明底替换」自动估计原图背景色，只清除疑似日文墨迹，并贴上不褪色的中文；「挖孔替换」以估计的原始背景色清除笔刷区域再迁移中文。非纯色背景会改用配准后的 SOURCE 局部纹理（不涂白），边缘做柔和过渡；也可主动选择「纹理直贴」。纹理移植可能带入 SOURCE 的扫描色差，请在叠加检查中先确保配准精确。在本地原生引擎模式下，透明底/挖孔/纹理使用桌面版同名区域处理算法；网页 Lite 为简化实现。编辑都会保存到工作区/导出，切换模式不会自动改写以前的笔画。右键可恢复原始日文。</p></div>
         <div class="inspector-block"><div class="inspector-title"><strong>当前页面</strong><span id="editCount">0 次编辑</span></div><button id="clearEdits" class="button secondary wide" type="button">清空本页编辑</button><button id="exportPage" class="button secondary wide" type="button">导出当前页 PNG</button></div>
         <div class="help-card"><strong>使用提示</strong><p>① 调整中日图片对应和偏移，查看对照。</p><p>② 点击「自动配准」，用「叠加检查」核对画框。<br>③ 选择「自由涂抹」，调画笔大小后直接刷过文字。</p><p>④ 用清除、克隆、恢复画笔微调。克隆笔先按住 Alt 点击取样。</p><p>⑤ 保存工作区 ZIP 可在下次继续编辑。</p></div>
       </aside>
@@ -62,5 +62,6 @@
   </div>
   <script src="vendor/jszip.min.js"></script>
   <script type="module" src="app.js"></script>
+<script type="application/json" id="engineVersion">{"bridge":"0.3.0"}</script>
 </body>
 </html>
