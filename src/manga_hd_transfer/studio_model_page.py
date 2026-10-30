@@ -1128,14 +1128,14 @@ class ModelPage(QWidget):
                 all_stopped = False
         return all_stopped
 
-    def shutdown_background_probes(self, timeout_ms: int = 2200) -> None:
-        """Stop read-only probe QThreads before QApplication teardown.
+    def shutdown_background_probes(self, timeout_ms: int = 2200) -> bool:
+        """Retain live Python workers until they finish cooperatively.
 
-        PySide/Qt aborts when a live QThread wrapper is destroyed during Python
-        finalization. Component/network probes are read-only, so a bounded wait
-        followed by termination is safer than letting Qt tear them down alive.
-        Model downloads/dependency installs are intentionally not force-killed.
+        QThread.terminate() can interrupt Python while it owns the GIL or an
+        import lock. Read-only work is not safe to kill at arbitrary instructions.
+        The window must stay alive when the bounded wait expires.
         """
+        all_stopped = True
         for attr in ("_probe_worker", "_network_probe_worker"):
             worker = getattr(self, attr, None)
             if worker is None:
@@ -1143,12 +1143,14 @@ class ModelPage(QWidget):
             try:
                 if worker.isRunning():
                     worker.requestInterruption()
-                    if not worker.wait(max(0, int(timeout_ms))):
-                        worker.terminate()
-                        worker.wait(1200)
+                    worker.wait(max(0, int(timeout_ms)))
+                    if worker.isRunning():
+                        all_stopped = False
+                        continue
             except RuntimeError:
                 pass
             setattr(self, attr, None)
+        return all_stopped
 
     def _start_probe(self):
         if self._global_busy or self.has_write_task_running():

@@ -357,7 +357,9 @@ def resolve_result_state(page_dir: str | Path, artifacts: Any = None, extra_cand
     current = newest_existing([
         reviewed,
         automatic,
-        art.get("book_final"),
+        # A compressed or upscaled delivery cannot become an editing canvas:
+        # masks, selections and layers all use native TARGET coordinates.
+        art.get("book_final") if not art.get("delivery_final") else None,
         *list(extra_candidates),
     ])
     stable = _existing_file(page_dir / "final_auto.png") or _existing_file(page_dir / "manual_effect_base.png")
@@ -580,6 +582,13 @@ def commit_reviewed_result(page_dir: str | Path, final_reviewed: str | Path, *, 
             project["artifacts"] = artifacts
             meta = as_dict(project.get("meta"))
             meta["review_sync"] = payload
+            delivery = as_dict(meta.get("delivery_export"))
+            if delivery:
+                from .publication import publish_project_delivery
+                requested = delivery.get("requested") or str(Path(delivery["output"]).with_suffix(".png"))
+                publish_project_delivery(
+                    delivery.get("settings"), page_dir, requested, artifacts, meta,
+                )
             project["meta"] = meta
             save_json(project_path, project)
     return reviewed

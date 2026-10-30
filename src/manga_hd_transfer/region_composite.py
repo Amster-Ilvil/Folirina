@@ -367,6 +367,46 @@ def _strengthen_region_transparent_clear_mask(
     return out, diag
 
 
+def _manual_flat_colour_clear(target: np.ndarray, selection: np.ndarray):
+    """Recover bold lettering holes in a proven flat-colour manual container.
+
+    Compact-component filtering deliberately rejects broad artwork, but can
+    also reject a bold Japanese glyph. A connected, closed, uniform coloured
+    paper region supplies independent erasure authority without a glyph-size
+    assumption. This helper never grants authority to white/gradient paper,
+    disconnected artwork, or pixels outside the reviewer's selection.
+    """
+    from .target_text_removal import coloured_container_removal
+    empty = np.zeros(target.shape[:2], np.uint8)
+    plan = coloured_container_removal(target, selection, manual_flat_paper=True)
+    if plan.diagnostics.get("reason") != "target_colour_container_holes":
+        return empty, empty.copy(), None, {"reason": "not_verified_colour_container"}
+    domain = plan.domain > 0
+    use = np.asarray(selection) > 0
+    overlap = float(np.count_nonzero(domain & use) / max(1, np.count_nonzero(use)))
+    paper_pixels = target[domain & (plan.mask == 0)]
+    if overlap < 0.80 or len(paper_pixels) < 64:
+        return empty, empty.copy(), None, {"reason": "selection_not_inside_colour_container"}
+    paper = np.median(paper_pixels, axis=0)
+    deviations = np.max(np.abs(paper_pixels.astype(np.float32) - paper), axis=1)
+    if float(np.percentile(deviations, 95)) > 10:
+        return empty, empty.copy(), None, {"reason": "colour_container_not_flat"}
+    # Large contrasting objects inside otherwise-flat paper are illustrations,
+    # not a licence to erase the entire object as one oversized glyph.
+    count, _labels, stats, _centers = cv2.connectedComponentsWithStats(
+        (plan.mask > 0).astype(np.uint8), 8
+    )
+    largest = int(stats[1:, cv2.CC_STAT_AREA].max()) if count > 1 else 0
+    if largest > int(np.count_nonzero(domain) * 0.15):
+        return empty, empty.copy(), None, {"reason": "colour_container_large_nonpaper_object"}
+    clear = cv2.bitwise_and(plan.mask, np.asarray(selection, np.uint8))
+    return clear, plan.domain, np.rint(paper).astype(np.uint8), {
+        "reason": "verified_flat_colour_lettering_holes", "selection_containment": overlap,
+        "clear_pixels": int(cv2.countNonZero(clear)), "paper_bgr": np.rint(paper).astype(int).tolist(),
+        "authority_policy": "explicit_manual_selection_intersect_closed_flat_colour_paper",
+    }
+
+
 def _neutral_paper_selection(target: np.ndarray, selection: np.ndarray) -> tuple[bool, dict[str, Any]]:
     """Return whether a manual selection is a bright/neutral paper container.
 
@@ -679,6 +719,41 @@ def apply_region_action(current: np.ndarray, target: np.ndarray, source: np.ndar
         clear, clear_diag = _strengthen_region_transparent_clear_mask(
             target, masks.aligned_source, src_mask, clear_base, selection
         )
+        flat_clear = np.zeros_like(clear); flat_domain = np.zeros_like(clear); flat_paper = None
+        if cv2.countNonZero(src_mask):
+            flat_clear, flat_domain, flat_paper, flat_diag = _manual_flat_colour_clear(target, selection)
+            clear = cv2.bitwise_or(clear, flat_clear)
+            if flat_paper is not None:
+                # A proven paper container does not authorize edits to its
+                # neighbouring rays, hair or background, even if the rectangle
+                # and paired-diff masks include those few nonpaper pixels.
+                clear = cv2.bitwise_and(clear, flat_domain)
+                src_mask = cv2.bitwise_and(src_mask, flat_domain)
+                # A closed coloured field may also contain a shared drawing
+                # line. Keep coincident dark SOURCE/TARGET structure instead of
+                # erasing it as a lettering hole. Coincident Chinese ink is
+                # harmless here: the SOURCE foreground is reapplied below.
+                source_dark = (masks.aligned_source.max(axis=2) < 160).astype(np.uint8)
+                source_near = cv2.dilate(source_dark, np.ones((5, 5), np.uint8)) > 0
+                translated_near = cv2.dilate((src_mask > 0).astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
+                target_dark = (target.max(axis=2) < 160) & (flat_domain > 0) & (selection > 0)
+                _n, components, component_stats, _ = cv2.connectedComponentsWithStats(
+                    target_dark.astype(np.uint8), 8
+                )
+                shared_ink = np.zeros_like(target_dark)
+                # Pixel-wise coincidences between unrelated Chinese/Japanese
+                # strokes are not shared artwork. Preserve only a complete
+                # TARGET component almost wholly explained by SOURCE structure.
+                for component in range(1, _n):
+                    cx, cy, cw, ch, area = component_stats[component]
+                    local = components[cy:cy+ch, cx:cx+cw] == component
+                    overlap = np.count_nonzero(local & source_near[cy:cy+ch, cx:cx+cw])
+                    translated_overlap = np.any(local & translated_near[cy:cy+ch, cx:cx+cw])
+                    if area >= 4 and overlap / float(area) >= 0.90 and not translated_overlap:
+                        shared_ink[cy:cy+ch, cx:cx+cw] |= local
+                clear[shared_ink] = 0
+                flat_diag["shared_dark_structure_preserved_pixels"] = int(np.count_nonzero(shared_ink))
+            clear_diag["flat_colour_container"] = flat_diag
         # Re-assert the explicit manual authority boundary after every recovery
         # stage.  This remains a TARGET-background-preserving operation: unlike
         # brush reveal, we do not replace the whole corridor with SOURCE pixels.
@@ -692,11 +767,17 @@ def apply_region_action(current: np.ndarray, target: np.ndarray, source: np.ndar
             model_path = getattr(cfg.inpainting, "lama_model_path", None)
             colour = cv2.cvtColor(target, cv2.COLOR_BGR2HSV)[..., 1]
             colour_background = bool(np.mean(colour[selection > 0] > 25) >= 0.10)
-            if colour_background and lama_status(model_path).ready:
+            if flat_paper is not None and not np.any((clear > 0) & (flat_domain == 0)):
+                cleaned = target.copy(); cleaned[clear > 0] = flat_paper
+                clean_diag = {"mode": "verified_flat_colour_fill", "model_invoked": False,
+                              "background_policy": "exact_target_paper_before_source_ink"}
+            elif colour_background and lama_status(model_path).ready:
                 cleaned, clean_diag = inpaint_koharu_text(target, clear, model_path=model_path)
                 clean_diag["background_policy"] = "lama_manga_colour_target_before_source_ink"
             else:
                 cleaned, clean_diag = local_ops.clean_manual_target_text(target, clear, bbox=bbox)
+            if flat_paper is not None:
+                cleaned[(clear > 0) & (flat_domain > 0)] = flat_paper
             use = clear > 0
             out[use] = cleaned[use]
             canonical_base[use] = cleaned[use]

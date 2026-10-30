@@ -42,7 +42,13 @@ def _kind(row: dict[str, Any]) -> str:
     return str(row.get("kind") or row.get("type") or "speech").strip().lower()
 
 
-def white_bubble_interior(target: np.ndarray, bubble: Any, *, inset: int = 3) -> tuple[np.ndarray | None, dict]:
+def white_bubble_interior(
+    target: np.ndarray,
+    bubble: Any,
+    *,
+    inset: int = 3,
+    manual_geometry_override: bool = False,
+) -> tuple[np.ndarray | None, dict]:
     """Prove neutral white paper inside a semantic balloon, preserving its rim.
 
     Bright yellow, skin, gradients and arbitrary rectangular selections do not
@@ -53,7 +59,7 @@ def white_bubble_interior(target: np.ndarray, bubble: Any, *, inset: int = 3) ->
         return None, {"reason": "not_speech_bubble"}
     points = _bubble_points(bubble)
     confidence = float(bubble.get("confidence", 1.0) or 0.0)
-    if points is None or confidence < 0.62:
+    if points is None or (confidence < 0.62 and not manual_geometry_override):
         return None, {"reason": "unproven_bubble_geometry"}
     full = _polygon_mask(points, target.shape[:2])
     area = int(cv2.countNonZero(full))
@@ -214,6 +220,13 @@ def _choose_target_bubble(
     if not isinstance(bubbles, list):
         bubbles = []
     requested_id = str(row.get("target_bubble_id") or row.get("bubble_id") or "").strip()
+    manual_override = bool(row.get("manual_geometry_override")) and bool(requested_id)
+    manual_polygon = row.get("manual_target_bubble_polygon")
+    if manual_override and manual_polygon is not None:
+        bubbles = [*bubbles, {
+            "id": requested_id, "kind": "speech", "confidence": 1.0,
+            "polygon": manual_polygon, "origin": "explicit_manual_contour",
+        }]
     selection_area = max(1, int(cv2.countNonZero(selection)))
     candidates: list[tuple[float, float, dict[str, Any], np.ndarray, np.ndarray]] = []
     for bubble in bubbles:
@@ -223,7 +236,7 @@ def _choose_target_bubble(
         if requested_id and bubble_id != requested_id:
             continue
         confidence = float(bubble.get("confidence", 1.0) or 0.0)
-        if confidence < 0.62:
+        if confidence < 0.62 and not manual_override:
             continue
         points = _bubble_points(bubble)
         if points is None:
@@ -239,7 +252,25 @@ def _choose_target_bubble(
         if inner_area < max(64, int(area * 0.72)):
             continue
         if requested_id:
-            containment = 1.0
+            if manual_override:
+                selection_spec = row.get("selection_spec")
+                if not isinstance(selection_spec, dict) or str(selection_spec.get("kind") or "").strip().lower() not in {"freehand", "smart"}:
+                    continue
+                try:
+                    selection_points = np.asarray(selection_spec.get("points"), dtype=np.float32).reshape(-1, 2)
+                except (TypeError, ValueError):
+                    continue
+                if len(selection_points) < 3 or not np.all(np.isfinite(selection_points)):
+                    continue
+                overlap = cv2.countNonZero(cv2.bitwise_and(selection, inner))
+                containment = overlap / float(max(1, inner_area))
+                # A manual low-confidence override must carry a contour-shaped
+                # selection covering nearly all of this one bubble. A loose
+                # bounding box is not enough to relax semantic confidence.
+                if containment < 0.90:
+                    continue
+            else:
+                containment = 1.0
         else:
             contained = cv2.bitwise_and(selection, inner)
             containment = cv2.countNonZero(contained) / float(selection_area)
@@ -274,6 +305,13 @@ def _match_source_bubble(
     if not isinstance(bubbles, list):
         bubbles = []
     requested_id = str(row.get("source_bubble_id") or "").strip()
+    manual_source_polygon = row.get("manual_source_bubble_polygon")
+    if bool(row.get("manual_geometry_override")) and manual_source_polygon is not None:
+        requested_id = requested_id or "manual-source-contour"
+        bubbles = [*bubbles, {
+            "id": requested_id, "kind": "speech", "confidence": 1.0,
+            "polygon": manual_source_polygon, "origin": "explicit_manual_contour",
+        }]
     H = registration_homography(project).copy()
     dx = int(row.get("source_offset_x", 0) or 0); dy = int(row.get("source_offset_y", 0) or 0)
     if dx or dy:
@@ -297,7 +335,8 @@ def _match_source_bubble(
         score = 0.75 * iou + 0.25 * target_coverage
         if best is None or score > best[0]:
             best = (score, bubble, mapped)
-    if best is None or best[0] < 0.38:
+    minimum_score = 0.68 if bool(row.get("manual_geometry_override")) else 0.38
+    if best is None or best[0] < minimum_score:
         raise ValueError("SOURCE 中没有与选中气泡可靠配对的中文气泡")
     return best[1], best[2], float(best[0])
 
@@ -326,7 +365,11 @@ def apply_white_bubble_blank_first(
     target_bubble, target_full, target_inner, target_diag = _choose_target_bubble(
         project, np.asarray(selection, np.uint8), row, (h, w), inset
     )
-    target_inner, white_diag = white_bubble_interior(target, target_bubble, inset=inset)
+    manual_geometry_override = bool(row.get("manual_geometry_override"))
+    target_inner, white_diag = white_bubble_interior(
+        target, target_bubble, inset=inset,
+        manual_geometry_override=manual_geometry_override,
+    )
     if target_inner is None:
         raise ValueError("选中的气泡不是经过验证的纯白底气泡，未修改")
     white_ratio = float(white_diag["white_ratio"])
@@ -350,7 +393,8 @@ def apply_white_bubble_blank_first(
         intersection = cv2.countNonZero(cv2.bitwise_and(plan.domain, target_full))
         union = cv2.countNonZero(cv2.bitwise_or(plan.domain, target_full))
         match_score = intersection / float(max(1, union))
-        if plan.diagnostics.get("reason") != "target_white_container_holes" or match_score < 0.50:
+        fallback_minimum = 0.68 if manual_geometry_override else 0.50
+        if plan.diagnostics.get("reason") != "target_white_container_holes" or match_score < fallback_minimum:
             raise ValueError("SOURCE 检测及闭合白底轮廓均未确认对应中文气泡，未修改")
         source_bubble = {"id": "registered-white-source:" + str(target_bubble.get("id") or "")}
         source_projected = plan.domain
@@ -364,10 +408,12 @@ def apply_white_bubble_blank_first(
         source_offset_y=int(row.get("source_offset_y", 0) or 0),
     )
     inner_roi = target_inner[y:y1, x:x1]
+    full_roi = target_full[y:y1, x:x1]
     projected_roi = source_projected[y:y1, x:x1].copy()
+    source_inset = max(inset, min(24, int(row.get("source_inset_px", inset) or inset)))
     source_safe = cv2.erode(
         projected_roi,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * inset + 1, 2 * inset + 1)),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * source_inset + 1, 2 * source_inset + 1)),
         iterations=1,
     )
     support = (inner_roi > 0) & (source_safe > 0)
@@ -380,13 +426,47 @@ def apply_white_bubble_blank_first(
         raise ValueError("配准后的 SOURCE 气泡内没有足够中文笔画，未修改")
     soft_near = cv2.dilate(core.astype(np.uint8) * 255, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), iterations=1) > 0
     source_ink = support & soft_near & (gray <= int(row.get("ink_aa_threshold", 248) or 248))
+    from .scan_paper import shadow_free_ink
+    local_ink = shadow_free_ink(gray, support)
+    if local_ink is not None:
+        source_ink = local_ink
     ink_pixels = int(np.count_nonzero(source_ink))
     if ink_pixels < 8:
         raise ValueError("没有提取到可用 SOURCE 中文笔画，未修改")
 
     out = current.copy()
     roi_out = out[y:y1, x:x1]
+    # The inside edge can carry old Japanese pixels or scan shadows even after
+    # the bubble's centre is cleared. Rebuild this narrow rim from the immutable
+    # TARGET: neutral pixels become white again and only the original dark
+    # balloon contour is retained. Chinese ink is composited after this below.
+    rebuild_rim = manual_geometry_override and row.get("manual_target_outline_polygon") is not None
+    rim = (full_roi > 0) & (inner_roi == 0) if rebuild_rim else np.zeros_like(inner_roi, dtype=bool)
+    roi_out[rim] = (255, 255, 255)
+    target_roi = target[y:y1, x:x1]
+    target_gray_roi = cv2.cvtColor(target_roi, cv2.COLOR_BGR2GRAY)
+    target_outline = rim & (target_gray_roi < 150)
+    roi_out[target_outline] = target_roi[target_outline]
     roi_out[inner_roi > 0] = (255, 255, 255)
+    restored_outline_pixels = 0
+    raw_outline = row.get("manual_target_outline_polygon")
+    if manual_geometry_override and raw_outline is not None:
+        try:
+            outline_points = np.asarray(raw_outline, dtype=np.float32).reshape(-1, 2)
+        except (TypeError, ValueError):
+            outline_points = np.empty((0, 2), np.float32)
+        if len(outline_points) >= 3 and np.all(np.isfinite(outline_points)):
+            outline_full = _polygon_mask(outline_points, (h, w))
+            outline_core = cv2.erode(
+                outline_full,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)),
+                iterations=1,
+            )
+            outline_band = (outline_full > 0) & (outline_core == 0)
+            outline_roi = outline_band[y:y1, x:x1]
+            dark_original_outline = outline_roi & (target_gray_roi < 150)
+            roi_out[dark_original_outline] = target_roi[dark_original_outline]
+            restored_outline_pixels = int(np.count_nonzero(dark_original_outline))
     roi_out[source_ink] = aligned[source_ink]
     clear = np.zeros((h, w), np.uint8)
     clear[y:y1, x:x1] = inner_roi
@@ -407,17 +487,19 @@ def apply_white_bubble_blank_first(
         "source_closed_white_container_fallback": source_container_fallback,
         "target_white_ratio": white_ratio,
         "inset_px": inset,
+        "source_ink_inset_px": source_inset,
         "source_ink_core_pixels": int(np.count_nonzero(core)),
         "source_ink_pixels": ink_pixels,
         "target_dark_pixels_before": int(np.count_nonzero((cv2.cvtColor(target[y:y1, x:x1], cv2.COLOR_BGR2GRAY) < 190) & (inner_roi > 0))),
+        "manual_target_outline_restored_pixels": restored_outline_pixels,
         "residual_target_dark_pixels_after": residual_dark,
         "white_fill_pixels": white_outside_ink,
         "source_to_target_identity": bool(identity),
-        "write_scope": "inset_verified_white_speech_bubble_polygon",
+        "write_scope": "verified_white_speech_bubble_interior_and_rebuilt_rim",
         "bubble_bbox": [int(bx), int(by), int(bx + bwidth), int(by + bheight)],
         "bubble_interior_bbox": [int(x), int(y), int(x1), int(y1)],
     }
-    return out, layer, clear, target_inner, diag
+    return out, layer, clear, target_full if rebuild_rim else target_inner, diag
 
 
 __all__ = ["apply_white_bubble_blank_first", "white_bubble_interior", "verified_white_bubble_mask", "compose_white_bubbles"]

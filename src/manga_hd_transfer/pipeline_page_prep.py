@@ -54,6 +54,16 @@ class PageInputContext:
     cache_stats: dict[str, str]
 
 
+def _check_source_path(path: str | Path) -> None:
+    # Path('') becomes '.', which is not a missing image but a directory.
+    # TARGET-only pairs are valid for passthrough, never for translation.
+    if not str(path or '').strip() or Path(path).is_dir():
+        raise ValueError(
+            '当前页缺少有效的中文 SOURCE 图片（源路径为空或指向目录）。'
+            '请补配中文源图，或将本页标记为“跳过 / 保留原图”；不能执行替换。'
+        )
+
+
 def prepare_workspace(
     pair: PagePair,
     page_root: str | Path,
@@ -62,10 +72,6 @@ def prepare_workspace(
     mode: str,
 ) -> WorkspacePreparation:
     root = Path(page_root)
-    root.mkdir(parents=True, exist_ok=True)
-    review_mode_archive = archive_review_state_if_mode_changed(root, mode)
-    stale_mode_cleanup = clear_stale_mode_outputs(root, strict=True)
-    invalidate_manual_review_state(root)
     mark = (
         page_mark
         if isinstance(page_mark, PageMark)
@@ -78,6 +84,14 @@ def prepare_workspace(
             target_name=Path(pair.target_path).name,
         )
     )
+    # Reject invalid process requests before archiving/clearing existing review
+    # artifacts. Explicit skipped TARGET-only pages still use normal passthrough.
+    if mark.should_process:
+        _check_source_path(pair.source_path)
+    root.mkdir(parents=True, exist_ok=True)
+    review_mode_archive = archive_review_state_if_mode_changed(root, mode)
+    stale_mode_cleanup = clear_stale_mode_outputs(root, strict=True)
+    invalidate_manual_review_state(root)
     return WorkspacePreparation(root, mark, review_mode_archive, stale_mode_cleanup)
 
 
@@ -88,6 +102,7 @@ def prefetch_page_images(pair: PagePair) -> PrefetchedPageImages:
     owns all transactional side effects. The returned arrays are consumed by at
     most one page run and are never shared across renderers.
     """
+    _check_source_path(pair.source_path)
     source = read_image(pair.source_path)
     target = read_image(pair.target_path)
     return PrefetchedPageImages(
@@ -103,6 +118,7 @@ def load_page_inputs(
     *,
     prefetched_images: PrefetchedPageImages | None = None,
 ) -> PageInputContext:
+    _check_source_path(pair.source_path)
     authority_source_path = pair.source_path
     source_path_local = authority_source_path
     target_path_local = pair.target_path

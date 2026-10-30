@@ -1,5 +1,5 @@
 """Compose pixel-mode translations over an independently cleaned colour master."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
@@ -16,6 +16,50 @@ class TargetFirstComposition:
     authority: np.ndarray
     source_layer: np.ndarray
     diagnostics: dict
+    deferred_white_regions: list = field(default_factory=list, repr=False)
+
+    def resolve_verified_white_cleanup(self, white_clear_mask: np.ndarray) -> None:
+        """Settle optional-layout warnings only after proven white blank-first.
+
+        A missing Koharu SOURCE mask is not proof that the final white bubble
+        failed: its mode-owned raster/text foreground may have been rendered by
+        the later white-bubble stage. Require every original dark TARGET pixel
+        in the proven white interior to have actual blank-first erase authority.
+        Coloured/gradient regions and incomplete cleanups remain blocking.
+        """
+        if white_clear_mask.shape != self.clear_mask.shape:
+            raise ValueError("white cleanup authority dimensions differ")
+        rows = self.diagnostics.get("rows", [])
+        for index, box, required in self.deferred_white_regions:
+            x0, y0, x1, y1 = box
+            active = required > 0
+            if np.any(active) and np.all(white_clear_mask[y0:y1, x0:x1][active] > 0):
+                rows[index].update(
+                    status="resolved_verified_white_blank_first",
+                    verified_white_cleared_pixels=int(np.count_nonzero(active)),
+                )
+
+    def review_findings(self) -> tuple[list, list]:
+        rows = self.diagnostics.get("rows", [])
+        unresolved = [row for row in rows if str(row.get("status", "")).startswith("deferred_")]
+        residual = [row for row in rows if row.get("status") == "applied_target_first_lama"
+                    and (int(row.get("unchanged_target_dark_pixels_outside_source_ink", 0)) > 16
+                         or int(row.get("clean_base_dark_pixels", 0)) > 16)]
+        return unresolved, residual
+
+
+def _paper_is_spatially_flat(target, sample_mask):
+    """Separate JPEG noise from a coherent gradient before exact colour fill."""
+    x, y, w, h = cv2.boundingRect(sample_mask.astype(np.uint8))
+    medians = []
+    for iy in range(3):
+        for ix in range(3):
+            x0, x1 = x + w * ix // 3, x + w * (ix + 1) // 3
+            y0, y1 = y + h * iy // 3, y + h * (iy + 1) // 3
+            pixels = target[y0:y1, x0:x1][sample_mask[y0:y1, x0:x1]]
+            if len(pixels) >= 32:
+                medians.append(np.median(pixels, axis=0))
+    return len(medians) >= 3 and np.max(np.ptp(np.asarray(medians), axis=0)) <= 3
 
 
 def compose_coloured_containers(target, proposed, aligned_source, source_ink, records, callback):
@@ -29,7 +73,7 @@ def compose_coloured_containers(target, proposed, aligned_source, source_ink, re
     white_clear = np.zeros(shape, np.uint8)
     source_gray = cv2.cvtColor(aligned_source, cv2.COLOR_BGR2GRAY)
     source_sat = cv2.cvtColor(aligned_source, cv2.COLOR_BGR2HSV)[..., 1]
-    rows, plans = [], []
+    rows, plans, deferred_white_regions = [], [], []
     flat_fills = []
     for record in records or ():
         if not bool(getattr(record, "applied", False)):
@@ -73,6 +117,14 @@ def compose_coloured_containers(target, proposed, aligned_source, source_ink, re
         ink = (source_ink > 0) & interior & (source_gray < 235)
         if np.count_nonzero(ink) < 16:
             rows.append({**row, "status": "deferred_missing_source_lettering"})
+            if white_plan:
+                required = ((plan.mask > 0) & (target.min(axis=2) < 235)).astype(np.uint8)
+                if np.any(required):
+                    rx, ry, rw, rh = cv2.boundingRect(required)
+                    deferred_white_regions.append((
+                        len(rows) - 1, (rx, ry, rx + rw, ry + rh),
+                        required[ry:ry+rh, rx:rx+rw].copy(),
+                    ))
             continue
         compare_scope = np.maximum(plan.mask, ink.astype(np.uint8)*255)
         if equivalent_registered_ink(aligned_source, target, compare_scope):
@@ -82,13 +134,18 @@ def compose_coloured_containers(target, proposed, aligned_source, source_ink, re
         # neon paper can leave pale outlines of the old glyphs, invisible to a
         # dark-pixel residual audit. Exact paper reconstruction avoids that.
         colour_inner = cv2.erode(plan.domain, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
-        samples = target[(colour_inner > 0) & (plan.mask == 0)]
+        sample_mask = (colour_inner > 0) & (plan.mask == 0)
+        samples = target[sample_mask]
         flat_colour = None
         if not white_plan and len(samples) >= max(64, int(np.count_nonzero(colour_inner) * .5)):
             paper_colour = np.median(samples, axis=0)
             deviations = np.max(np.abs(samples.astype(np.float32) - paper_colour), axis=1)
             paper_hsv = cv2.cvtColor(np.uint8([[paper_colour]]), cv2.COLOR_BGR2HSV)[0, 0]
-            if paper_hsv[1] >= 50 and paper_hsv[2] >= 150 and np.percentile(deviations, 95) <= 10:
+            # Compression noise can exceed a few levels, but a coherent spatial
+            # colour change is a gradient and must never become a median fill.
+            if (paper_hsv[1] >= 18 and paper_hsv[2] >= 64
+                    and np.percentile(deviations, 95) <= 10
+                    and _paper_is_spatially_flat(target, sample_mask)):
                 flat_colour = np.rint(paper_colour).astype(np.uint8)
         if callback is None and not white_plan and flat_colour is None:
             rows.append({**row, "status": "deferred_inpainting_unavailable"})
@@ -102,9 +159,10 @@ def compose_coloured_containers(target, proposed, aligned_source, source_ink, re
             clear = np.maximum(clear, colour_inner)
             flat_fills.append((colour_inner, flat_colour))
         source_support[ink] = 255
-        # Restore the original contour and a small external AA fringe; no
-        # SOURCE paper or previous fill operation can become the new master.
-        restore = np.maximum(restore, cv2.dilate(plan.domain, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))))
+        # The proven contour belongs to this container, but its external fringe
+        # can contain accepted lettering from a neighbouring region. Never
+        # restore original TARGET over edits outside this container's authority.
+        restore = np.maximum(restore, plan.domain)
         row["status"] = "applied_white_blank_first" if white_plan else "applied_target_first_lama"
         if flat_colour is not None:
             row.update(status="applied_flat_colour_blank_first", paper_bgr=flat_colour.tolist())
@@ -113,7 +171,7 @@ def compose_coloured_containers(target, proposed, aligned_source, source_ink, re
     if not plans:
         return TargetFirstComposition(proposed, target.copy(), clear, restore,
                                       np.zeros((*shape, 4), np.uint8),
-                                      {"applied": 0, "rows": rows})
+                                      {"applied": 0, "rows": rows}, deferred_white_regions)
     model_mask = clear.copy(); model_mask[white_clear > 0] = 0
     for flat_mask, _ in flat_fills:
         model_mask[flat_mask > 0] = 0
@@ -176,4 +234,4 @@ def compose_coloured_containers(target, proposed, aligned_source, source_ink, re
         "schema": "folirina.target_first_colour.v1", "applied": len(plans),
         "policy": "target_only_mask_then_lama_then_source_alpha",
         "source_background_composited": False, "model": model_diagnostics, "rows": rows,
-    })
+    }, deferred_white_regions)

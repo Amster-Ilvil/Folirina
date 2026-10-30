@@ -19,7 +19,7 @@ from typing import Callable, Type
 
 from .cache import load_completed_page
 from .mode_contracts import mode_scoped_config_payload
-from .io_utils import list_images, save_json, stem_id
+from .io_utils import list_images, load_json, save_json, stem_id
 from .models import BookProject, PagePair, PageProject
 from .project_store import DiskBackedPageList
 from .page_memory import release_page_heavy_arrays
@@ -701,6 +701,40 @@ def run_book_orchestration(
                 if cached is not None and not _resume_mark_allows_cached(cached, requested_mark):
                     cached = None
                 if cached is not None:
+                    if cached.meta.pop("_delivery_refresh_pending", False):
+                        from .publication import publish_project_delivery, snapshot_delivery_outputs, restore_delivery_outputs
+                        from .workspace_guard import PageRunGuard
+                        try:
+                            with PageRunGuard(page_dir, str(config.transfer.mode)):
+                                emit(idx, len(pairs), pair, "running", True, "继续：重新导出压缩 / 超分结果")
+                                fresh = load_json(page_dir / "project.json")
+                                with tempfile.TemporaryDirectory(prefix=".delivery-transaction-", dir=page_dir) as td:
+                                    snapshot_delivery_outputs(Path(td), final_path, config.export.delivery, (fresh.get("meta") or {}).get("delivery_export"))
+                                    try:
+                                        publish_project_delivery(
+                                            config.export.delivery, page_dir, final_path,
+                                            fresh["artifacts"], fresh["meta"], cancel_cb=cancel_cb,
+                                        )
+                                        save_json(page_dir / "project.json", fresh)
+                                    except Exception:
+                                        restore_delivery_outputs(Path(td))
+                                        raise
+                                cached.artifacts.update(fresh["artifacts"])
+                                cached.meta.update(fresh["meta"])
+                        except cancelled_exception:
+                            cancelled = True
+                            emit(idx - 1, len(pairs), pair, "cancelled", True, "用户停止导出")
+                            save_checkpoint(idx - 1, current_pair=pair, status="cancelled", force=True)
+                            break
+                        except Exception as exc:
+                            row = {"index": idx, "source": pair.source_path, "target": pair.target_path,
+                                   "stage": "delivery", "error": f"{type(exc).__name__}: {exc}"}
+                            failures.append(row)
+                            emit(idx, len(pairs), pair, "failed", True, row["error"])
+                            save_checkpoint(idx, current_pair=pair, status="failed", force=True)
+                            if config.batch.stop_on_error:
+                                raise
+                            continue
                     resumed += 1
                     compatible_hit = bool((cached.meta or {}).get("batch_resume_compatible_hit"))
                     if compatible_hit:

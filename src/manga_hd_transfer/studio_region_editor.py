@@ -25,8 +25,6 @@ from .region_workspace_state import RegionWorkspaceLinkState, selection_signatur
 from .region_brush_reveal import (
     stroke_bbox as brush_stroke_bbox, paint_reveal_stroke_inplace, compose_reveal_patch,
     mask_bbox as brush_mask_bbox, mask_counts as brush_mask_counts,
-    label_verified_white_bubbles, touched_verified_white_bubble_labels,
-    expand_to_verified_white_bubbles_inplace,
 )
 from .region_selection import project_selection_spec
 from .manual_effect import map_target_bbox_to_source, registration_homography
@@ -182,10 +180,6 @@ class RegionCompositeDialog(QDialog):
         from .white_bubble_composite import verified_white_bubble_mask
         self._brush_white = (verified_white_bubble_mask(self._brush_target, self.project.get("target_bubbles", []))
                              if self._brush_target is not None else None)
-        if self._brush_white is not None and np.any(self._brush_white):
-            self._brush_white_labels, self._brush_white_stats = label_verified_white_bubbles(self._brush_white)
-        else:
-            self._brush_white_labels = self._brush_white_stats = None
         if self._brush_base is None or self._brush_base.shape[:2] != self.target_view.image_shape():
             raise ValueError("区域涂抹无法读取当前结果")
         if self._brush_source is None:
@@ -301,6 +295,10 @@ class RegionCompositeDialog(QDialog):
         brush_actions=QGridLayout(); brush_actions.setHorizontalSpacing(5); brush_actions.setVerticalSpacing(5)
         self.brush_undo_btn=QPushButton("撤销一笔"); self.brush_redo_btn=QPushButton("重做一笔"); self.brush_clear_btn=QPushButton("清空本次涂抹")
         brush_actions.addWidget(self.brush_undo_btn,0,0); brush_actions.addWidget(self.brush_redo_btn,0,1); brush_actions.addWidget(self.brush_clear_btn,1,0,1,2); brush_actions.setColumnStretch(0,1); brush_actions.setColumnStretch(1,1); bp.addLayout(brush_actions)
+        self.brush_repair_btn=QPushButton("去字白边并修补背景 · LaMa")
+        self.brush_repair_btn.setToolTip("框选完整的白描边文字，或涂抹透明笔触后点击。后台使用本机已有 LaMa 修补原图纹理，再叠加黑灰中文；不下载模型，不改选区外画面。")
+        self.brush_repair_btn.clicked.connect(self._repair_outlined_background)
+        bp.addWidget(self.brush_repair_btn)
         self.brush_status=QLabel("尚未涂抹 · 选择“透明揭示”或“挖孔揭示”后直接在中间画布操作")
         self.brush_status.setObjectName("hint"); self.brush_status.setWordWrap(True); self.brush_status.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred); bp.addWidget(self.brush_status)
         ip.addWidget(brush_panel); ip.addStretch(1)
@@ -529,7 +527,8 @@ class RegionCompositeDialog(QDialog):
         self.target_view.set_interaction_mode("brush")
         self.target_view.set_brush_size(int(self.brush_size.value()))
         names={"transparent":"透明揭示","hole":"挖孔揭示","restore":"恢复日文"}
-        self.selection_status.setText(f"涂抹模式 · {names.get(key,key)} · 左键涂抹，右键恢复，中键平移")
+        safety={"transparent":"仅揭示笔触内黑灰文字候选；过滤 SOURCE 纸色和彩色内容，不自动扩展气泡", "hole":"完整揭示 SOURCE，包含背景和图案", "restore":"恢复笔触内的原始日文图"}
+        self.selection_status.setText(f"涂抹模式 · {names.get(key,key)} · {safety.get(key,'')} · 右键恢复，中键平移")
         self._trace_region("region_brush_activated",{"brush_mode":key,"selection_bbox":self.target_view.box()})
         self._update_brush_controls(); self._update_region_action_state()
 
@@ -711,33 +710,12 @@ class RegionCompositeDialog(QDialog):
         mode="restore" if bool((payload or {}).get("right")) else self._brush_mode_key()
         diag=paint_reveal_stroke_inplace(self._brush_transparent,self._brush_hole,[start,end],diameter,mode,limit_mask=limit,restore_mask=self._brush_restore)
         if diag.changed_pixels>0:
-            expanded_boxes=[]
-            if mode != "restore" and self._brush_white_labels is not None:
-                labels=touched_verified_white_bubble_labels(
-                    self._brush_transparent,self._brush_hole,self._brush_white_labels,diag.bbox
-                )
-                if labels:
-                    boxes=[]
-                    for label in labels:
-                        if label < len(self._brush_white_stats):
-                            x,y,bw,bh=[int(v) for v in self._brush_white_stats[label,:4]]
-                            boxes.append((x,y,x+bw,y+bh))
-                    extra_tiles=set().union(*(self._tiles_for_bbox(box) for box in boxes))
-                    self._remember_before_tiles(extra_tiles)
-                    expanded_boxes=expand_to_verified_white_bubbles_inplace(
-                        self._brush_transparent,self._brush_hole,self._brush_white_labels,
-                        self._brush_white_stats,labels
-                    )
-                    for label in labels:
-                        if label < len(self._brush_white_stats):
-                            x,y,bw,bh=[int(v) for v in self._brush_white_stats[label,:4]]
-                            roi=self._brush_restore[y:y+bh,x:x+bw]
-                            roi[self._brush_white_labels[y:y+bh,x:x+bw]==label]=0
+            # A brush grants authority only to its painted footprint. Semantic
+            # balloon expansion belongs to the explicit whole-balloon tool;
+            # doing it here also escaped limit_mask and modified nearby artwork.
             # Feather/Telea touch neighboring tiles; invalidate those borders
             # too so a tile seam cannot resurrect Japanese strokes.
             dirty=set(self._tiles_for_bbox(self._halo_bounds(diag.bbox)))
-            for box in expanded_boxes:
-                dirty.update(self._tiles_for_bbox(box))
             self._refresh_brush_tiles(dirty)
 
     def _brush_stroke_finished(self):
@@ -813,11 +791,11 @@ class RegionCompositeDialog(QDialog):
                 self._brush_base=image; self.target_view.replace_display_image(final_path)
         self._brush_transparent[:]=0; self._brush_hole[:]=0; self._brush_restore[:]=0; self._brush_history.clear(); self._brush_redo_stack.clear(); self._brush_stroke_before={}; self._brush_stroke_tiles=set(); self._brush_source_tile_cache.clear(); self._clear_brush_preview_items(); self._update_brush_controls()
 
-    def _brush_commit_snapshot(self):
+    def _brush_commit_snapshot(self, *, halo=None):
         box=brush_mask_bbox(self._brush_transparent,self._brush_hole,self._brush_restore)
         if len(box)!=4: raise ValueError("当前没有可提交的涂抹揭示")
         # Commit exactly the same padded context used by live preview.
-        box=list(self._halo_bounds(box)); x0,y0,x1,y1=box
+        box=list(self._halo_bounds(box,pad=halo)); x0,y0,x1,y1=box
         return {"box":box,"tr":self._brush_transparent[y0:y1,x0:x1].copy(),
             "ho":self._brush_hole[y0:y1,x0:x1].copy(),"restore":self._brush_restore[y0:y1,x0:x1].copy(),"base":self._brush_base[y0:y1,x0:x1].copy(),
             "target":self._brush_target[y0:y1,x0:x1].copy() if self._brush_target is not None else None,
@@ -835,8 +813,25 @@ class RegionCompositeDialog(QDialog):
         tr=snapshot["tr"]; ho=snapshot["ho"]
         under,_identity=_aligned_source_roi(snapshot["source"],snapshot["shape"],snapshot["project"],(x0,y0,x1,y1),source_offset_x=snapshot["dx"],source_offset_y=snapshot["dy"])
         restore=snapshot.get("restore")
-        _preview,patch=compose_reveal_patch(snapshot["base"],under,tr,ho,transparent_feather_px=snapshot["feather"],transparent_opacity=snapshot["opacity"],target_bgr=snapshot["target"],verified_white_mask=snapshot.get("white"),restore_mask=restore)
-        if cv2.countNonZero(patch[:,:,3])<=0: raise ValueError("涂抹揭示的有效透明区域为空")
+        repair_diag={}; inpaint=None; outlined_pixels=0
+        if snapshot.get("repair_outlined_background"):
+            from .outlined_text_mask import outlined_target_text_mask, refine_smooth_inpainted_background
+            from .lama_manga_runtime import inpaint_koharu_text
+            if snapshot.get("target") is None:
+                raise ValueError("背景修补需要原始 TARGET")
+            outlined=outlined_target_text_mask(snapshot["target"])
+            outlined_pixels=int(np.count_nonzero((outlined>0)&(tr>0)&(ho==0)))
+            if not outlined_pixels:
+                raise ValueError("笔触/选区内没有完整的黑字白描边证据；请框住整组原日文并保留周围背景。")
+            def inpaint(image,mask):
+                result,diag=inpaint_koharu_text(image,mask,model_path=snapshot.get("lama_model_path"))
+                result,smooth=refine_smooth_inpainted_background(image,mask,result)
+                diag.update(smooth)
+                repair_diag.update(diag)
+                return result,diag
+        _preview,patch=compose_reveal_patch(snapshot["base"],under,tr,ho,transparent_feather_px=snapshot["feather"],transparent_opacity=snapshot["opacity"],target_bgr=snapshot["target"],verified_white_mask=snapshot.get("white"),restore_mask=restore,inpaint_callback=inpaint)
+        if cv2.countNonZero(patch[:,:,3])<=0:
+            raise ValueError("笔触内没有可安全揭示的黑灰文字或可清除的日文；长直线和画面内容会被保护。请覆盖完整字形，或使用显式挖孔工具。")
         counts=brush_mask_counts(tr,ho,restore); kinds=[]
         if counts["transparent_pixels"]: kinds.append("transparent")
         if counts["hole_pixels"]: kinds.append("hole")
@@ -848,23 +843,58 @@ class RegionCompositeDialog(QDialog):
             "transparent_feather_px":snapshot["feather"],"transparent_opacity":snapshot["opacity"],
             "brush_reveal_kind":"+".join(kinds) if kinds else "none",**counts,
         }
+        if snapshot.get("repair_outlined_background"):
+            row.update(background_repair="lama_manga",outlined_text_pixels=outlined_pixels,
+                       background_repair_diagnostics=repair_diag)
         union=np.maximum(tr,ho).astype(np.uint8)
         if restore is not None: union=np.maximum(union,restore)
         return row,union,patch
 
-    def _commit_brush_session(self, *, interactive:bool=True, after_commit=None)->bool:
+    def _outlined_repair_snapshot(self):
+        if np.any(self._brush_transparent):
+            snapshot=self._brush_commit_snapshot(halo=128)
+        else:
+            if self._pending_brush_pixels():
+                raise ValueError("请先提交或清空现有挖孔/恢复笔触，再修补背景。")
+            box=list(self.target_view.box() or [])
+            if len(box)!=4:
+                raise ValueError("请先框选白描边文字，或用透明画笔涂抹要修补的位置。")
+            from .region_selection import selection_mask_from_row
+            selection=selection_mask_from_row({"target_bbox":box,"selection_spec":self.target_view.selection_spec()},self._brush_base.shape[:2])
+            xa,ya,xb,yb=self._halo_bounds(box,pad=128)
+            tr=selection[ya:yb,xa:xb].copy(); zero=np.zeros_like(tr)
+            snapshot={"box":[xa,ya,xb,yb],"tr":tr,"ho":zero,"restore":zero.copy(),
+                "base":self._brush_base[ya:yb,xa:xb].copy(),
+                "target":self._brush_target[ya:yb,xa:xb].copy(),
+                "white":self._brush_white[ya:yb,xa:xb].copy() if self._brush_white is not None else None,
+                "source":self._brush_source,"shape":self._brush_base.shape[:2],"project":copy.deepcopy(self.project),
+                "dx":int(self.offset_x.value()),"dy":int(self.offset_y.value()),
+                "feather":int(self.brush_feather.value()),"opacity":float(self.brush_opacity.value())/100.,
+                "diameter":int(self.brush_size.value())}
+        snapshot["repair_outlined_background"]=True
+        snapshot["lama_model_path"]=self.config.inpainting.lama_model_path
+        return snapshot
+
+    def _repair_outlined_background(self):
+        if self._link_state.applying: return
+        try: snapshot=self._outlined_repair_snapshot()
+        except (ValueError,TypeError) as exc:
+            notify(self,str(exc),"warning"); return
+        self._commit_brush_session(snapshot=snapshot)
+
+    def _commit_brush_session(self, *, interactive:bool=True, after_commit=None, snapshot=None)->bool:
         if self._link_state.applying: return False
         if self._commit_handler is None:
             if interactive: QMessageBox.warning(self,"无法提交","当前区域编辑器没有连接复核提交器。")
             return False
-        try: snapshot=self._brush_commit_snapshot()
+        try: snapshot=self._brush_commit_snapshot() if snapshot is None else snapshot
         except Exception as exc:
             if interactive: QMessageBox.information(self,"没有涂抹",str(exc))
             return False
         self._link_state.applying=True
         self.target_view.setEnabled(False); self._region_inspector.setEnabled(False)
-        self.apply_btn.setText("后台提交涂抹…"); self.apply_btn.setEnabled(False)
-        self._trace_region("region_brush_commit_requested",{"target_bbox":snapshot["box"],"pixels":self._pending_brush_pixels()})
+        self.apply_btn.setText("后台 LaMa 修补…" if snapshot.get("repair_outlined_background") else "后台提交涂抹…"); self.apply_btn.setEnabled(False)
+        self._trace_region("region_brush_commit_requested",{"target_bbox":snapshot["box"],"pixels":brush_mask_counts(snapshot["tr"],snapshot["ho"],snapshot.get("restore"))["union_pixels"],"background_repair":bool(snapshot.get("repair_outlined_background"))})
         succeeded=[]
         def action():
             row,reveal,patch=self._build_brush_commit(snapshot)
@@ -880,7 +910,8 @@ class RegionCompositeDialog(QDialog):
                 final=self._commit_finalize_handler(row,result) if self._commit_finalize_handler is not None else result
                 final_path=Path(str(getattr(final,"final_reviewed",final) or self.page_dir/"final_reviewed.png"))
                 self._reset_brush_session(final_path); self._applied+=1
-                self.selection_status.setText(f"涂抹揭示已提交 · 已叠加 {self._applied} 步")
+                label="去字背景修补已提交" if row.get("background_repair") else "涂抹揭示已提交"
+                self.selection_status.setText(f"{label} · 已叠加 {self._applied} 步")
                 self._trace_region("region_brush_commit_succeeded",{"target_bbox":snapshot["box"],"applied_count":self._applied})
                 succeeded.append(True)
             except Exception as exc: failed(str(exc))

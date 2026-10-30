@@ -8,6 +8,7 @@ import sys
 import socket
 import threading
 import tomllib
+from contextlib import contextmanager
 
 import cv2
 import numpy as np
@@ -62,7 +63,41 @@ def _fake_text(img, box, lines):
         cv2.rectangle(img,(x0+5,y),(x1-5,min(y+gap,y1-2)),(0,0,0),-1); y+=gap*2
 
 
+@contextmanager
+def _offline_model_store():
+    """Keep synthetic pipeline checks independent of installed neural models.
+
+    Host/model/MPS acceptance belongs to m6_native_acceptance, not this offline
+    release gate. A real detector interpreting synthetic bars and circles can
+    legitimately change the geometry and must not change these fixture routes.
+    Only this diagnostic process's model discovery is redirected; user models
+    and product defaults are never changed.
+    """
+    previous = os.environ.get("FOLIRINA_MODEL_HOME")
+    with tempfile.TemporaryDirectory(prefix="folirina-selftest-models-") as td:
+        os.environ["FOLIRINA_MODEL_HOME"] = str(Path(td) / "models")
+        try:
+            yield
+        finally:
+            if previous is None:
+                os.environ.pop("FOLIRINA_MODEL_HOME", None)
+            else:
+                os.environ["FOLIRINA_MODEL_HOME"] = previous
+
+
 def run_selftest() -> dict:
+    with _offline_model_store():
+        report = _run_selftest_fixtures()
+    report["scope"] = {
+        "kind": "offline_synthetic_pipeline",
+        "installed_models_used": False,
+        "hardware_benchmark": False,
+        "native_acceptance": "tools/m6_native_acceptance.py",
+    }
+    return report
+
+
+def _run_selftest_fixtures() -> dict:
     with tempfile.TemporaryDirectory(prefix="mhd-selftest-") as td:
         root=Path(td)
         target=_page(); box=(235,660,365,740); _fake_text(target,box,3)

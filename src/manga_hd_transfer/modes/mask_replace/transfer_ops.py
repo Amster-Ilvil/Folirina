@@ -1083,27 +1083,9 @@ def transfer_koharu_semantic_regions(
             records.append(rec)
             continue
 
-        rendered = text_img
-        # The target ink cache describes the previous rendered revision exactly.
-        # Invalidate only after a successful pixel write; failed candidates may
-        # safely reuse it byte-for-byte.
-        rendered_target_ink_cache = None
-        composite = np.maximum(composite, write_mask)
+        candidate_rendered = text_img
         diag_clear = diag.get("clear_mask")
-        if isinstance(diag_clear, np.ndarray) and diag_clear.shape == shape:
-            clear_all = np.maximum(clear_all, diag_clear)
-        if raw_group_used:
-            # The TARGET Koharu polygon can under-segment a whole letter into a
-            # tiny stroke while its raw_box spans the real typography.  Grant
-            # explicit ALLOW only to pixels that the strict plain-paper changed-
-            # glyph transfer actually cleared/wrote; never to the raw rectangle.
-            authority_allow = np.maximum(authority_allow, write_mask)
-            if isinstance(diag_clear, np.ndarray) and diag_clear.shape == shape:
-                authority_allow = np.maximum(authority_allow, diag_clear)
-        use = write_mask > 0
-        rgb = cv2.cvtColor(rendered, cv2.COLOR_BGR2RGB)
-        layer[use, :3] = rgb[use]
-        layer[..., 3] = np.maximum(layer[..., 3], write_mask)
+        candidate_clear = diag_clear if isinstance(diag_clear, np.ndarray) and diag_clear.shape == shape else np.zeros(shape, np.uint8)
         rec.applied = True
         rec.mask_iou = 1.0
         rec.target_coverage = 1.0
@@ -1121,24 +1103,41 @@ def transfer_koharu_semantic_regions(
             }
         else:
             _evaluate_content_completeness(
-                rec, source_ink_mask, diag.get("target_ink_mask"), rendered, cfg,
+                rec, source_ink_mask, diag.get("target_ink_mask"), candidate_rendered, cfg,
                 target_invalidation_mask=write_mask,
             )
         if not bool(getattr(rec, "content_complete", False)) and not bool(diag.get("empty_source_clear", False)):
             repaired, repaired_mask, repair_diag = _repair_content_region(
-                rec, rendered, aligned_source, target, write_mask, gate,
-                source_ink_mask, diag.get("target_ink_mask"), cfg,
+                rec, candidate_rendered, aligned_source, target, write_mask, gate,
+                source_ink_mask, diag.get("target_ink_mask"), cfg, source_ink_only=True,
             )
             rec.meta["content_auto_repair"] = repair_diag
             if bool(repair_diag.get("improved", False)):
-                rendered = repaired
+                candidate_rendered = repaired
                 write_mask = np.maximum(write_mask, repaired_mask)
-                composite = np.maximum(composite, write_mask)
-                clear_all = np.maximum(clear_all, repaired_mask)
-                use = write_mask > 0
-                rgb = cv2.cvtColor(rendered, cv2.COLOR_BGR2RGB)
-                layer[use, :3] = rgb[use]
-                layer[..., 3] = np.maximum(layer[..., 3], write_mask)
+                candidate_clear = np.maximum(candidate_clear, repaired_mask)
+        # A failed standalone/open-text recovery can include nearby artwork.
+        # Do not publish its patch before checking completeness: otherwise a
+        # review candidate permanently bleaches hair/bags even with SAFE triage.
+        if standalone and not bool(getattr(rec, "content_complete", False)):
+            rec.applied = False
+            rec.reason = "standalone_content_incomplete_not_published"
+            rec.review_required = True
+            rec.review_reason = "semantic_content_incomplete"
+            rec.restorable = True
+            rec.editable = True
+            records.append(rec)
+            continue
+        rendered = candidate_rendered
+        rendered_target_ink_cache = None
+        composite = np.maximum(composite, write_mask)
+        clear_all = np.maximum(clear_all, candidate_clear)
+        if raw_group_used:
+            authority_allow = np.maximum(authority_allow, np.maximum(write_mask, candidate_clear))
+        use = write_mask > 0
+        rgb = cv2.cvtColor(rendered, cv2.COLOR_BGR2RGB)
+        layer[use, :3] = rgb[use]
+        layer[..., 3] = np.maximum(layer[..., 3], write_mask)
         boundary_touch = bool(diag.get("boundary_touch", False))
         strict_raw_group_safe = bool(
             raw_group_used

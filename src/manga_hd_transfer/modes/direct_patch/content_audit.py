@@ -165,6 +165,7 @@ def _repair_content_region(
     tolerance_px: int | None = None,
     min_source_coverage: float | None = None,
     max_target_residual: float | None = None,
+    source_ink_only: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """Attempt one bounded OCR-free completeness repair inside a trusted region.
 
@@ -186,6 +187,16 @@ def _repair_content_region(
         max_px=int(getattr(cfg, "content_auto_repair_max_growth_px", 5)),
     )
     new_pixels = (repair_mask > 0) & (current_write_mask == 0)
+    blocked_paper_pixels = 0
+    if source_ink_only:
+        if source_ink is None or source_ink.shape != repair_mask.shape:
+            return rendered, current_write_mask, {"enabled": True, "reason": "missing_source_ink_authority"}
+        # Open/coloured text owns glyphs, not SOURCE paper. Growing a repair
+        # around JP erasure used to copy white scan pixels into colour balloons.
+        blocked = new_pixels & (source_ink == 0)
+        blocked_paper_pixels = int(np.count_nonzero(blocked))
+        repair_mask[blocked] = 0
+        new_pixels &= source_ink > 0
     if np.any(new_pixels):
         out[new_pixels] = source_image[new_pixels]
 
@@ -210,6 +221,16 @@ def _repair_content_region(
                 if np.any(repaint):
                     out[repaint] = source_image[repaint]
 
+    colour_repair = {"repaired_pixels": 0}
+    if source_ink_only:
+        from ...coloured_paper_repair import repair_coloured_paper_leaks
+        out, _paper_mask, colour_repair = repair_coloured_paper_leaks(
+            out, target_original, np.maximum(repair_mask,residual_clear), protected_ink=source_ink,
+        )
+        # Publish validated repair pixels fully opaque, even if their old
+        # semantic-transfer alpha was partial; otherwise the white fringe can
+        # leak through again when the layer is composited.
+        repair_mask = np.maximum(repair_mask, _paper_mask)
     _evaluate_content_completeness(
         rec, source_ink, target_ink, out, cfg,
         tolerance_px=tolerance_px,
@@ -223,7 +244,7 @@ def _repair_content_region(
     after_res = float(getattr(rec, "target_residual_ratio", 0.0))
     gain = (after_cov - before_cov) + (before_res - after_res)
     min_gain = float(getattr(cfg, "content_auto_repair_min_gain", 0.01))
-    improved = bool(rec.content_complete or gain >= min_gain)
+    improved = bool(rec.content_complete or gain >= min_gain or int(colour_repair.get("repaired_pixels", 0)) > 0)
     rec.repair_succeeded = bool(improved)
     if not improved:
         rec.source_ink_coverage = before_cov
@@ -233,6 +254,9 @@ def _repair_content_region(
     return out if improved else rendered, repair_mask if improved else current_write_mask, {
         "enabled": True,
         "growth": growth,
+        "source_ink_only": bool(source_ink_only),
+        "source_paper_pixels_blocked": blocked_paper_pixels,
+        "coloured_paper_repair": colour_repair,
         "residual_clear_pixels": int(cv2.countNonZero(residual_clear)),
         "before_source_coverage": before_cov,
         "after_source_coverage": after_cov,

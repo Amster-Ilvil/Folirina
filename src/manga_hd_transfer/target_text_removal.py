@@ -18,13 +18,13 @@ class TargetRemovalPlan:
     diagnostics: dict
 
 
-def coloured_container_removal(target: np.ndarray, seed: np.ndarray) -> TargetRemovalPlan:
+def coloured_container_removal(target: np.ndarray, seed: np.ndarray, *, manual_flat_paper: bool = False) -> TargetRemovalPlan:
     # A short translated line can sit inside a much taller Japanese balloon.
     # Grow only the search window, never the mask or the accepted container.
     last = None
     for family in ("colour", "white"):
         for scale in (0.65, 1.3, 2.6):
-            plan = _container_in_window(target, seed, scale, family)
+            plan = _container_in_window(target, seed, scale, family, manual_flat_paper=manual_flat_paper)
             last = plan
             if plan.diagnostics.get("reason") != "container_reaches_search_boundary":
                 break
@@ -35,7 +35,7 @@ def coloured_container_removal(target: np.ndarray, seed: np.ndarray) -> TargetRe
     return last
 
 
-def _container_in_window(target: np.ndarray, seed: np.ndarray, scale: float, family: str) -> TargetRemovalPlan:
+def _container_in_window(target: np.ndarray, seed: np.ndarray, scale: float, family: str, *, manual_flat_paper: bool = False) -> TargetRemovalPlan:
     shape = target.shape[:2]
     empty = np.zeros(shape, np.uint8)
     if seed.shape != shape:
@@ -50,7 +50,10 @@ def _container_in_window(target: np.ndarray, seed: np.ndarray, scale: float, fam
     roi = target[y0:y1, x0:x1]
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     local_seed = seed[y0:y1, x0:x1] > 0
-    bright_colour = ((hsv[..., 1] >= 60) & (hsv[..., 2] >= 145)) if family == "colour" else (
+    # Saturation distinguishes tinted paper from white; brightness alone loses
+    # dark purple balloons, while S>=60 loses cream/pastel paper entirely.
+    # Connected-container, boundary, texture and SOURCE checks still apply.
+    bright_colour = ((hsv[..., 1] >= 18) & (hsv[..., 2] >= 64)) if family == "colour" else (
         (hsv[..., 1] <= 35) & (hsv[..., 2] >= 215))
     sample = bright_colour & local_seed
     if np.count_nonzero(sample) < max(100, np.count_nonzero(local_seed)*0.40):
@@ -60,7 +63,16 @@ def _container_in_window(target: np.ndarray, seed: np.ndarray, scale: float, fam
         hue = int(hist.argmax()) * 6 + 3
         distance = np.abs(hsv[..., 0].astype(np.int16)-hue)
         distance = np.minimum(distance, 180-distance)
-        colour = (bright_colour & (distance <= 10)).astype(np.uint8)
+        # Hue alone connects yellow balloon paper to touching brown hair/skin.
+        # Bound the flood by the paper's robust brightness distribution inside
+        # the supplied text seed. Uniform dark/pastel paper remains supported;
+        # gradients receive a wider bound from their actual variation.
+        values = hsv[..., 2][sample & (distance <= 10)].astype(np.float32)
+        value_median = float(np.median(values))
+        value_mad = float(np.median(np.abs(values - value_median)))
+        value_radius = max(24.0, 4.0 * value_mad)
+        colour = (bright_colour & (distance <= 10)
+                  & (np.abs(hsv[..., 2].astype(np.float32) - value_median) <= value_radius)).astype(np.uint8)
     else:
         colour = bright_colour.astype(np.uint8)
     count, labels, stats, _ = cv2.connectedComponentsWithStats(colour, 8)
@@ -91,9 +103,18 @@ def _container_in_window(target: np.ndarray, seed: np.ndarray, scale: float, fam
         paper = roi[component > 0]
         median = np.median(paper, axis=0)
         deviation = np.max(np.abs(paper.astype(np.float32) - median), axis=1)
+        paper_ratio = np.count_nonzero(component) / max(1, area)
+        # Explicit manual selections may contain oversized display lettering:
+        # 10% nonpaper is not a useful glyph-size limit for a large starburst.
+        # Keep the automatic contract unchanged. The manual caller additionally
+        # rejects large objects, non-flat paper and writes outside its selection.
+        manual_bold = (manual_flat_paper and family == "colour"
+                       and paper_ratio >= 0.75
+                       and np.percentile(deviation, 95) <= 10
+                       and float(np.median(hsv[..., 1][component > 0])) >= 120)
         flat_large = (family == "colour" and area <= shape[0]*shape[1]*0.50
-                      and np.count_nonzero(component) >= area*0.90
-                      and np.percentile(deviation, 95) <= 15)
+                      and ((paper_ratio >= 0.90 and np.percentile(deviation, 95) <= 15)
+                           or manual_bold))
         if not flat_large:
             return TargetRemovalPlan(empty, empty.copy(), {"reason": "oversized_container"})
     # Preserve the original contour, rays and nearby line art. Letter holes are
@@ -102,13 +123,27 @@ def _container_in_window(target: np.ndarray, seed: np.ndarray, scale: float, fam
     holes = ((filled > 0) & (colour == 0) & (interior > 0)).astype(np.uint8)*255
     n, labs, st, _ = cv2.connectedComponentsWithStats((holes > 0).astype(np.uint8), 8)
     glyphs = np.zeros_like(holes)
+    protected = np.zeros_like(holes)
     for i in range(1, n):
         if int(st[i, cv2.CC_STAT_AREA]) >= 2:
-            glyphs[labs == i] = 255
+            component_hole = labs == i
+            if manual_flat_paper and family == "colour":
+                # A coloured inset/illustration enclosed by paper is not a bold
+                # black glyph. Preserve its outline as well as its bright fill.
+                different_colour = ((hsv[..., 2] >= 80) & (hsv[..., 1] >= 55)
+                                    & (distance > 10))
+                if np.mean(different_colour[component_hole]) > 0.10:
+                    protected[component_hole] = 255
+                    continue
+            glyphs[component_hole] = 255
     if cv2.countNonZero(glyphs) > max(1, area)*0.40:
         return TargetRemovalPlan(empty, empty.copy(), {"reason": "non_textured_paper_not_proven"})
     glyphs = cv2.dilate(glyphs, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
     glyphs[interior == 0] = 0
+    if np.any(protected):
+        protected = cv2.dilate(protected, np.ones((3, 3), np.uint8))
+        glyphs[protected > 0] = 0
+        filled[protected > 0] = 0
     domain, removal = empty.copy(), empty.copy()
     domain[y0:y1, x0:x1] = filled
     removal[y0:y1, x0:x1] = glyphs

@@ -962,7 +962,7 @@ def transfer_koharu_semantic_regions(
         if not bool(getattr(rec, "content_complete", False)):
             repaired, repaired_mask, repair_diag = _repair_content_region(
                 rec, rendered, aligned_source, target, write_mask, gate,
-                source_ink_mask, diag.get("target_ink_mask"), cfg,
+                source_ink_mask, diag.get("target_ink_mask"), cfg, source_ink_only=True,
             )
             rec.meta["content_auto_repair"] = repair_diag
             if bool(repair_diag.get("improved", False)):

@@ -30,7 +30,11 @@ def list_images(folder: str | Path) -> list[Path]:
 
 
 def read_image(path: str | Path) -> np.ndarray:
+    if not str(path or '').strip():
+        raise ValueError('图片路径为空，请选择有效的图片文件。')
     p = Path(path)
+    if p.is_dir():
+        raise ValueError(f'图片路径指向目录而非图片文件：{p}')
     data = np.fromfile(p, dtype=np.uint8)
     img = cv2.imdecode(data, cv2.IMREAD_COLOR)
     if img is None:

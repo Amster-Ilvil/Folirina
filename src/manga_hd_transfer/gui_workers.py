@@ -58,13 +58,19 @@ class ComponentProbeWorker(QThread):
 
     def __init__(self, config: PipelineConfig):
         super().__init__()
+        self.setStackSize(8 * 1024 * 1024)
         self.config = config
 
     def run(self):
         try:
-            self.done.emit(probe_components(self.config))
+            if self.isInterruptionRequested():
+                return
+            result = probe_components(self.config, cancel_cb=self.isInterruptionRequested)
+            if not self.isInterruptionRequested():
+                self.done.emit(result)
         except Exception as exc:
-            self.failed.emit(str(exc))
+            if not self.isInterruptionRequested():
+                self.failed.emit(str(exc))
 
 
 class ModelDownloadWorker(QThread):

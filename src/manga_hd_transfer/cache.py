@@ -307,8 +307,9 @@ class PageStageCache:
             return None
         p = obj.get("payload") or {}
         try:
+            from .registration_geometry import normalize_registration_matrix
             return RegistrationResult(
-                matrix=np.asarray(p["matrix"], dtype=np.float64),
+                matrix=normalize_registration_matrix(p["matrix"]),
                 method=str(p["method"]) + "+cache",
                 confidence=float(p["confidence"]),
                 inlier_ratio=float(p["inlier_ratio"]),
@@ -788,6 +789,18 @@ def load_completed_page(page_dir: str | Path, pair: PagePair, config: Any, final
         chosen = final_path
     if chosen is None:
         return None
+    from .publication import delivery_enabled
+    delivery_cfg = getattr(getattr(config, "export", None), "delivery", None)
+    if delivery_enabled(delivery_cfg) or meta0.get("delivery_export"):
+        # Resume prefetch is parallel and must remain read-only for delivery.
+        # The book's main loop serializes optional GPU/encoder work with cancel.
+        page = page_project_from_dict(obj, pair_override=pair, resume_hit=True)
+        page.meta["_delivery_refresh_pending"] = True
+        if compatible_continue:
+            page.meta["batch_resume_compatible_hit"] = True
+            page.meta["batch_resume_policy"] = "continue"
+            page.meta["batch_resume_identity_reason"] = "same_inputs_same_mode_existing_success"
+        return page
     need_sync = not final_path.exists()
     if not need_sync and chosen != final_path:
         try:

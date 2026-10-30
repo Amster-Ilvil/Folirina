@@ -13,6 +13,7 @@ import platform
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from .config import PipelineConfig
 from .model_downloads import model_local_paths, discovered_model_path, paddle_profile_marker_status
@@ -39,7 +40,13 @@ def _has_module(name: str) -> bool:
         return False
 
 
-def probe_components(config: PipelineConfig | None = None, *, deep: bool = False) -> dict[str, ComponentStatus]:
+def probe_components(config: PipelineConfig | None = None, *, deep: bool = False,
+                     cancel_cb: Callable[[], bool] | None = None) -> dict[str, ComponentStatus]:
+    def check_cancel():
+        if cancel_cb is not None and cancel_cb():
+            raise InterruptedError("Component probe cancelled")
+
+    check_cancel()
     cfg = config or PipelineConfig()
     torch_ok = _has_module("torch")
     is_mac = platform.system() == "Darwin"
@@ -78,7 +85,9 @@ def probe_components(config: PipelineConfig | None = None, *, deep: bool = False
     lg_weights = local_models["lightglue"].is_file()
     loftr_weights = local_models["loftr"].is_file()
     lg_missing = missing_dependency_modules("lightglue")
+    check_cancel()
     loftr_missing = missing_dependency_modules("loftr")
+    check_cancel()
     lg_pkg = not lg_missing
     loftr_pkg = not loftr_missing
     try:
@@ -99,6 +108,7 @@ def probe_components(config: PipelineConfig | None = None, *, deep: bool = False
     )
     mangalens_path = Path(cfg.bubbles.mangalens_model_path).expanduser() if cfg.bubbles.mangalens_model_path else local_models["mangalens"]
     mangalens_weight = mangalens_path.is_file()
+    check_cancel()
     try:
         from .vision_runtime import runtime_status as _vision_runtime_status
         mangalens_runtime = _vision_runtime_status("mangalens")
@@ -116,6 +126,7 @@ def probe_components(config: PipelineConfig | None = None, *, deep: bool = False
     ysg_resolved = discovered_model_path("ysg_obb", cfg.bubbles.ysg_obb_model_path)
     ysg_path = ysg_resolved if ysg_resolved is not None else local_models["ysg_obb"]
     ysg_weight = bool(ysg_resolved and ysg_resolved.is_file())
+    check_cancel()
     try:
         ysg_runtime = _vision_runtime_status("ysg_obb")
         ysg_detail = ysg_runtime.detail
@@ -128,6 +139,7 @@ def probe_components(config: PipelineConfig | None = None, *, deep: bool = False
     )
     rtdetr_path = Path(cfg.bubbles.rtdetr_model_path).expanduser() if cfg.bubbles.rtdetr_model_path else local_models["rtdetr_v2"]
     rtdetr_files = all((rtdetr_path / n).is_file() for n in ("config.json", "preprocessor_config.json", "model.safetensors")) if rtdetr_path.is_dir() else False
+    check_cancel()
     try:
         rtdetr_runtime = _vision_runtime_status("rtdetr_v2")
         rtdetr_detail = rtdetr_runtime.detail
@@ -139,6 +151,7 @@ def probe_components(config: PipelineConfig | None = None, *, deep: bool = False
         rtdetr_pkg,
         (f"本地模型：{rtdetr_path}" if rtdetr_files else "缺少本地模型；可在模型中心主动下载。") + " " + rtdetr_detail,
     )
+    check_cancel()
     sam2_path = Path(cfg.bubbles.sam2_checkpoint).expanduser() if cfg.bubbles.sam2_checkpoint else local_models["sam2"]
     sam2_weight = sam2_path.is_file()
     try:
@@ -157,6 +170,7 @@ def probe_components(config: PipelineConfig | None = None, *, deep: bool = False
         ("manga_ocr", "Manga OCR", cfg.ocr.manga_ocr_model_path, ("config.json","preprocessor_config.json","model.safetensors")),
         ("baberu_ocr", "Baberu OCR", cfg.ocr.baberu_ocr_model_path, ("onnx_infer.py","onnx/vision_int4.onnx","onnx/decoder_prefill_int8.onnx","onnx/decoder_step_int8.onnx","tokenizer/vocab.json")),
     ):
+        check_cancel()
         path=Path(configured).expanduser() if configured else local_models[key]
         files=bool(path.is_dir() and all((path/n).is_file() for n in required))
         try:
@@ -170,6 +184,7 @@ def probe_components(config: PipelineConfig | None = None, *, deep: bool = False
     mit48_path = Path(cfg.ocr.ocr48px_model_path).expanduser() if cfg.ocr.ocr48px_model_path else local_models["ocr48px"]
     mit48_files = bool(mit48_path.is_dir() and all((mit48_path / n).is_file() for n in ("ocr_ar_48px.ckpt", "alphabet-all-v7.txt", "upstream-source/manga_48px_core.py", "upstream-source/manga_48px_xpos.py")))
     mit48_runner = bool(str(cfg.ocr.ocr48px_command or "").strip())
+    check_cancel()
     try:
         status=_vision_runtime_status("ocr48px"); mit48_native_runtime=bool(status.ready); mit48_detail=status.detail
     except Exception as exc:
@@ -200,6 +215,7 @@ def probe_components(config: PipelineConfig | None = None, *, deep: bool = False
             backend=getattr(cfg.ocr, "hayai_ocr_backend", "auto"),
             max_num_patches=normalize_hayai_patch_budget(getattr(cfg.ocr, "hayai_ocr_max_num_patches", 384), backend=getattr(cfg.ocr, "hayai_ocr_backend", "auto")),
         )
+    check_cancel()
     hayai_ready = bool(hayai_runtime_ready and hayai_marker)
     rows["hayai_ocr"] = ComponentStatus(
         "hayai_ocr", "Hayai OCR 2.3 · v2.5-nova", hayai_ready, hayai_runtime_ready,
@@ -247,6 +263,7 @@ def probe_components(config: PipelineConfig | None = None, *, deep: bool = False
             key,label,bool(exists and command),bool(command),
             (f"模型：{path}" if exists else "模型尚未导入。") + (" 本地 runner 已配置。" if command else " 尚未配置本地 runner 命令。"),
         )
+    check_cancel()
     torch_sr_missing = missing_dependency_modules("torch_sr")
     torch_sr_pkg = not torch_sr_missing
     rows["torch_sr"] = ComponentStatus(
@@ -260,6 +277,7 @@ def probe_components(config: PipelineConfig | None = None, *, deep: bool = False
     except Exception:
         active_pipeline = "ocr"
     paddle_dependency_key = "paddle_doc" if active_pipeline in {"vl", "structure"} else "paddle"
+    check_cancel()
     paddle_missing = missing_dependency_modules(paddle_dependency_key)
     paddle_runtime = not paddle_missing
     paddle_marker = local_models["paddle"].is_file()
@@ -267,6 +285,7 @@ def probe_components(config: PipelineConfig | None = None, *, deep: bool = False
     # Explicit local det+rec directories are authoritative and need no marker.
     if getattr(cfg.ocr, "paddle_text_detection_model_dir", None) and getattr(cfg.ocr, "paddle_text_recognition_model_dir", None):
         selected_profile_ready = True
+    check_cancel()
     try:
         if active_pipeline in {"vl", "structure"}:
             from .paddle_doc_runtime import runtime_status as _paddle_runtime_status

@@ -15,7 +15,9 @@ def aligned_source_roi(source: np.ndarray, target_shape: tuple[int, int], projec
     """Warp SOURCE directly into a TARGET-space ROI instead of a full page."""
     th, tw = map(int, target_shape)
     xa, ya, xb, yb = [int(v) for v in roi]
-    rw, rh = max(1, xb - xa), max(1, yb - ya)
+    if not (0 <= xa < xb <= tw and 0 <= ya < yb <= th):
+        raise ValueError("SOURCE 对齐 ROI 为空或超出 TARGET 画布")
+    rw, rh = xb - xa, yb - ya
     H = registration_homography(project).copy()
     dx, dy = int(source_offset_x), int(source_offset_y)
     identity = bool(
@@ -30,7 +32,10 @@ def aligned_source_roi(source: np.ndarray, target_shape: tuple[int, int], projec
     C = np.asarray([[1.0, 0.0, -float(xa)], [0.0, 1.0, -float(ya)], [0.0, 0.0, 1.0]], np.float64)
     crop = cv2.warpPerspective(
         source, C @ H, (rw, rh), flags=cv2.INTER_LANCZOS4,
-        borderMode=cv2.BORDER_REPLICATE,
+        # Edge replication invents strokes outside SOURCE coverage (a black
+        # page rim becomes a wide black strip). Match full-page alignment's
+        # empty white paper instead; transparent tools never composite paper.
+        borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255),
     )
     return crop, False
 

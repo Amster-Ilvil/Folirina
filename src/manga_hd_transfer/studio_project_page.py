@@ -803,6 +803,10 @@ class ProjectPage(QWidget):
         process_grid.addWidget(self.cancel, 0, 1)
         process_grid.addWidget(self.run_book, 1, 0)
         process_grid.addWidget(self.continue_book, 1, 1)
+        self.output_settings = QPushButton("输出压缩 / Upscayl 超分设置…")
+        self.output_settings.setToolTip("处理前可选 Caesium 压缩格式、质量和 Upscayl 超分倍率。")
+        self.output_settings.clicked.connect(lambda: self.window.show_page_key("export"))
+        process_grid.addWidget(self.output_settings, 2, 0, 1, 2)
         process_grid.setColumnStretch(0, 1); process_grid.setColumnStretch(1, 1)
         actions.layout.addLayout(process_grid)
 

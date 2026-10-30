@@ -105,11 +105,12 @@ class PipelineWorker(QThread):
                 if self._cancelled():
                     self.cancelled.emit()
                     return
-                emitted_path = str(final_path)
+                delivery = as_dict(project.meta).get("delivery_export")
+                emitted_path = str(project.artifacts.get("final") or final_path) if delivery else str(final_path)
                 if should_reapply_review and (page_root / "project.json").exists():
                     reviewed = apply_review_page(page_root, self.config.model_copy(deep=True))
                     emitted_path = str(reviewed)
-                    if final_path.exists() or Path(reviewed).exists():
+                    if not delivery and (final_path.exists() or Path(reviewed).exists()):
                         try:
                             final_path.parent.mkdir(parents=True, exist_ok=True)
                             atomic_copy_file(reviewed, final_path)
@@ -126,6 +127,10 @@ class PipelineWorker(QThread):
                     if sync_path.exists():
                         project.meta["review_sync"] = as_dict(load_json(sync_path))
                     project.meta["reapplied_review_after_process"] = True
+                    if delivery:
+                        saved = as_dict(load_json(page_root / "project.json"))
+                        project.artifacts.update(as_dict(saved.get("artifacts")))
+                        project.meta["delivery_export"] = as_dict(saved.get("meta")).get("delivery_export", delivery)
                 self.done.emit(project, emitted_path)
             else:
                 project = pipeline.run_book(

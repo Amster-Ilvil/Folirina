@@ -2,12 +2,13 @@ from __future__ import annotations
 
 """Publication/export page isolated from the StudioWindow shell."""
 
-from PySide6.QtWidgets import QWidget, QLabel, QPushButton, QHBoxLayout, QVBoxLayout, QCheckBox, QMessageBox
+from PySide6.QtWidgets import QWidget, QLabel, QPushButton, QHBoxLayout, QVBoxLayout, QCheckBox, QMessageBox, QScrollArea
 
 from .gui_toast import notify
 from .gui_components import Card, PathRow
 from .gui_dialogs import confirm_action
 from .workspace_cleanup import cleanup_output_workspace
+from .studio_delivery_options import DeliveryOptions
 
 class ExportPage(QWidget):
     def __init__(self, window: "StudioWindow"):
@@ -27,11 +28,14 @@ class ExportPage(QWidget):
         left.layout.addWidget(self.cleanup)
         self.run=QPushButton("开始整册处理"); self.run.setObjectName("primary"); left.layout.addWidget(self.run); left.layout.addStretch(1)
         content.addWidget(left,4)
-        right=Card("输出结构", "默认只保留正式结果与继续编辑所需文件。")
+        right=Card("最终图片 · 压缩与 AI 超分", "在处理前设置，所有模式共用导出阶段。默认保持原有无损 PNG 输出。")
+        self.delivery=DeliveryOptions(window); right.layout.addWidget(self.delivery)
         for title,desc in [
             ("final/","最终高清页面"),("pages/*/project.json","配准、气泡、匹配与 QA 工程数据"),("mask_transfer_layer.png","旧中文版气泡/文本框迁移图层"),("mask_transfer_mask.png","实际覆盖高清母版的精确蒙版"),("editable.ora / .psd","可选；默认关闭以节省空间")]:
             row=QHBoxLayout(); t=QLabel(title); t.setStyleSheet("font-weight:600;"); d=QLabel(desc); d.setObjectName("hint"); row.addWidget(t); row.addStretch(1); row.addWidget(d); right.layout.addLayout(row)
-        right.layout.addStretch(1); content.addWidget(right,6)
+        right.layout.addStretch(1)
+        scroll=QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(right)
+        content.addWidget(scroll,6)
         self.out.button.clicked.connect(lambda:self.window.choose_directory("output")); self.run.clicked.connect(self.window.run_book)
         self.cleanup.clicked.connect(self._cleanup_pages)
         self.debug.toggled.connect(self._sync); self.component_masks.toggled.connect(self._sync); self.layers.toggled.connect(self._sync)
@@ -42,6 +46,7 @@ class ExportPage(QWidget):
     def set_processing_busy(self, busy: bool) -> None:
         self.run.setEnabled(not bool(busy))
         self.cleanup.setEnabled(not bool(busy))
+        self.delivery.setEnabled(not bool(busy))
 
     def _cleanup_pages(self):
         if self.window._busy_running():
@@ -67,6 +72,7 @@ class ExportPage(QWidget):
         except Exception as exc:
             QMessageBox.critical(self,"清理失败",str(exc))
     def refresh(self):
+        self.delivery.refresh()
         self.out.set_path(self.window.state.output_dir)
         self.debug.setChecked(self.window.state.config.export.save_debug)
         self.component_masks.setChecked(bool(getattr(self.window.state.config.export,"save_component_masks",False)))

@@ -211,8 +211,11 @@ def _registered_text_raster_equivalent(
     x1=min(w,int(np.ceil(max(float(traw[2]),sp[2])))+4); y1=min(h,int(np.ceil(max(float(traw[3]),sp[3])))+4)
     if x1-x0 < 6 or y1-y0 < 6:
         return False
-    aligned=cv2.warpPerspective(source_image,matrix,(w,h),flags=cv2.INTER_LINEAR,borderValue=(255,255,255))
-    ag=cv2.cvtColor(aligned[y0:y1,x0:x1],cv2.COLOR_BGR2GRAY).astype(np.float32)
+    # Only this local lettering participates in the proof. Warping the full
+    # page once per uncovered item makes punctuation-heavy pages needlessly slow.
+    crop_matrix = np.array([[1., 0., -x0], [0., 1., -y0], [0., 0., 1.]]) @ matrix
+    aligned=cv2.warpPerspective(source_image,crop_matrix,(x1-x0,y1-y0),flags=cv2.INTER_LINEAR,borderValue=(255,255,255))
+    ag=cv2.cvtColor(aligned,cv2.COLOR_BGR2GRAY).astype(np.float32)
     bg=cv2.cvtColor(target_image[y0:y1,x0:x1],cv2.COLOR_BGR2GRAY).astype(np.float32)
     if ag.size < 64 or bg.size != ag.size:
         return False
@@ -289,19 +292,19 @@ def append_semantic_coverage_qa(
     downgraded_target_only_rejections = 0
     suppressed_target_only_micro_text = 0
     suppressed_equivalent_scene_text = 0
+    suppressed_equivalent_bubbles = 0
     bubble_masks: list[np.ndarray] = []
     for row in bubbles:
         mask = getattr(row, "mask", None)
         if not isinstance(mask, np.ndarray) or mask.shape != shape or cv2.countNonZero(mask) <= 0:
             continue
         bubble_masks.append(mask)
-        child = any(
+        children = [tr for tr in texts if (
             isinstance(getattr(tr, "mask", None), np.ndarray)
             and getattr(tr, "mask").shape == shape
             and _mask_fraction(getattr(tr, "mask"), mask) >= 0.35
-            for tr in texts
-        )
-        if not child:
+        )]
+        if not children:
             continue
         record_coverage = _mask_fraction(mask, handled)
         pixel_coverage = _mask_fraction(mask, handled_pixels)
@@ -338,6 +341,17 @@ def append_semantic_coverage_qa(
                     meta["verification_scope"] = "registered_source_semantic_support"
                     issue.meta = meta
                     downgraded_target_only_rejections += 1
+            continue
+        # Punctuation-only / unchanged bubbles are intentionally not rewritten.
+        # Require bilateral raster proof for EVERY child; a single shared dot
+        # or digit must never hide a different, untranslated line.
+        if source_support is True and all(
+            _registered_text_raster_equivalent(
+                child, source_evidence, registration,
+                source_image=source_image, target_image=target_image,
+            ) for child in children
+        ):
+            suppressed_equivalent_bubbles += 1
             continue
         uncovered_bubbles += 1
         conf = float(getattr(row, "confidence", 0.0))
@@ -410,6 +424,7 @@ def append_semantic_coverage_qa(
         stats["koharu_semantic_qa_downgraded_target_only_rejections"] = str(downgraded_target_only_rejections)
         stats["koharu_semantic_qa_suppressed_target_only_micro_text"] = str(suppressed_target_only_micro_text)
         stats["koharu_semantic_qa_suppressed_equivalent_scene_text"] = str(suppressed_equivalent_scene_text)
+        stats["koharu_semantic_qa_suppressed_equivalent_bubbles"] = str(suppressed_equivalent_bubbles)
 
 
 def append_photo_pair_evidence_qa(

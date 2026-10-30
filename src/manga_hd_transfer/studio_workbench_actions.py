@@ -1039,6 +1039,19 @@ class WorkbenchActionsMixin:
         final_path = Path(final)
         if final_path.exists() and final_path.name == "final_reviewed.png":
             commit_reviewed_result(final_path.parent, final_path)
+        project_path = final_path.parent / "project.json"
+        if project_path.is_file():
+            saved = load_json(project_path)
+            meta = saved.get("meta") or {}
+            delivery = meta.get("delivery_export") or {}
+            if delivery:
+                from .publication import publish_project_delivery
+                requested = delivery.get("requested") or str(Path(delivery["output"]).with_suffix(".png"))
+                publish_project_delivery(
+                    delivery.get("settings"), final_path.parent, requested, saved["artifacts"], meta,
+                )
+                save_json(project_path, saved)
+                return
         pair=self.window.current_pair()
         if pair is None or not self.window.state.output_dir:
             return

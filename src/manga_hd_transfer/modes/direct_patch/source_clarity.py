@@ -201,6 +201,11 @@ def enhance_white_source_patch(
     # silhouette, hard-core forcing or mask clipping is involved.
     paper_scale = 255.0 / max(1.0, float(paper_gray))
     normalized = np.clip(src_gray * paper_scale, 0.0, 255.0)
+    from ...scan_paper import shadow_free_ink
+    local_ink = shadow_free_ink(src_gray.astype(np.uint8), use)
+    if local_ink is not None:
+        normalized[use & ~local_ink] = 255.0
+        diag['scan_shadow_support'] = 'local_sauvola_antialias'
     coverage = np.clip((255.0 - normalized) / 255.0, 0.0, 1.0)
     gamma = max(0.40, float(alpha_gamma))
     if abs(gamma - 1.0) > 1e-6:

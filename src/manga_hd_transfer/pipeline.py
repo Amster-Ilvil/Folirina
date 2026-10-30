@@ -26,10 +26,7 @@ from .pipeline_match_service import accepted_matches
 from .book_orchestration import run_book_orchestration
 from .version import __version__
 from .modes.runtime_binding import bind_mode_runtime_config
-
-
-class PipelineCancelled(RuntimeError):
-    """Cooperative cancellation raised only at safe stage boundaries."""
+from .cancellation import PipelineCancelled
 
 
 def _check_cancel(cancel_cb, stage: str = "") -> None:
@@ -47,6 +44,10 @@ class TransferPipeline:
     ) -> None:
         source_config = config or PipelineConfig()
         self.config = bind_mode_runtime_config(source_config)
+        from .publication import delivery_enabled, validate_delivery_runtime
+        if delivery_enabled(self.config.export.delivery):
+            # Fail before loading OCR/detector models or processing any pages.
+            validate_delivery_runtime(self.config.export.delivery)
         self._source_ocr = source_ocr
         self._target_ocr = target_ocr
         self._ocr_soft_failures: list[str] = []

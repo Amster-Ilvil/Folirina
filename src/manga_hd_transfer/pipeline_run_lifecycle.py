@@ -24,6 +24,9 @@ from .workspace_guard import PageRunGuard, cleanup_orphan_temp_files
 from .workspace_integrity import validate_page_workspace
 from .run_status import status_from_project
 from .selective_replay import write_selective_replay_plan
+from .publication import (
+    delivery_enabled, publish_project_delivery, snapshot_delivery_outputs, restore_delivery_outputs,
+)
 
 
 def _selected_strategy(project: PageProject) -> str:
@@ -193,6 +196,11 @@ def run_page_lifecycle(
             orphan_cleanup = cleanup_orphan_temp_files(root)
             trace.event("workspace_guard_acquired", orphan_temp_cleanup=orphan_cleanup)
             snapshot = create_run_snapshot(root, trace.run_id)
+            previous_project = load_json(snapshot / "project.json") if (snapshot / "project.json").exists() else {}
+            previous_delivery = (previous_project.get("meta") or {}).get("delivery_export")
+            export_delivery = delivery_enabled(config.export.delivery)
+            if final_path is not None and (export_delivery or previous_delivery):
+                snapshot_delivery_outputs(snapshot, Path(final_path), config.export.delivery, previous_delivery)
             trace.event(
                 "run_start",
                 selected_mode=mode, version=version,
@@ -227,7 +235,9 @@ def run_page_lifecycle(
                     accepts_prefetched = True
                 if accepts_prefetched and prefetched_images is not None:
                     impl_kwargs["prefetched_images"] = prefetched_images
-                project = process_impl(pair, root, final_path, **impl_kwargs)
+                # Renderers always keep native, lossless workspace geometry.
+                # The shared publication stage owns any resized/lossy delivery.
+                project = process_impl(pair, root, None if export_delivery else final_path, **impl_kwargs)
             except Exception as exc:
                 # Restore the previous published page instead of leaving the
                 # stale/half-cleared automatic result visible after a failed
@@ -237,6 +247,7 @@ def run_page_lifecycle(
                     invalidate_manual_review_state(root)
                 except Exception:
                     pass
+                restore_delivery_outputs(snapshot)
                 restored = restore_run_snapshot(root, snapshot)
                 if restored.get("success"):
                     discard_run_snapshot(snapshot)
@@ -305,6 +316,13 @@ def run_page_lifecycle(
                 project.artifacts["selective_replay_plan"] = str(replay_path)
                 terminal_status = status_from_project(project, integrity, publish_effect)
                 project.meta["run_status"] = str(terminal_status)
+                if final_path is not None and (export_delivery or previous_delivery):
+                    if progress_cb is not None:
+                        progress_cb(98, "delivery", "导出：Upscayl 超分 / Caesium 压缩")
+                    publish_project_delivery(
+                        config.export.delivery, root, final_path, project.artifacts, project.meta,
+                        previous=previous_delivery, cancel_cb=cancel_cb,
+                    )
                 save_json(root / "qa.json", {"summary": qa_summary(project.qa), "issues": [x.to_dict() for x in project.qa]})
                 save_json(root / "project.json", project.to_dict())
                 trace.event(
@@ -336,6 +354,7 @@ def run_page_lifecycle(
                     invalidate_manual_review_state(root)
                 except Exception:
                     pass
+                restore_delivery_outputs(snapshot)
                 restored = restore_run_snapshot(root, snapshot)
                 if restored.get("success"):
                     discard_run_snapshot(snapshot)

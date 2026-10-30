@@ -665,20 +665,6 @@ def run_page_flow(
                 mask_transfer.clear_mask[use] = target_first.clear_mask[use]
             transfer_rgba = mask_transfer.layer_rgba
             koharu_cleanup.clear_mask[use] = target_first.clear_mask[use]
-        colour_rows = target_first.diagnostics.get("rows", [])
-        unresolved = [row for row in colour_rows if str(row.get("status", "")).startswith("deferred_")]
-        residual = [row for row in colour_rows if row.get("status") == "applied_target_first_lama"
-                    and (int(row.get("unchanged_target_dark_pixels_outside_source_ink", 0)) > 16
-                         or int(row.get("clean_base_dark_pixels", 0)) > 16)]
-        if unresolved or residual:
-            qa.append(QAItem(
-                "target_first_colour_review", "error",
-                "Some coloured containers could not be independently cleaned or still have dark foreground in the clean TARGET base; manual review is required.",
-                meta={"deferred": unresolved, "possible_residual": residual},
-            ))
-        if trace is not None:
-            trace.event("target_first_colour", diagnostics=target_first.diagnostics)
-
     _stage_done("transfer", stage_started)
     stage_started = time.perf_counter()
     emit_progress(91, "composition", "正在合成迁移结果")
@@ -752,7 +738,19 @@ def run_page_flow(
         if trace is not None:
             trace.event("white_bubble_blank_first", diagnostics=white_bubbles.diagnostics)
     if target_first is not None:
+        # Review the final ordered composition, not an intermediate result that
+        # precedes verified white-bubble blank-first cleanup.
+        target_first.resolve_verified_white_cleanup(white_bubbles.clear_mask)
+        unresolved, residual = target_first.review_findings()
+        if unresolved or residual:
+            project.qa.append(QAItem(
+                "target_first_colour_review", "error",
+                "Some containers could not be independently cleaned or still have dark foreground in the clean TARGET base; manual review is required.",
+                meta={"deferred": unresolved, "possible_residual": residual},
+            ))
         project.meta["target_first_colour"] = target_first.diagnostics
+        if trace is not None:
+            trace.event("target_first_colour", diagnostics=target_first.diagnostics)
         if target_first.diagnostics.get("applied", 0):
             from .io_utils import write_image
             write_image(page_root / "target_clean_base.png", inpaint_result.image)

@@ -424,13 +424,15 @@ class StudioWindow(StudioProjectControllerMixin, QMainWindow):
         # macOS crash report showed ComponentProbeWorker still alive while QtCore
         # was finalizing. Read-only probes are drained here; processing workers
         # receive their existing cooperative cancellation signal.
+        still_running = False
         try:
             if hasattr(self, "models"):
-                self.models.shutdown_background_probes()
+                if not self.models.shutdown_background_probes():
+                    still_running = True
         except Exception:
             logger.debug("background probe shutdown failed", exc_info=True)
+            still_running = True
 
-        still_running = False
         try:
             if hasattr(self, "models") and not self.models.shutdown_write_workers():
                 still_running = True

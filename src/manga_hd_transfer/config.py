@@ -2119,6 +2119,25 @@ class QAConfig(BaseModel):
     fail_empty_mask_replace: bool = True
 
 
+class DeliveryExportConfig(BaseModel):
+    """Optional publication processing; native review pixels are never resized."""
+    compression_enabled: bool = False
+    format: Literal["webp", "jpeg", "png"] = "webp"
+    quality: int = Field(default=90, ge=1, le=100)
+    lossless: bool = False
+    png_opt_level: int = Field(default=2, ge=0, le=6)
+    caesium_path: str = ""
+    upscale_enabled: bool = False
+    upscale_scale: Literal[2, 4] = 2
+    upscale_model: str = Field(default="digital-art-4x", pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+    upscayl_path: str = ""
+    upscayl_models: str = ""
+    tile_size: int = Field(default=128, ge=32, le=1024)
+    threads: int = Field(default=2, ge=1, le=8)
+    timeout_seconds: int = Field(default=600, ge=1, le=3600)
+    max_output_megapixels: int = Field(default=100, ge=1, le=256)
+
+
 class ExportConfig(BaseModel):
     # v1.3.12 compact-by-default workspace.  The files needed for GUI restore,
     # review and manual repair remain lossless; expensive diagnostic duplicates
@@ -2140,6 +2159,7 @@ class ExportConfig(BaseModel):
     # throughput; sparse masks/layers favour disk size.
     persistent_png_compression: int = 4
     sparse_png_compression: int = 9
+    delivery: DeliveryExportConfig = Field(default_factory=DeliveryExportConfig)
 
 
 class SemanticLayoutConfig(BaseModel):
