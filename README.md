@@ -39,6 +39,8 @@
 
 网页版是**轻量工作台，不是桌面版全部功能的在线复制**。大批高清图片的速度和稳定性受各用户设备内存、浏览器限制；多人可各自在本地独立处理，但网站的访问量仍受 [GitHub Pages 托管限制](https://docs.github.com/en/pages/getting-started-with-github-pages/github-pages-limits)约束。请勿将网页上的“配准成功”视为成品已自动通过画质复核。
 
+**匿名使用统计（可选）**：网页版已预留访问量、独立访客、漫画导入及成品导出事件统计。默认不发送任何统计请求；仓库维护者需配置 Umami Cloud 的公开 Website ID 后才能启用。不会上传漫画、文件名或编辑内容。具体步骤见 [网页版统计启用指南](docs/ANALYTICS_SETUP.md)。
+
 ## 下载
 
 [**前往 GitHub Releases 下载最新版**](https://github.com/Amster-Ilvil/Folirina/releases)
