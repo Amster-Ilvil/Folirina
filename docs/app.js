@@ -4,6 +4,7 @@ import {getBounds,brushOrSelectionMask} from './core.js';
 import {inspectTextDifferences,maskOverlay} from './glyph_masks.js';
 import {deliverySettings,encodeDeliveryCanvas,encodeDeliveryPngBlob,exportFilename} from './delivery_export.js';
 import {reviewedEdit} from './reviewed_masks.js';
+import {folirinaAnalytics,trackUsage} from './analytics.js';
 
 const $=id=>document.getElementById(id);
 const state={sources:[],targets:[],pairs:[],index:0,view:'result',tool:'paint-transfer',brush:24,threshold:185,paper:255,gesture:null,inspection:null,review:null,reviewPreview:false,cloneAnchor:null,stamp:0,rendering:false,hover:null,transferMode:'hole'};
@@ -164,6 +165,7 @@ async function importImages(kind,files){
    releaseItems(old);
    if(kind==='source'){state.sources=items;state.pairs.forEach(p=>{p.edits=[];p.undo=[];p.redo=[];p.dx=0;p.dy=0;p.scale=1;p.affine=null;p.homography=null;p.nativeMatrix=null;p.alignDiagnostics=null;p.alignError=null});freshPairsForSources()}else{state.targets=items;createPairs()}
    toast(`已导入 ${items.length} 张${kind==='source'?'中文 SOURCE':'日文 TARGET'}图片`);
+   trackUsage(kind==='source'?'source_import_success':'target_import_success');
  }catch(err){toast(`导入失败：${err.message}`);console.error(err)}finally{busy(false);updateUI()}
 }
 function refreshPageList(){
@@ -374,7 +376,7 @@ $('applyReview').addEventListener('click',()=>{
   if(!confirm('确认应用人工修正的 SOURCE/TARGET 掩码？复杂网点的修补仍可能有痕迹；之后可撤销或右键恢复。'))return;
   p.undo.push(structuredClone(p.edits));if(p.undo.length>50)p.undo.shift();p.redo=[];p.edits.push(edit);
   state.reviewPreview=false;state.review=null;state.inspection=null;state.view='result';
-  state.pendingStroke=null;updateUI();toast('已应用人工审阅掩码，可 Ctrl/⌘+Z 撤销');
+  state.pendingStroke=null;updateUI();toast('已应用人工审阅掩码，可 Ctrl/⌘+Z 撤销');trackUsage('review_apply_success');
  }catch(e){toast(e.message)}
 });
 async function renderPage(){
@@ -552,7 +554,7 @@ async function exportOne(){const p=current();if(!p)return;
      const [t,s]=await Promise.all([bitmap(currentTarget()),currentSrc()?bitmap(currentSrc()):null]);
      const c=compose(t,s,p,{rejectUnsafe:true});try{blob=await encodeDeliveryCanvas(c,spec)}finally{c.width=0;c.height=0}
    }
-   download(blob,exportFilename(safeName(currentTarget().name).replace(/\.[^.]+$/,'')+'_folirina',spec));toast(`本页 ${spec.extension.toUpperCase()} 已生成（原始 TARGET 尺寸）`)
+   download(blob,exportFilename(safeName(currentTarget().name).replace(/\.[^.]+$/,'')+'_folirina',spec));toast(`本页 ${spec.extension.toUpperCase()} 已生成（原始 TARGET 尺寸）`);trackUsage('page_export_success')
  }catch(e){toast(`导出失败：${e.message}`);console.error(e)}finally{busy(false)}}
 $('exportPage').addEventListener('click',exportOne);
 $('exportAll').addEventListener('click',async()=>{
@@ -571,7 +573,7 @@ $('exportAll').addEventListener('click',async()=>{
   await new Promise(r=>setTimeout(r,0));
  }
  if(!count)throw Error('所有页面均被跳过');
- $('busyDetail').textContent='压缩 ZIP...';const out=await zip.generateAsync({type:'blob',compression:'STORE'},meta=>{$('busyDetail').textContent=`压缩 ZIP ${Math.round(meta.percent)}%`});download(out,'Folirina_Web_Export.zip');toast(`已导出 ${count} 页 ${spec.extension.toUpperCase()}，按 TARGET 原分辨率保存`);
+ $('busyDetail').textContent='压缩 ZIP...';const out=await zip.generateAsync({type:'blob',compression:'STORE'},meta=>{$('busyDetail').textContent=`压缩 ZIP ${Math.round(meta.percent)}%`});download(out,'Folirina_Web_Export.zip');toast(`已导出 ${count} 页 ${spec.extension.toUpperCase()}，按 TARGET 原分辨率保存`);trackUsage('book_export_success');
  }catch(e){toast(`导出失败：${e.message}`);console.error(e)}finally{busy(false)}
 });
 $('exportMasks').addEventListener('click',async()=>{
@@ -585,7 +587,7 @@ $('exportMasks').addEventListener('click',async()=>{
   for(const [name,mask] of files){const image=oneMaskPng(mask,box.w,box.h);const blob=await canvasBlob(image);zip.file(name,blob);image.width=image.height=0}
   zip.file('diagnostic.json',JSON.stringify({page:currentTarget().name,bounds:box,summary:inspection.summary,reviewed:!!review,warning:review?'包含人工作出的掩码修订；背景重建仍可能失真':'仅候选区域，未经检查不得直接擦除'},null,2));
   download(await zip.generateAsync({type:'blob',compression:'DEFLATE'}),safeName(currentTarget().name)+'_dual_masks.zip');
-  toast('已导出 SOURCE／TARGET 独立候选掩码，仅供人工对照');
+  toast('已导出 SOURCE／TARGET 独立候选掩码，仅供人工对照');trackUsage('mask_export_success');
  }catch(err){toast('掩码导出失败：'+err.message)}finally{busy(false)}
 });
 $('saveProject').addEventListener('click',async()=>{
@@ -595,7 +597,7 @@ $('saveProject').addEventListener('click',async()=>{
  const targets=state.targets.map((i,k)=>({name:i.name,path:`target/${String(k).padStart(4,'0')}.${(i.name.split('.').at(-1)||'png').toLowerCase()}`}));
  state.sources.forEach((i,k)=>zip.file(sources[k].path,i.blob));state.targets.forEach((i,k)=>zip.file(targets[k].path,i.blob));
  zip.file('project.json',JSON.stringify({format:'folirina-web-lite',version:1,baseCommit:'a1516de602e99e5098431ff32864c0578d797a9f',sources,targets,pairs:state.pairs.map(({undo,redo,...p})=>p),index:state.index},null,2));
- const out=await zip.generateAsync({type:'blob',compression:'STORE'},m=>$('busyDetail').textContent=`打包 ${Math.round(m.percent)}%`);download(out,'Folirina_Web_Workspace.zip');toast('工作区已保存；下次可直接载入 ZIP 继续编辑');
+ const out=await zip.generateAsync({type:'blob',compression:'STORE'},m=>$('busyDetail').textContent=`打包 ${Math.round(m.percent)}%`);download(out,'Folirina_Web_Workspace.zip');toast('工作区已保存；下次可直接载入 ZIP 继续编辑');trackUsage('workspace_save_success');
  }catch(e){toast(`保存失败：${e.message}`);console.error(e)}finally{busy(false)}
 });
 $('openProject').addEventListener('click',()=>$('projectInput').click());
@@ -619,9 +621,10 @@ $('projectInput').addEventListener('change',async e=>{
       throw Error('工作区包含无效或过大的人工审核掩码');
  }
  }return {...defaultPair(i,newSources.length),...p,undo:[],redo:[]}});
- releaseItems(state.sources);releaseItems(state.targets);state.sources=newSources;state.targets=newTargets;state.pairs=pairs;state.inspection=null;state.review=null;state.reviewPreview=false;state.index=Math.min(Math.max(0,data.index||0),pairs.length-1);newSources=[];newTargets=[];updateUI();toast(`工作区加载成功，共 ${pairs.length} 页`);
+ releaseItems(state.sources);releaseItems(state.targets);state.sources=newSources;state.targets=newTargets;state.pairs=pairs;state.inspection=null;state.review=null;state.reviewPreview=false;state.index=Math.min(Math.max(0,data.index||0),pairs.length-1);newSources=[];newTargets=[];updateUI();toast(`工作区加载成功，共 ${pairs.length} 页`);trackUsage('workspace_open_success');
  }catch(err){releaseItems(newSources);releaseItems(newTargets);toast(`加载失败：${err.message}`);console.error(err)}finally{busy(false)}
 });
+folirinaAnalytics.initialize();
 if('serviceWorker' in navigator && location.protocol.startsWith('http'))navigator.serviceWorker.register('./sw.js').catch(()=>{});
 updateUI();
 // For smoke/regression tests only: no privileged APIs or network actions.
