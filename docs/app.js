@@ -2,6 +2,7 @@ import {unpack,releaseItems,bitmap,defaultPair,compose,smartPairs,canvasBlob,dow
 import {estimateBrowserAffine} from './registration.js';
 import {getBounds,brushOrSelectionMask} from './core.js';
 import {inspectTextDifferences,maskOverlay} from './glyph_masks.js';
+import {deliverySettings,encodeDeliveryCanvas,encodeDeliveryPngBlob,exportFilename} from './delivery_export.js';
 import {reviewedEdit} from './reviewed_masks.js';
 
 const $=id=>document.getElementById(id);
@@ -298,7 +299,7 @@ function inspectCurrentMask(target,source,p,edit){
  const sourcePixels=sc.getImageData(box.x,box.y,box.w,box.h).data;
  const targetPixels=tctx.getImageData(0,0,box.w,box.h).data;
  const selection=brushOrSelectionMask(edit,box.x,box.y,box.w,box.h);
- const inspection=inspectTextDifferences(sourcePixels,targetPixels,selection,box.w,box.h);
+ const inspection=inspectTextDifferences(sourcePixels,targetPixels,selection,box.w,box.h,{outlinedTarget:$('outlinedTargetInk').checked});
  tc.width=tc.height=0;
  return {box,inspection};
 }
@@ -353,6 +354,12 @@ $('reviewUndo').addEventListener('click',()=>{
  showReviewButtons();renderPage();
 });
 $('maskRepairMode').addEventListener('change',()=>{state.reviewPreview=false;});
+$('outlinedTargetInk').addEventListener('change',e=>{
+ if(state.review?.touched>0&&!confirm('重新提取候选会丢弃尚未确认的掩码笔画，是否继续？')){
+   e.target.checked=!e.target.checked;return;
+ }
+ state.review=null;state.reviewPreview=false;renderPage();
+});
 $('resetReview').addEventListener('click',()=>{state.review=null;state.reviewPreview=false;showReviewButtons();renderPage();});
 $('previewReview').addEventListener('click',()=>{
  try{reviewEdit();state.reviewPreview=true;state.view='result';
@@ -532,21 +539,25 @@ function redo(){const p=current();if(!p||!p.redo.length)return;p.undo.push(struc
 $('undoButton').addEventListener('click',undo);$('redoButton').addEventListener('click',redo);
 $('clearEdits').addEventListener('click',()=>{const p=current();if(!p||!p.edits.length)return;if(!confirm('清空本页全部编辑？可以用撤销恢复。'))return;p.undo.push(structuredClone(p.edits));p.edits=[];p.redo=[];updateUI()});
 document.addEventListener('keydown',e=>{if(['INPUT','SELECT','TEXTAREA'].includes(document.activeElement.tagName))return;if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='z'){e.preventDefault();e.shiftKey?redo():undo()}if(e.key==='ArrowRight')goPage(state.index+1);if(e.key==='ArrowLeft')goPage(state.index-1);if(e.key==='['||e.key===']'){e.preventDefault();updateBrushSize(state.brush+(e.key===']'?8:-8))}});
+function selectedDelivery(){return deliverySettings($('deliveryFormat').value,Number($('deliveryQuality').value));}
+$('deliveryFormat').addEventListener('change',()=>{const fmt=$('deliveryFormat').value,lossy=fmt!=='png';$('deliveryQuality').disabled=!lossy;$('deliveryQualityHint').textContent=lossy?'（数值越大画质越高）':'（PNG 为无损原图输出）';$('exportPage').textContent='导出当前页 '+(fmt==='jpeg'?'JPEG':fmt.toUpperCase());});
+$('deliveryFormat').dispatchEvent(new Event('change'));
 async function exportOne(){const p=current();if(!p)return;
  if(p.edits.some(e=>['transfer','reviewed'].includes(e.kind))&&!isRegistered(p)){toast('本页含未配准的迁移操作，禁止错位导出；请先自动配准');return;}
- busy(true,'生成 PNG','按原始 TARGET 分辨率合成...');try{
-   let blob;
+ busy(true,'导出图片','按原始 TARGET 分辨率合成...');try{
+   const spec=selectedDelivery();let blob;
    if(nativeEngine.enabled && p.edits.length){
-     const r=await nativeRender(p,currentSrc(),currentTarget());blob=await(await fetch(r.png)).blob();
+     const r=await nativeRender(p,currentSrc(),currentTarget());blob=await encodeDeliveryPngBlob(await(await fetch(r.png)).blob(),spec);
    }else{
      const [t,s]=await Promise.all([bitmap(currentTarget()),currentSrc()?bitmap(currentSrc()):null]);
-     const c=compose(t,s,p,{rejectUnsafe:true});blob=await canvasBlob(c);c.width=0;c.height=0;
+     const c=compose(t,s,p,{rejectUnsafe:true});try{blob=await encodeDeliveryCanvas(c,spec)}finally{c.width=0;c.height=0}
    }
-   download(blob,safeName(currentTarget().name).replace(/\.[^.]+$/,'')+'_folirina.png');toast('本页 PNG 已生成')
+   download(blob,exportFilename(safeName(currentTarget().name).replace(/\.[^.]+$/,'')+'_folirina',spec));toast(`本页 ${spec.extension.toUpperCase()} 已生成（原始 TARGET 尺寸）`)
  }catch(e){toast(`导出失败：${e.message}`);console.error(e)}finally{busy(false)}}
 $('exportPage').addEventListener('click',exportOne);
 $('exportAll').addEventListener('click',async()=>{
- if(!state.targets.length)return;busy(true,'导出整册','正在生成 PNG 文件...');try{
+ if(!state.targets.length)return;busy(true,'导出整册','正在生成成品图片...');try{
+ const spec=selectedDelivery();
  const zip=new JSZip(),dir=zip.folder('Folirina_Output');let count=0;
  for(let i=0;i<state.pairs.length;i++){
   const p=state.pairs[i];if(p.skip)continue;
@@ -554,13 +565,13 @@ $('exportAll').addEventListener('click',async()=>{
   $('busyDetail').textContent=`合成页面 ${i+1}/${state.pairs.length}`;
   const t=await bitmap(state.targets[p.tgt]),s=p.src===null?null:await bitmap(state.sources[p.src]);
   let blob;
-  if(nativeEngine.enabled&&p.edits.length){const r=await nativeRender(p,state.sources[p.src],state.targets[p.tgt]);blob=await(await fetch(r.png)).blob();}
-  else{const c=compose(t,s,p,{rejectUnsafe:true});blob=await canvasBlob(c);c.width=0;c.height=0;}
-  dir.file(`${String(i+1).padStart(4,'0')}_${safeName(state.targets[p.tgt].name).replace(/\.[^.]+$/,'')}.png`,blob);count++;
+  if(nativeEngine.enabled&&p.edits.length){const r=await nativeRender(p,state.sources[p.src],state.targets[p.tgt]);blob=await encodeDeliveryPngBlob(await(await fetch(r.png)).blob(),spec);}
+  else{const c=compose(t,s,p,{rejectUnsafe:true});try{blob=await encodeDeliveryCanvas(c,spec)}finally{c.width=0;c.height=0}}
+  dir.file(`${String(i+1).padStart(4,'0')}_${exportFilename(safeName(state.targets[p.tgt].name),spec)}`,blob);count++;
   await new Promise(r=>setTimeout(r,0));
  }
  if(!count)throw Error('所有页面均被跳过');
- $('busyDetail').textContent='压缩 ZIP...';const out=await zip.generateAsync({type:'blob',compression:'STORE'},meta=>{$('busyDetail').textContent=`压缩 ZIP ${Math.round(meta.percent)}%`});download(out,'Folirina_Web_Export.zip');toast(`已导出 ${count} 页 PNG，按 TARGET 原分辨率保存`);
+ $('busyDetail').textContent='压缩 ZIP...';const out=await zip.generateAsync({type:'blob',compression:'STORE'},meta=>{$('busyDetail').textContent=`压缩 ZIP ${Math.round(meta.percent)}%`});download(out,'Folirina_Web_Export.zip');toast(`已导出 ${count} 页 ${spec.extension.toUpperCase()}，按 TARGET 原分辨率保存`);
  }catch(e){toast(`导出失败：${e.message}`);console.error(e)}finally{busy(false)}
 });
 $('exportMasks').addEventListener('click',async()=>{
@@ -583,7 +594,7 @@ $('saveProject').addEventListener('click',async()=>{
  const sources=state.sources.map((i,k)=>({name:i.name,path:`source/${String(k).padStart(4,'0')}.${(i.name.split('.').at(-1)||'png').toLowerCase()}`}));
  const targets=state.targets.map((i,k)=>({name:i.name,path:`target/${String(k).padStart(4,'0')}.${(i.name.split('.').at(-1)||'png').toLowerCase()}`}));
  state.sources.forEach((i,k)=>zip.file(sources[k].path,i.blob));state.targets.forEach((i,k)=>zip.file(targets[k].path,i.blob));
- zip.file('project.json',JSON.stringify({format:'folirina-web-lite',version:1,baseCommit:'b87edcd124a16cdd9feec7b42934291c53c16bbc',sources,targets,pairs:state.pairs.map(({undo,redo,...p})=>p),index:state.index},null,2));
+ zip.file('project.json',JSON.stringify({format:'folirina-web-lite',version:1,baseCommit:'a1516de602e99e5098431ff32864c0578d797a9f',sources,targets,pairs:state.pairs.map(({undo,redo,...p})=>p),index:state.index},null,2));
  const out=await zip.generateAsync({type:'blob',compression:'STORE'},m=>$('busyDetail').textContent=`打包 ${Math.round(m.percent)}%`);download(out,'Folirina_Web_Workspace.zip');toast('工作区已保存；下次可直接载入 ZIP 继续编辑');
  }catch(e){toast(`保存失败：${e.message}`);console.error(e)}finally{busy(false)}
 });

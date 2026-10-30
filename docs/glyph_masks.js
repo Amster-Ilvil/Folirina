@@ -1,3 +1,4 @@
+import {outlinedTargetCandidates} from './outline_candidates.js';
 /**
  * Experimental, non-destructive dual ink mask inspection.
  * Inspired by Folirina desktop text_transfer.py: independent SOURCE and TARGET
@@ -72,6 +73,13 @@ export function inspectTextDifferences(source,target,selection,w,h,opts={}){
  const a=localInk(source,w,h,radius,delta),b=localInk(target,w,h,radius,delta);
  const sourceCandidate=candidateComponents(a,b,selection,w,h);
  const targetCandidate=candidateComponents(b,a,selection,w,h);
+ // Optional desktop-main white-outline evidence is preview-only. Selection
+ // and manual review remain mandatory; never auto-erase these candidates.
+ let outline={accepted:0,components:0,rejected:0};
+ if(opts.outlinedTarget){
+  outline=outlinedTargetCandidates(target,selection,w,h);
+  for(let p=0;p<w*h;p++)if(outline.mask[p])targetCandidate.mask[p]=1;
+ }
  let shared=0,selected=0,possible=0;
  for(let p=0;p<w*h;p++){
   if(selection[p*4+3]<128)continue;
@@ -85,7 +93,7 @@ export function inspectTextDifferences(source,target,selection,w,h,opts={}){
  const caution=selected<64?'选区太小':structuralSupport<.16?'两版公共线条较少，配准或版面差异可能较大':candidateRatio>.72?'大量像素呈现差异，可能包含背景网点和建筑结构':'仍可能误判建筑线条、网点或彩色纹理，必须人工检查';
  return {sourceMask:sourceCandidate.mask,targetMask:targetCandidate.mask,width:w,height:h,
    summary:{selected,shared,possible,structuralSupport,sourceCandidates:sourceCandidate.acceptedArea,
-    targetCandidates:targetCandidate.acceptedArea,sourceComponents:sourceCandidate.components,
+    targetCandidates:targetCandidate.acceptedArea,outlinedCandidates:outline.accepted,outlinedComponents:outline.components,sourceComponents:sourceCandidate.components,
     targetComponents:targetCandidate.components,caution,destructiveSafe:false}};
 }
 
