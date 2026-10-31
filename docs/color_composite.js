@@ -106,7 +106,10 @@ export function applyRegisteredTexturePatch(dst,original,src,mask,w,h,mode='text
     if(src[j+3]>=245)valid++;
   }
   if(selected<4)return {applied:false,changed:0,reason:'笔刷选区过小'};
-  if(valid/selected<.93)return {applied:false,changed:0,reason:'当前选区有部分超出配准后中文版范围，请检查配准'};
+  const coverage=valid/selected;
+  // Safety guard: poor overlap likely means mismatched pages or broken registration.
+  // Small edge gaps are safe to skip pixel by pixel, without erasing TARGET.
+  if(coverage<.65)return {applied:false,changed:0,selected,valid,reason:`中文版配准覆盖率仅 ${Math.round(coverage*100)}%，请核对配对或缩小选区`};
   // Estimate minor brightness / chroma difference from image structure just
   // outside the painted region. Restrict to similar, non-ink pixels so the
   // Japanese glyphs cannot substantially distort the color correction.
@@ -136,7 +139,8 @@ export function applyRegisteredTexturePatch(dst,original,src,mask,w,h,mode='text
   const soft=(mode==='transparent'||mode==='texture');
   for(let y=0;y<h;y++)for(let x=0;x<w;x++){
     const j=(y*w+x)*4;
-    if(mask[j+3]<128)continue;
+    // Source pixels outside the actual overlap have alpha 0; never paste them.
+    if(mask[j+3]<128 || src[j+3]<245)continue;
     // No expansion outside the brush. Feather only inward along its edge.
     let alpha=1;
     if(soft){
@@ -162,5 +166,5 @@ export function applyRegisteredTexturePatch(dst,original,src,mask,w,h,mode='text
     if(did)changed++;
     dst[j+3]=255;
   }
-  return {applied:changed>0,changed,method:'registered-texture',reason:changed?'':'选区内 SOURCE 与 TARGET 像素没有明显差异',shift:shifts};
+  return {applied:changed>0,changed,method:'registered-texture',selected,valid,skippedOutside:selected-valid,reason:changed?'':'选区内 SOURCE 与 TARGET 像素没有明显差异',shift:shifts};
 }

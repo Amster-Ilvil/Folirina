@@ -415,8 +415,12 @@ async function renderPage(){
        state.pendingStroke=null;
        const failed=guarded.find(x=>x.edit===newest.edit);
        const stats=strokeResults.find(x=>x.edit===newest.edit)?.result;
-       if(!failed&&stats?.method==='registered-texture'){
-         $('renderHint').textContent='已使用 SOURCE 配准纹理迁移：未清白背景；请检查画笔边缘是否有扫描色差，必要时右键恢复';
+       if(!failed&&stats?.method==='registered-texture'&&stats.applied){
+         if(stats.skippedOutside>0){
+           const percent=Math.round(100*stats.skippedOutside/Math.max(1,stats.selected));
+           $('renderHint').textContent=`已迁移 SOURCE 有效覆盖区域；画笔内 ${percent}% 的像素超出中文版裁边，已安全保留 TARGET 原图。请检查边缘残字。`;
+           toast(`已局部替换：${percent}% 的选区没有中文版对应像素，原图已保留`);
+         }else $('renderHint').textContent='已使用 SOURCE 配准纹理迁移：未清白背景；请检查画笔边缘是否有扫描色差，必要时右键恢复';
        }
        if(failed||!stats?.applied||stats.changed===0){
          // Unusable strokes must not enter undo/export history as if valid.
@@ -453,7 +457,8 @@ async function renderPage(){
          ctx.save();if(state.view==='overlay')ctx.globalAlpha=.48;ctx.drawImage(img,0,0);ctx.restore();
        }else{
          const warped=warpedSource(source,W,H,p);
-         ctx.save();if(state.view==='overlay')ctx.globalAlpha=.48;ctx.drawImage(warped,0,0);ctx.restore();warped.width=0;warped.height=0;
+         ctx.save();if(state.view==='overlay')ctx.globalAlpha=.48;ctx.drawImage(warped,0,0);ctx.restore();
+         // warpedSource may return a cached projective canvas: never zero its dimensions here.
        }
      }else if(state.view==='source')ctx.drawImage(target,0,0);
    }

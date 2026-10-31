@@ -65,7 +65,7 @@ function projectiveSourceCanvas(source,W,H,pair){
   zoom*H0[3]+sy*H0[6],zoom*H0[4]+sy*H0[7],zoom*H0[5]+sy*H0[8],H0[6],H0[7],H0[8]];
  const key=W+'/'+H+'/'+h.map(n=>n.toFixed(8)).join('/');
  const old=projectiveCache.get(source);
- if(old?.key===key)return old.canvas;
+ if(old?.key===key && old.canvas.width===W && old.canvas.height===H)return old.canvas;
  const inv=invertH(h);if(!inv)throw Error('透视配准矩阵不可逆');
  const from=nativeCanvas(source.width,source.height),fc=from.getContext('2d',{willReadFrequently:true});fc.drawImage(source,0,0);
  const pixels=fc.getImageData(0,0,source.width,source.height).data;
