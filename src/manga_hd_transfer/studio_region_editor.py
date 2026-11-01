@@ -177,6 +177,9 @@ class RegionCompositeDialog(QDialog):
         self._brush_base=cv2.imread(str(self.display_path if self.display_path.exists() else self.target_path),cv2.IMREAD_COLOR)
         self._brush_source=cv2.imread(str(self.source_path),cv2.IMREAD_COLOR)
         self._brush_target=cv2.imread(str(self.target_path),cv2.IMREAD_COLOR)
+        from .outlined_text_mask import trusted_project_text_mask
+        self._brush_text_mask = (trusted_project_text_mask(self.project,self._brush_target.shape[:2])
+                                 if self._brush_target is not None else None)
         from .white_bubble_composite import verified_white_bubble_mask
         self._brush_white = (verified_white_bubble_mask(self._brush_target, self.project.get("target_bubbles", []))
                              if self._brush_target is not None else None)
@@ -580,7 +583,7 @@ class RegionCompositeDialog(QDialog):
             return
         base=self._brush_base[y0:y1,x0:x1]
         under=self._source_tile(key)
-        preview,_patch=compose_reveal_patch(base,under,tr,ho,transparent_feather_px=int(self.brush_feather.value()),transparent_opacity=float(self.brush_opacity.value())/100.0,target_bgr=self._brush_target[y0:y1,x0:x1] if self._brush_target is not None else None,verified_white_mask=self._brush_white[y0:y1,x0:x1] if getattr(self,"_brush_white",None) is not None else None,restore_mask=restore)
+        preview,_patch=compose_reveal_patch(base,under,tr,ho,transparent_feather_px=int(self.brush_feather.value()),transparent_opacity=float(self.brush_opacity.value())/100.0,target_bgr=self._brush_target[y0:y1,x0:x1] if self._brush_target is not None else None,verified_white_mask=self._brush_white[y0:y1,x0:x1] if getattr(self,"_brush_white",None) is not None else None,restore_mask=restore,target_text_mask=self._brush_text_mask[y0:y1,x0:x1] if self._brush_text_mask is not None else None)
         rgb=cv2.cvtColor(preview,cv2.COLOR_BGR2RGB); hh,ww=rgb.shape[:2]
         q=QImage(rgb.data,ww,hh,int(rgb.strides[0]),QImage.Format.Format_RGB888).copy(); pix=QPixmap.fromImage(q)
         if item is None:
@@ -617,14 +620,15 @@ class RegionCompositeDialog(QDialog):
                 self._brush_transparent[ya:yb,xa:xb].copy(),self._brush_hole[ya:yb,xa:xb].copy(),
                 self._brush_target[ya:yb,xa:xb].copy() if self._brush_target is not None else None,
                 self._brush_white[ya:yb,xa:xb].copy() if getattr(self,"_brush_white",None) is not None else None,
-                self._brush_restore[ya:yb,xa:xb].copy()))
+                self._brush_restore[ya:yb,xa:xb].copy(),
+                self._brush_text_mask[ya:yb,xa:xb].copy() if self._brush_text_mask is not None else None))
         source=self._brush_source; project=self.project; shape=self._brush_base.shape[:2]
         dx=int(self.offset_x.value()); dy=int(self.offset_y.value())
         feather=int(self.brush_feather.value()); opacity=float(self.brush_opacity.value())/100.0
         cached={key:self._brush_source_tile_cache.get((key[0],key[1],dx,dy,tuple(ext))) for key,_,_,ext,*_ in snapshots}
         def render():
             rows=[]
-            for key,version,roi,extended,base,tr,ho,target,white,restore in snapshots:
+            for key,version,roi,extended,base,tr,ho,target,white,restore,text_mask in snapshots:
                 if not np.any(tr) and not np.any(ho) and not np.any(restore):
                     rows.append((key,version,roi,None,None)); continue
                 under=cached[key]
@@ -644,7 +648,8 @@ class RegionCompositeDialog(QDialog):
                     transparent_feather_px=feather,transparent_opacity=opacity,
                     target_bgr=target[by0:by1,bx0:bx1] if target is not None else None,
                     verified_white_mask=white[by0:by1,bx0:bx1] if white is not None else None,
-                    restore_mask=restore[by0:by1,bx0:bx1])
+                    restore_mask=restore[by0:by1,bx0:bx1],
+                    target_text_mask=text_mask[by0:by1,bx0:bx1] if text_mask is not None else None)
                 preview[by0:by1,bx0:bx1]=local
                 x0,y0,x1,y1=roi; xa,ya,_,_=extended
                 preview=preview[y0-ya:y1-ya,x0-xa:x1-xa]
@@ -800,6 +805,7 @@ class RegionCompositeDialog(QDialog):
             "ho":self._brush_hole[y0:y1,x0:x1].copy(),"restore":self._brush_restore[y0:y1,x0:x1].copy(),"base":self._brush_base[y0:y1,x0:x1].copy(),
             "target":self._brush_target[y0:y1,x0:x1].copy() if self._brush_target is not None else None,
             "white":self._brush_white[y0:y1,x0:x1].copy() if getattr(self,"_brush_white",None) is not None else None,
+            "target_text_mask":self._brush_text_mask[y0:y1,x0:x1].copy() if self._brush_text_mask is not None else None,
             "source":self._brush_source,"shape":self._brush_base.shape[:2],"project":copy.deepcopy(self.project),
             "dx":int(self.offset_x.value()),"dy":int(self.offset_y.value()),
             "feather":int(self.brush_feather.value()),"opacity":float(self.brush_opacity.value())/100.0,
@@ -819,7 +825,23 @@ class RegionCompositeDialog(QDialog):
             from .lama_manga_runtime import inpaint_koharu_text
             if snapshot.get("target") is None:
                 raise ValueError("背景修补需要原始 TARGET")
-            outlined=outlined_target_text_mask(snapshot["target"])
+            evidence_mask=snapshot.get('target_text_mask')
+            if ((evidence_mask is None or not np.any((evidence_mask>0)&(tr>0)&(ho==0)))
+                    and np.mean(np.ptp(snapshot['target'],axis=2)<=24)>.95):
+                # Explicit background repair runs off the UI thread. Reuse only
+                # existing local detector assets; collect never downloads them.
+                from .layout_evidence import collect_koharu_layout_evidence
+                from .config import BubbleConfig
+                evidence=collect_koharu_layout_evidence(snapshot['target'],BubbleConfig(**snapshot.get('bubble_config',{})))
+                if not evidence.available:
+                    raise ValueError('黑白画面的白描边修补需要本地文字检测证据；请在模型中心准备 Koharu Layout，避免按整块选区误擦原画。')
+                if evidence.available:
+                    from .outlined_text_mask import trusted_project_text_mask
+                    evidence_mask=trusted_project_text_mask({'target_blocks':[b.to_dict() for b in evidence.text_blocks()]},tr.shape)
+                    snapshot['target_text_mask']=evidence_mask
+            outlined=outlined_target_text_mask(snapshot["target"], scope=((tr>0)&(ho==0)).astype(np.uint8),text_seed=evidence_mask)
+            if evidence_mask is not None:
+                outlined|=cv2.dilate((evidence_mask>0).astype(np.uint8)*255,np.ones((7,7),np.uint8))
             outlined_pixels=int(np.count_nonzero((outlined>0)&(tr>0)&(ho==0)))
             if not outlined_pixels:
                 raise ValueError("笔触/选区内没有完整的黑字白描边证据；请框住整组原日文并保留周围背景。")
@@ -829,7 +851,7 @@ class RegionCompositeDialog(QDialog):
                 diag.update(smooth)
                 repair_diag.update(diag)
                 return result,diag
-        _preview,patch=compose_reveal_patch(snapshot["base"],under,tr,ho,transparent_feather_px=snapshot["feather"],transparent_opacity=snapshot["opacity"],target_bgr=snapshot["target"],verified_white_mask=snapshot.get("white"),restore_mask=restore,inpaint_callback=inpaint)
+        _preview,patch=compose_reveal_patch(snapshot["base"],under,tr,ho,transparent_feather_px=snapshot["feather"],transparent_opacity=snapshot["opacity"],target_bgr=snapshot["target"],verified_white_mask=snapshot.get("white"),restore_mask=restore,inpaint_callback=inpaint,target_text_mask=snapshot.get('target_text_mask'))
         if cv2.countNonZero(patch[:,:,3])<=0:
             raise ValueError("笔触内没有可安全揭示的黑灰文字或可清除的日文；长直线和画面内容会被保护。请覆盖完整字形，或使用显式挖孔工具。")
         counts=brush_mask_counts(tr,ho,restore); kinds=[]
@@ -867,12 +889,14 @@ class RegionCompositeDialog(QDialog):
                 "base":self._brush_base[ya:yb,xa:xb].copy(),
                 "target":self._brush_target[ya:yb,xa:xb].copy(),
                 "white":self._brush_white[ya:yb,xa:xb].copy() if self._brush_white is not None else None,
+                "target_text_mask":self._brush_text_mask[ya:yb,xa:xb].copy() if self._brush_text_mask is not None else None,
                 "source":self._brush_source,"shape":self._brush_base.shape[:2],"project":copy.deepcopy(self.project),
                 "dx":int(self.offset_x.value()),"dy":int(self.offset_y.value()),
                 "feather":int(self.brush_feather.value()),"opacity":float(self.brush_opacity.value())/100.,
                 "diameter":int(self.brush_size.value())}
         snapshot["repair_outlined_background"]=True
         snapshot["lama_model_path"]=self.config.inpainting.lama_model_path
+        snapshot['bubble_config']=self.config.bubbles.model_dump()
         return snapshot
 
     def _repair_outlined_background(self):

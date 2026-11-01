@@ -399,6 +399,7 @@ def compose_reveal_patch(
     verified_white_mask: np.ndarray | None = None,
     restore_mask: np.ndarray | None = None,
     inpaint_callback: Callable[[np.ndarray, np.ndarray], tuple[np.ndarray, dict]] | None = None,
+    target_text_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Clean TARGET ink in the stroke, then reveal SOURCE ink over its colour.
 
@@ -428,7 +429,15 @@ def compose_reveal_patch(
     if reference.shape != base_bgr.shape:
         raise ValueError("brush TARGET reference shape mismatch")
     from .outlined_text_mask import outlined_target_text_mask
-    outlined = outlined_target_text_mask(reference)
+    if target_text_mask is not None and target_text_mask.shape != support.shape:
+        raise ValueError('brush TARGET text evidence mask shape mismatch')
+    outlined = outlined_target_text_mask(reference, scope=support.astype(np.uint8), text_seed=target_text_mask)
+    if target_text_mask is not None:
+        # Restore the complete detector footprint, including kana/furigana and
+        # white rims joined to white paper. Never promote its bounding box.
+        semantic=cv2.dilate((target_text_mask>0).astype(np.uint8),np.ones((7,7),np.uint8))
+        semantic[~support]=0
+        outlined|=semantic*255
     outlined[~support] = 0
     from .coloured_paper_repair import repair_coloured_paper_leaks
     working, paper_repair, _paper_diag = repair_coloured_paper_leaks(

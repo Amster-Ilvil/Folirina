@@ -13,6 +13,7 @@ import numpy as np
 from .external_command import run_external_command
 from .io_utils import read_image, write_image
 from .storage_paths import model_home
+from .inpaint_preservation import binary_text_mask, commit_mask_only, preclear_flat_components
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +85,13 @@ def inpaint_koharu_text(
     model_path: str | Path | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Run the configured LaMa Manga sidecar for one protected text mask."""
+    mask = binary_text_mask(image, mask)
+    if not np.any(mask):
+        return image.copy(), {'clear_pixels':0, 'outside_mask_changed_pixels':0}
+    original = image
+    image, pending, flat = preclear_flat_components(image, mask)
+    if not np.any(pending):
+        return image, {**flat, 'backend':'verified-local-flat', 'outside_mask_changed_pixels':0}
     current = status(model_path)
     if not current.ready:
         raise RuntimeError(current.detail)
@@ -100,7 +108,7 @@ def inpaint_koharu_text(
         mask_path = root / "mask.png"
         output_path = root / "output.png"
         write_image(input_path, image)
-        write_image(mask_path, (mask > 0).astype(np.uint8) * 255)
+        write_image(mask_path, pending)
         proc = run_external_command(
             command,
             {"input": input_path, "mask": mask_path, "output": output_path, "model": current.model_path},
@@ -112,7 +120,11 @@ def inpaint_koharu_text(
         result = read_image(output_path)
         if result.shape != image.shape:
             raise RuntimeError(f"LaMa Manga output shape mismatch: {result.shape} vs {image.shape}")
+        result = commit_mask_only(image, result, pending)
+        result = commit_mask_only(original, result, mask)
         return result, {
+            **flat,
+            'outside_mask_changed_pixels':0,
             "stdout": proc.stdout[-1000:],
             "command_exit": proc.returncode,
             "shell": proc.shell,

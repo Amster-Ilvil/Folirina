@@ -110,6 +110,16 @@ def clean_koharu_text_on_flat_backgrounds(
             row["status"] = "skipped_empty_foreground_mask"
             rows.append(row)
             continue
+        # The semantic foreground may contain only black glyph cores. Include
+        # their proven white outlines before classifying the surrounding paper;
+        # otherwise LaMa is conditioned on the old white Japanese silhouette.
+        from .outlined_text_mask import outlined_target_text_mask
+        x,y,bw,bh = cv2.boundingRect(cv2.findNonZero(native))
+        xa,ya,xb,yb = max(0,x-16),max(0,y-16),min(w,x+bw+16),min(h,y+bh+16)
+        outlined = outlined_target_text_mask(target[ya:yb,xa:xb], text_seed=native[ya:yb,xa:xb])
+        if np.any(outlined):
+            native = native.copy()
+            native[ya:yb,xa:xb] |= outlined
         if equivalent_registered_ink(aligned_source, target, native):
             row["status"] = "preserved_equivalent_source_lettering"
             rows.append(row)

@@ -11,6 +11,7 @@ import numpy as np
 from .config import InpaintingConfig
 from .external_command import run_external_command
 from .io_utils import read_image, write_image
+from .inpaint_preservation import binary_text_mask, commit_mask_only, preclear_flat_components
 
 
 @dataclass(slots=True)
@@ -100,6 +101,7 @@ def lama_subprocess(image: np.ndarray, mask: np.ndarray, command: str, timeout: 
         result = read_image(out)
         if result.shape[:2] != image.shape[:2]:
             raise RuntimeError(f"LaMa output shape mismatch: {result.shape} vs {image.shape}")
+        result = commit_mask_only(image, result, mask)
         return InpaintResult(result, "lama-external", {
             "stdout": proc.stdout[-1000:], "command_exit": proc.returncode,
             "shell": proc.shell,
@@ -131,6 +133,7 @@ def model_inpaint_subprocess(
         result=read_image(out)
         if result.shape[:2] != image.shape[:2]:
             raise RuntimeError(f"{backend} output shape mismatch: {result.shape} vs {image.shape}")
+        result = commit_mask_only(image, result, mask)
         return InpaintResult(result, backend, {
             "stdout":proc.stdout[-1000:], "command_exit":proc.returncode, "shell":proc.shell,
             "model_path":str(model_path or ""), "prompted":bool(prompt), "negative_prompted":bool(negative_prompt),
@@ -138,6 +141,26 @@ def model_inpaint_subprocess(
 
 
 def inpaint_image(image: np.ndarray, mask: np.ndarray, config: InpaintingConfig | None = None) -> InpaintResult:
+    cfg = config or InpaintingConfig()
+    if mask is None:
+        return InpaintResult(image.copy(), 'none', {'reason':'empty_mask'})
+    mask = binary_text_mask(image, mask)
+    if not np.any(mask):
+        return InpaintResult(image.copy(), 'none', {'reason':'empty_mask'})
+    base, pending, flat = image, mask, {}
+    if cfg.backend.lower() == 'auto':
+        base, pending, flat = preclear_flat_components(image, mask)
+    if np.any(pending):
+        result = _inpaint_image_backend(base, pending, cfg)
+    else:
+        result = InpaintResult(base, 'solid-local', {'auto_selected':True})
+    result.image = commit_mask_only(image, result.image, mask)
+    result.diagnostics.update(flat)
+    result.diagnostics['outside_mask_changed_pixels'] = 0
+    return result
+
+
+def _inpaint_image_backend(image: np.ndarray, mask: np.ndarray, config: InpaintingConfig | None = None) -> InpaintResult:
     cfg = config or InpaintingConfig()
     if mask is None or cv2.countNonZero(mask) == 0:
         return InpaintResult(image.copy(), "none", {"reason": "empty_mask"})
@@ -182,18 +205,20 @@ def inpaint_image(image: np.ndarray, mask: np.ndarray, config: InpaintingConfig 
     if backend != "auto":
         raise ValueError(f"Unknown inpainting backend: {cfg.backend}")
 
-    _, variance, _ = _background_stats(image, mask)
-    if bool(getattr(cfg, "prefer_threshold_clear_for_white", True)) and variance <= float(getattr(cfg, "threshold_clear_max_variance", 140.0)):
-        result = threshold_clear(image, mask, cfg)
-        result.diagnostics["auto_selected"] = True
-        return result
-    if variance <= cfg.solid_variance_threshold:
-        result = solid_fill(image, mask)
-        result.diagnostics["auto_selected"] = True
-        return result
+    # Proven local flats have already been cleared by the public entry point.
+    # A page-wide trimmed variance cannot prove the remaining islands flat:
+    # it hides thin art lines and mixes separate black/white balloons.
     if bool(getattr(cfg,"auto_use_ai_models",False)):
+        lama_command = cfg.lama_manga_command or cfg.lama_command
+        lama_model = cfg.lama_model_path
+        if not lama_command:
+            from .lama_manga_runtime import status, command_template
+            ready = status(lama_model)
+            if ready.ready:
+                lama_command = command_template(lama_model)
+                lama_model = str(ready.model_path)
         candidates = [
-            ("lama_manga", cfg.lama_manga_command or cfg.lama_command, cfg.lama_model_path, "", ""),
+            ("lama_manga", lama_command, lama_model, "", ""),
             ("aot_inpainting", cfg.aot_command, cfg.aot_model_path, "", ""),
         ]
         for name,command,model,prompt,negative in candidates:
