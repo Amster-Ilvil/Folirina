@@ -259,9 +259,17 @@ class _PersistentWorker:
         if self._proc is not None and self._proc.poll() is None:
             return
         py = _vision_runtime_python()
+        if not py.is_file():
+            raise RuntimeError(f"视觉模型 Python 运行时不存在：{py}")
+        script = worker_script()
+        if not script.is_file():
+            raise RuntimeError(
+                f"视觉模型 Worker 脚本未随 Folirina 一起安装：{script}。"
+                "请安装包含运行时 Worker 文件的新版程序。"
+            )
         self._responses = queue.Queue(); self._stderr_tail = []
         self._proc = subprocess.Popen(
-            [str(py), str(worker_script())],
+            [str(py), str(script)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace", bufsize=1,
             env=deep_install_env(),
@@ -309,8 +317,18 @@ class _PersistentWorker:
                     self.stop()
                     raise RuntimeError("视觉模型 Worker 超时。\n" + detail[-5000:])
                 try:
-                    result = self._responses.get(timeout=remaining)
+                    result = self._responses.get(timeout=min(remaining, 0.25))
                 except queue.Empty as exc:
+                    proc = self._proc
+                    if proc is not None and proc.poll() is not None:
+                        detail = "\n".join(self._stderr_tail[-30:])
+                        exit_code = proc.returncode
+                        self.stop()
+                        raise RuntimeError(
+                            f"视觉模型 Worker 启动后立即退出（exit={exit_code}）。\n{detail[-5000:]}"
+                        ) from exc
+                    if time.monotonic() < deadline:
+                        continue
                     detail = "\n".join(self._stderr_tail[-30:])
                     self.stop()
                     raise RuntimeError("视觉模型 Worker 超时。\n" + detail[-5000:]) from exc
