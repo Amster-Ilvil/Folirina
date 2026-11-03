@@ -601,7 +601,7 @@ $('saveProject').addEventListener('click',async()=>{
  const sources=state.sources.map((i,k)=>({name:i.name,path:`source/${String(k).padStart(4,'0')}.${(i.name.split('.').at(-1)||'png').toLowerCase()}`}));
  const targets=state.targets.map((i,k)=>({name:i.name,path:`target/${String(k).padStart(4,'0')}.${(i.name.split('.').at(-1)||'png').toLowerCase()}`}));
  state.sources.forEach((i,k)=>zip.file(sources[k].path,i.blob));state.targets.forEach((i,k)=>zip.file(targets[k].path,i.blob));
- zip.file('project.json',JSON.stringify({format:'folirina-web-lite',version:1,baseCommit:'a1516de602e99e5098431ff32864c0578d797a9f',sources,targets,pairs:state.pairs.map(({undo,redo,...p})=>p),index:state.index},null,2));
+ zip.file('project.json',JSON.stringify({format:'folirina-web-lite',version:1,baseCommit:'37a3fff6bfac13f7aee551e06cd7ff1584d28a96',sources,targets,pairs:state.pairs.map(({undo,redo,...p})=>p),index:state.index},null,2));
  const out=await zip.generateAsync({type:'blob',compression:'STORE'},m=>$('busyDetail').textContent=`打包 ${Math.round(m.percent)}%`);download(out,'Folirina_Web_Workspace.zip');toast('工作区已保存；下次可直接载入 ZIP 继续编辑');trackUsage('workspace_save_success');
  }catch(e){toast(`保存失败：${e.message}`);console.error(e)}finally{busy(false)}
 });

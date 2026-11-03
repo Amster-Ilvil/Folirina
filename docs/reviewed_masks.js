@@ -1,4 +1,5 @@
 import {repairDirectionalTarget} from './structure_repair.js';
+import {preclearVerifiedFlat} from './verified_flat_repair.js';
 /**
  * Fully client-side, explicitly HUMAN-APPROVED text masks.
  * No automatic destructive authority: only separately reviewed source-writing
@@ -37,12 +38,14 @@ export function applyReviewedTransfer(current,original,source,edit,w,h){
  const sourceMask=decodeBitMask(edit.sourceBits,n),targetMask=decodeBitMask(edit.targetBits,n);
  const next=new Uint8ClampedArray(current);
  let cleared=0,written=0,noDonor=0,lineBridges=0,uncertain=0;
+ const flat=edit.repairMode==='neighbors'?preclearVerifiedFlat(next,original,targetMask,w,h):null;
  if(edit.repairMode==='directional'){
    const stats=repairDirectionalTarget(next,original,targetMask,w,h);
    ({cleared,noDonor,lineBridges,uncertain}=stats);
  }
  for(let y=0;y<h;y++)for(let x=0;x<w;x++){
    const p=y*w+x;if(!targetMask[p]||edit.repairMode==='directional')continue;
+   if(flat?.mask[p]){cleared++;continue}
    const j=p*4;
    if(edit.repairMode==='source' && source[j+3]>=240 && !sourceMask[p]){
      for(let c=0;c<3;c++)next[j+c]=source[j+c];
@@ -71,5 +74,5 @@ export function applyReviewedTransfer(current,original,source,edit,w,h){
  }
  let changed=0;for(let p=0;p<n;p++){const j=p*4;if(next[j]!==current[j]||next[j+1]!==current[j+1]||next[j+2]!==current[j+2])changed++}
  current.set(next);
- return {applied:changed>0,changed,cleared,written,noDonor,lineBridges,uncertain,method:'reviewed-source-target-masks'};
+ return {applied:changed>0,changed,cleared,written,noDonor,lineBridges,uncertain,flatPixels:flat?.pixels||0,flatComponents:flat?.components||0,method:'reviewed-source-target-masks'};
 }

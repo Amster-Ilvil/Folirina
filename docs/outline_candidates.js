@@ -17,6 +17,24 @@ export function outlinedTargetCandidates(rgba,selection,w,h){
  }
  let accepted=0,components=0,rejected=0;
  const stack=[],points=[];
+ const neutralCandidates=[];
+ const paintCandidate=({minX,minY,maxX,maxY,bw,bh,component,outside})=>{
+  // Only the inspected selection may supply write candidates.
+  for(let yy=Math.max(0,minY-3);yy<=Math.min(h-1,maxY+3);yy++)
+   for(let xx=Math.max(0,minX-3);xx<=Math.min(w-1,maxX+3);xx++){
+    const p=yy*w+xx;if(selection[p*4+3]<128)continue;
+    let close=false;
+    for(let dy=-3;dy<=3&&!close;dy++)for(let dx=-3;dx<=3;dx++){
+     if(dx*dx+dy*dy>9)continue;
+     const x=xx+dx,y=yy+dy;if(x<minX||x>maxX||y<minY||y>maxY)continue;
+     const q=(y-minY)*bw+x-minX;
+     if(component[q]||!outside[q]){close=true;break}
+    }
+    if(close&&!mask[p]){mask[p]=1;accepted++}
+   }
+  components++;
+ };
+
  for(let start=0;start<n;start++){
   if(!white[start]||seen[start])continue;
   seen[start]=1;stack.push(start);points.length=0;
@@ -79,22 +97,58 @@ export function outlinedTargetCandidates(rgba,selection,w,h){
    const r=rgba[j],g=rgba[j+1],b=rgba[j+2];
    if(Math.max(r,g,b)>=120&&Math.max(r,g,b)-Math.min(r,g,b)>=30)colored++;
   }
-  if(colored<Math.max(24,Math.ceil(total*.3))){rejected++;continue}
-  // Expand at most 3 px, but *only within* the user-specified selection.
-  // Dilation may catch white antialiasing without ever crossing edit authority.
-  for(let yy=Math.max(0,minY-3);yy<=Math.min(h-1,maxY+3);yy++)
-   for(let xx=Math.max(0,minX-3);xx<=Math.min(w-1,maxX+3);xx++){
-    const p=yy*w+xx;if(selection[p*4+3]<128)continue;
-    let close=false;
-    for(let dy=-3;dy<=3&&!close;dy++)for(let dx=-3;dx<=3;dx++){
-     if(dx*dx+dy*dy>9)continue;
-     const x=xx+dx,y=yy+dy;if(x<minX||x>maxX||y<minY||y>maxY)continue;
-     const q=(y-minY)*bw+x-minX;
-     if(component[q]||!outside[q]){close=true;break}
-    }
-    if(close&&!mask[p]){mask[p]=1;accepted++}
+  if(colored<Math.max(24,Math.ceil(total*.3))){
+   // Neutral black/white manga: unlike coloured paper, accept only a
+   // manually scoped *run* of at least three aligned white-outlined glyphs.
+   let neutral=0,context=0,selectedFill=0,filled=0;
+   const levels=[];
+   for(let yy=ya;yy<yb;yy++)for(let xx=xa;xx<xb;xx++){
+    const p=yy*w+xx,j=p*4,inside=xx>=minX&&xx<=maxX&&yy>=minY&&yy<=maxY;
+    if(inside&&component[(yy-minY)*bw+(xx-minX)])continue;
+    const r=rgba[j],g=rgba[j+1],b=rgba[j+2];
+    if(Math.max(r,g,b)-Math.min(r,g,b)<=24)neutral++;
+    levels.push(Math.round(.299*r+.587*g+.114*b));context++;
    }
-  components++;
+   for(let yy=minY;yy<=maxY;yy++)for(let xx=minX;xx<=maxX;xx++){
+    const q=(yy-minY)*bw+xx-minX;
+    if(!component[q]&&outside[q])continue;
+    filled++;if(selection[(yy*w+xx)*4+3]>=128)selectedFill++;
+   }
+   levels.sort((a,b)=>a-b);
+   const median=levels[Math.floor(levels.length/2)]??255;
+   if(context>=24&&neutral/context>=.8&&median<=170&&filled>=8&&selectedFill/filled>=.98&&neutralCandidates.length<400)
+    neutralCandidates.push({minX,minY,maxX,maxY,bw,bh,component,outside});
+   else rejected++;
+   continue;
+  }
+  paintCandidate({minX,minY,maxX,maxY,bw,bh,component,outside});
+ }
+ // Reject isolated white highlights: neutral candidates only qualify as
+ // a connected run of three or more similarly sized aligned glyphs.
+ const graph=Array.from({length:neutralCandidates.length},()=>[]);
+ for(let i=0;i<neutralCandidates.length;i++){
+  const a=neutralCandidates[i];
+  for(let j=0;j<i;j++){
+   const b=neutralCandidates[j];
+   if(Math.max(a.bw,b.bw)/Math.max(1,Math.min(a.bw,b.bw))>2||
+      Math.max(a.bh,b.bh)/Math.max(1,Math.min(a.bh,b.bh))>2)continue;
+   const dx=Math.abs((a.minX+a.bw/2)-(b.minX+b.bw/2));
+   const dy=Math.abs((a.minY+a.bh/2)-(b.minY+b.bh/2));
+   const connected=(dy<=Math.max(a.bh,b.bh)*.5&&dx>.4*Math.min(a.bw,b.bw)&&dx<=2.5*Math.max(a.bw,b.bw))||
+    (dx<=Math.max(a.bw,b.bw)*.5&&dy>.4*Math.min(a.bh,b.bh)&&dy<=2.5*Math.max(a.bh,b.bh));
+   if(connected){graph[i].push(j);graph[j].push(i)}
+  }
+ }
+ const visitedNeutral=new Uint8Array(neutralCandidates.length);
+ for(let i=0;i<neutralCandidates.length;i++){
+  if(visitedNeutral[i])continue;
+  const pending=[i],group=[];visitedNeutral[i]=1;
+  while(pending.length){
+   const k=pending.pop();group.push(k);
+   for(const j of graph[k])if(!visitedNeutral[j]){visitedNeutral[j]=1;pending.push(j)}
+  }
+  if(group.length<3){rejected+=group.length;continue}
+  for(const k of group)paintCandidate(neutralCandidates[k]);
  }
  return {mask,accepted,components,rejected};
 }
