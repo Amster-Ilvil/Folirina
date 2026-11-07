@@ -48,6 +48,7 @@ def white_bubble_interior(
     *,
     inset: int = 3,
     manual_geometry_override: bool = False,
+    require_enclosed: bool = True,
 ) -> tuple[np.ndarray | None, dict]:
     """Prove neutral white paper inside a semantic balloon, preserving its rim.
 
@@ -77,6 +78,35 @@ def white_bubble_interior(
             "paper_median_bgr": median.tolist(), "inset_px": radius}
     if ratio < 0.68 or float(median.min()) < 248 or float(np.ptp(median)) > 4:
         return None, {**diag, "reason": "not_flat_neutral_white"}
+    # Sparse screentones also have a white median. Prove that the paper is
+    # enclosed by an actual TARGET rim, rather than trusting a detector polygon
+    # around open narration or a large connected panel background.
+    x, y, w, h = cv2.boundingRect(full)
+    pad = 12
+    x0, y0 = max(0, x-pad), max(0, y-pad)
+    x1, y1 = min(target.shape[1], x+w+pad), min(target.shape[0], y+h+pad)
+    roi = target[y0:y1, x0:x1]
+    local_inner = inner[y0:y1, x0:x1] > 0
+    local_full = full[y0:y1, x0:x1] > 0
+    white = ((roi.min(axis=2) >= 240) & (np.ptp(roi, axis=2) <= 10)).astype(np.uint8)
+    count, labels, _, _ = cv2.connectedComponentsWithStats(white, 8)
+    votes = np.bincount(labels[local_inner].ravel(), minlength=count)
+    votes[0] = 0
+    label = int(votes.argmax())
+    component = labels == label
+    touches_edge = bool(component[0].any() or component[-1].any()
+                        or component[:, 0].any() or component[:, -1].any())
+    outside = int(np.count_nonzero(component & ~local_full))
+    if require_enclosed and label and touches_edge and outside > max(32, area * .02):
+        return None, {**diag, "reason": "white_paper_not_enclosed", "outside_paper_pixels": outside}
+    # A panel can itself be closed. Large connected artwork inside it still
+    # cannot be erased as lettering, even when most pixels are white paper.
+    dark = ((roi.min(axis=2) < 225) & local_inner).astype(np.uint8)
+    _, _, components, _ = cv2.connectedComponentsWithStats(dark, 8)
+    for _, _, cw, ch, size in components[1:]:
+        if (size > max(64, area * .05) and min(cw, ch) > min(w, h) * .20
+                and (cw > w * .45 or ch > h * .45)):
+            return None, {**diag, "reason": "artwork_inside_white_region", "artwork_pixels": int(size)}
     return inner, {**diag, "reason": "verified_white_bubble"}
 
 

@@ -126,6 +126,28 @@ def load_json(path: str | Path) -> object:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+def atomic_hardlink(alias: str | Path, target: str | Path) -> bool:
+    """Replace an alias only after its new hard link is ready."""
+    alias = Path(alias)
+    tmp = None
+    try:
+        fd, name = tempfile.mkstemp(prefix=f".{alias.name}.", suffix=".link", dir=str(alias.parent))
+        os.close(fd)
+        tmp = Path(name)
+        tmp.unlink()
+        os.link(target, tmp)
+        os.replace(tmp, alias)
+        return True
+    except OSError:
+        return False
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def ensure_bgr(image: np.ndarray | Image.Image) -> np.ndarray:
     if isinstance(image, Image.Image):
         arr = np.array(image.convert("RGB"))
@@ -144,4 +166,5 @@ def stem_id(path: str | Path) -> str:
     # same ``page`` cache/output directory.  Replace only filesystem-unfriendly
     # punctuation/spacing while preserving the historical ASCII behaviour.
     stem = unicodedata.normalize("NFKC", Path(path).stem)
-    return re.sub(r"[^\w.-]+", "_", stem, flags=re.UNICODE).strip("_") or "page"
+    name = re.sub(r"[^\w.-]+", "_", stem, flags=re.UNICODE).strip("_")
+    return name if name and name not in {".", ".."} else "page"

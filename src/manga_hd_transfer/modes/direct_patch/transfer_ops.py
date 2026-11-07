@@ -1431,6 +1431,10 @@ def _transfer_open_complex_text_region(
     x0, y0, x1, y1 = box
     bw, bh = max(1, x1 - x0), max(1, y1 - y0)
     default_pad = max(6, int(round(max(bw, bh) * float(getattr(cfg, "paired_diff_complex_region_pad_ratio", 0.16)))))
+    if max(bw, bh) > 3 * min(bw, bh):
+        # A long caption column needs a glyph-width fringe, not a fringe
+        # proportional to its whole height that reaches faces and hands.
+        default_pad = min(default_pad, max(3, min(12, int(round(min(bw, bh) * .16)))))
     pad = default_pad if region_pad_px is None else max(0, int(region_pad_px))
     gate = cv2.dilate(
         region_mask,
@@ -1525,6 +1529,7 @@ def _transfer_open_complex_text_region(
     clear = cv2.dilate(clear, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d * 2 + 1, d * 2 + 1)))
     clear = cv2.bitwise_and(clear, gate)
 
+    background_allow = None
     recolor_diag: dict = {}
     recolor_out = None
     recolor_write = np.zeros(shape, np.uint8)
@@ -1562,15 +1567,29 @@ def _transfer_open_complex_text_region(
             src_count = int(cv2.countNonZero(src_sel))
         clear_backend = str(recolor_diag.get("clear_backend") or "source-guided-monochrome-recolor")
     else:
-        out = cv2.inpaint(target, clear, 2.5, cv2.INPAINT_TELEA)
+        from ...textured_text_cleanup import clean_text_background
+        out, clear, background_cleanup = clean_text_background(target, clear, region_mask)
+        background_allow = background_cleanup.pop("authority_allow_mask", None)
         alpha = _soft_ink_alpha(aligned_source, src_sel, gate)
+        if background_cleanup["backend"] == "lama-manga-textured" and source_text_gate is not None:
+            from ...textured_text_cleanup import composite_outlined_source
+            out, source_write, src_sel = composite_outlined_source(out, aligned_source, source_text_gate)
+            src_count = int(cv2.countNonZero(src_sel))
+            alpha = np.zeros(shape, np.float32)
+        elif background_cleanup["backend"] == "lama-manga-textured":
+            from ...textured_text_cleanup import outlined_source_support
+            src_sel = outlined_source_support(aligned_source, src_sel, source_text_gate if source_text_gate is not None else gate)
+            alpha = (src_sel > 0).astype(np.float32)
+            src_count = int(cv2.countNonZero(src_sel))
         a3 = alpha[..., None]
         out = np.clip(
             aligned_source.astype(np.float32) * a3 + out.astype(np.float32) * (1.0 - a3),
             0, 255,
         ).astype(np.uint8)
         write = np.maximum(clear, (alpha * 255).astype(np.uint8))
-        clear_backend = "opencv-telea"
+        if source_text_gate is not None and background_cleanup["backend"] == "lama-manga-textured":
+            write = np.maximum(write, source_write)
+        clear_backend = background_cleanup["backend"]
     # Float alpha can change a pixel by one code value even when uint8(alpha*255)
     # rounds to zero.  Audit/export masks must describe the *exact* write footprint
     # so pixels outside it are guaranteed byte-identical to the target.
@@ -1597,6 +1616,7 @@ def _transfer_open_complex_text_region(
         "semantic_target_clear_hint_admitted": bool(semantic_hint_admitted),
         "clear_backend": clear_backend,
         "source_recolor": recolor_diag,
+        "outlined_clear_allow_mask": background_allow,
     }
 
 
@@ -1903,9 +1923,7 @@ def _semantic_paired_raw_box_gate(
     bx0, by0, bx1, by1 = [float(v) for v in base_box]
     base_area = max(1.0, (bx1-bx0)*(by1-by0))
     target_raw_area = max(1.0, (float(traw[2])-float(traw[0]))*(float(traw[3])-float(traw[1])))
-    if target_raw_area / base_area < 1.8:
-        diag["reason"] = "target_mask_not_undersegmented"
-        return None, diag
+    target_undersegmented = target_raw_area / base_area >= 1.8
 
     H = transform_to_homography(registration.matrix)
     best = None
@@ -1955,6 +1973,21 @@ def _semantic_paired_raw_box_gate(
         diag["raw_box_overlap"] = 0.0 if best is None else float(best[1])
         return None, diag
     _,raw_overlap,area_similarity,srow,sproj=best
+    if not target_undersegmented:
+        # The Japanese mask can be complete while the corresponding Chinese
+        # layout has extra columns above/beside it. Only the exact, strongly
+        # paired SOURCE text may extend this write corridor; panel geometry
+        # cannot supply that permission.
+        ix0=max(bx0,sproj[0]); iy0=max(by0,sproj[1])
+        ix1=min(bx1,sproj[2]); iy1=min(by1,sproj[3])
+        inside=max(0.0,ix1-ix0)*max(0.0,iy1-iy0)
+        source_area=max(1.0,(sproj[2]-sproj[0])*(sproj[3]-sproj[1]))
+        source_overflow=1.0-inside/source_area
+        if (not bool(paired_proof.get("admit",False)) or proof_source_index is None
+                or float(getattr(srow,"confidence",0.0)) < .90 or source_overflow < .03):
+            diag["reason"] = "target_mask_not_undersegmented"
+            return None, diag
+        diag["source_text_overflow_ratio"] = round(source_overflow,4)
     raw_group_mode = str(paired_proof.get("proof_mode") or "") == "raw_group"
     if raw_group_mode:
         min_area_similarity = float(getattr(cfg, "koharu_semantic_paired_raw_group_min_area_similarity", 0.17))
@@ -2148,6 +2181,31 @@ def transfer_koharu_semantic_regions(
     if include_sfx:
         texts.extend([x for x in list(getattr(evidence, "items", []) or []) if str(getattr(x, "label", "")) == "sfx"])
 
+    if not strict_raw_group_only and source_evidence is not None:
+        from ...neutral_caption_transfer import recover_neutral_captions
+        source_texts = [x for x in list(getattr(source_evidence, "items", []) or []) if str(getattr(x, "label", "")) == "text"]
+        recovered = recover_neutral_captions(aligned_source, target, source_texts, texts, registration, exclude_mask)
+        for caption in recovered:
+            row = caption["target"]
+            rid = str((getattr(row, "meta", {}) or {}).get("item_index", "caption"))
+            write = caption["write"]; use = write > 0
+            rendered[use] = caption["image"][use]
+            layer[use, :3] = cv2.cvtColor(rendered, cv2.COLOR_BGR2RGB)[use]
+            layer[..., 3] = np.maximum(layer[..., 3], write)
+            composite = np.maximum(composite, write)
+            clear_all = np.maximum(clear_all, caption["clear"])
+            raw_rescue_allow = np.maximum(raw_rescue_allow, write)
+            rec = MaskTransferRecord(f"koharu-neutral-src-{rid}", f"koharu-semantic-dst-text-{rid}", float(row.confidence), True, "applied_paired_neutral_caption")
+            rec.source_bbox = caption["source_box"]; rec.target_bbox = caption["target_box"]
+            rec.meta = {"semantic_completion": True, "standalone": True, "semantic_clear_backend": "lama-manga-neutral-caption", "ocr_used": False, "glyph_shape_change": caption["difference"], "model": caption["model"]}
+            _evaluate_content_completeness(
+                rec, (caption["alpha"] > .08).astype(np.uint8) * 255,
+                caption["clear"], caption["image"], cfg,
+                target_invalidation_mask=write,
+            )
+            records.append(rec)
+        exclude_mask = np.maximum(exclude_mask, composite)
+
     def overlap_ratio(mask: np.ndarray, other: np.ndarray) -> float:
         area = max(1, cv2.countNonZero(mask))
         return float(np.count_nonzero((mask > 0) & (other > 0)) / area)
@@ -2248,12 +2306,30 @@ def transfer_koharu_semantic_regions(
                 if sx1 > sx0 and sy1 > sy0:
                     source_text_gate=np.zeros(shape,np.uint8)
                     source_text_gate[sy0:sy1,sx0:sx1]=255
+        if source_text_gate is None and bool(paired_proof.get("admit")) and source_evidence is not None and registration is not None:
+            from ...neutral_caption_transfer import _box as projected_text_box
+            mate = next((s for s in getattr(source_evidence, "items", []) if (getattr(s,"meta",{}) or {}).get("item_index") == paired_proof.get("source_item_index")), None)
+            source_box = projected_text_box(mate, registration.matrix, shape) if mate is not None else None
+            if source_box is not None:
+                sx0,sy0,sx1,sy1=source_box
+                source_text_gate=np.zeros(shape,np.uint8)
+                source_text_gate[sy0:sy1,sx0:sx1]=255
         if raw_gate is not None and str(paired_proof.get("proof_mode") or "") == "lowconf_paired_raw_text":
             text_img, write_mask, source_ink_mask, diag = _paired_source_label_raster_transfer(
                 aligned_source, rendered, transfer_gate, cfg, paired_proof=paired_proof
             )
         else:
             text_img, write_mask, source_ink_mask, diag = None, np.zeros(shape, np.uint8), np.zeros(shape, np.uint8), {"reason": "source_label_not_applicable"}
+        if text_img is None and raw_gate is not None and raw_gate_diag.get("source_text_overflow_ratio"):
+            from .overlay import _white_container_target_flatness, build_white_source_overlay
+            paper = _white_container_target_flatness(target, transfer_gate)
+            if paper.get("flat"):
+                text_img, write_mask, source_ink_mask, diag = build_white_source_overlay(
+                    rendered, aligned_source, transfer_gate,
+                    target_clear_region_mask=gate, border_guard_px=0,
+                )
+                diag["clear_backend"] = "paired-source-flat-paper-raster"
+                diag["semantic_target_paper"] = paper
         if text_img is None:
             text_img, write_mask, source_ink_mask, diag = _transfer_open_complex_text_region(
                 aligned_source, rendered, transfer_gate, cfg, target_clear_hint=target_text_hint,
@@ -2270,6 +2346,8 @@ def transfer_koharu_semantic_regions(
             "source-guided-monochrome-recolor", "paired-raw-box-blackhat-inpaint",
             "paired-raw-group-large-text-inpaint", "paired-raw-group-plain-paper-text",
             "paired-source-label-raster",
+            "paired-source-flat-paper-raster",
+            "lama-manga-textured",
         }:
             # A larger under-segmented paired text group is allowed to expand
             # only when a specialised component renderer independently proves a
@@ -2374,6 +2452,9 @@ def transfer_koharu_semantic_regions(
         composite = np.maximum(composite, write_mask)
         if standalone and bool(raw_gate_diag.get("expanded", False)):
             raw_rescue_allow = np.maximum(raw_rescue_allow, write_mask)
+        outline_allow = diag.get("outlined_clear_allow_mask")
+        if isinstance(outline_allow, np.ndarray) and outline_allow.shape == shape:
+            raw_rescue_allow = np.maximum(raw_rescue_allow, outline_allow)
         diag_clear = diag.get("clear_mask")
         if isinstance(diag_clear, np.ndarray) and diag_clear.shape == shape:
             clear_all = np.maximum(clear_all, diag_clear)

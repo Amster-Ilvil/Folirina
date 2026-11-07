@@ -144,15 +144,24 @@ class ProjectWorkspaceManager:
                 return self.open_project(source)
         except (ValueError, OSError):
             pass
+        try:
+            self.projects_root.resolve().relative_to(source)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("工作区不能位于待导入项目内部，请选择项目之外的工作区目录。")
         self.projects_root.mkdir(parents=True, exist_ok=True)
         target = self._unique_project_dir(info.name)
-        shutil.copytree(source, target, copy_function=shutil.copy2)
-        payload = self._project_payload(target)
-        payload["project_id"] = uuid.uuid4().hex
-        payload["imported_from_project_id"] = info.project_id
-        payload["created_at"] = _now_iso()
-        payload["updated_at"] = payload["created_at"]
-        save_json(target / PROJECT_FILE, payload)
+        with tempfile.TemporaryDirectory(prefix=".project-import-", dir=self.projects_root) as td:
+            staged = Path(td) / "project"
+            shutil.copytree(source, staged, copy_function=shutil.copy2)
+            payload = self._project_payload(staged)
+            payload["project_id"] = uuid.uuid4().hex
+            payload["imported_from_project_id"] = info.project_id
+            payload["created_at"] = _now_iso()
+            payload["updated_at"] = payload["created_at"]
+            save_json(staged / PROJECT_FILE, payload)
+            staged.rename(target)
         return self.open_project(target)
 
     def delete_project(self, path: str | Path) -> None:

@@ -304,7 +304,9 @@ def _candidate_mask(candidate: Any, shape: tuple[int, int]) -> np.ndarray:
     return np.zeros(shape, np.uint8)
 
 
-def _max_item_overlap(mask: np.ndarray, items: Iterable[LayoutEvidenceItem]) -> float:
+def _max_item_overlap(
+    mask: np.ndarray, items: Iterable[LayoutEvidenceItem], *, candidate_coverage: bool = False,
+) -> float:
     area = int(np.count_nonzero(mask))
     if area <= 0:
         return 0.0
@@ -318,7 +320,8 @@ def _max_item_overlap(mask: np.ndarray, items: Iterable[LayoutEvidenceItem]) -> 
         if ia <= 0:
             continue
         inter = int(np.count_nonzero(mb & im))
-        best = max(best, float(inter / max(1, min(area, ia))))
+        denominator = area if candidate_coverage else min(area, ia)
+        best = max(best, float(inter / max(1, denominator)))
     return best
 
 
@@ -343,15 +346,19 @@ def classify_layout_authority(
     mask = _candidate_mask(candidate, shape)
     if int(np.count_nonzero(mask)) <= 0:
         return LayoutAuthorityDecision("UNKNOWN", "empty_candidate_mask")
-    bo = _max_item_overlap(mask, evidence.by_label("bubble"))
-    to = _max_item_overlap(mask, evidence.by_label("text"))
+    kind = str(region_kind or "bubble").strip().lower()
+    container = kind in {"bubble", "speech", "narration", "container"}
+    # A small text/bubble enclosed by a whole-panel proposal cannot authorize
+    # clearing the panel. Semantic evidence must cover the proposed container,
+    # not merely be contained inside it (intersection/min-area always scored 1).
+    bo = _max_item_overlap(mask, evidence.by_label("bubble"), candidate_coverage=container)
+    to = _max_item_overlap(mask, evidence.by_label("text"), candidate_coverage=container)
     so = _max_item_overlap(mask, evidence.by_label("sfx"))
     po = _max_item_overlap(mask, evidence.by_label("panel"))
     bubble_min = float(getattr(cfg, "paired_diff_koharu_layout_bubble_min_overlap", 0.25) if cfg is not None else 0.25)
     text_min = float(getattr(cfg, "paired_diff_koharu_layout_text_min_overlap", 0.35) if cfg is not None else 0.35)
     sfx_min = float(getattr(cfg, "paired_diff_koharu_layout_sfx_min_overlap", 0.35) if cfg is not None else 0.35)
     panel_min = float(getattr(cfg, "paired_diff_koharu_layout_panel_only_min_overlap", 0.20) if cfg is not None else 0.20)
-    kind = str(region_kind or "bubble").strip().lower()
     if kind in {"complex_text", "free_text", "text", "sfx", "onomatopoeia"}:
         supported = bool(to >= text_min or so >= sfx_min)
     elif kind in {"bubble", "speech", "narration", "container"}:

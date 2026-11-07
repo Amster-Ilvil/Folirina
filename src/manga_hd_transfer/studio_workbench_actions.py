@@ -25,7 +25,7 @@ from .gui_components import (
     ImageView, Card, WorkbenchPageRail, StableComboBox, StableSpinBox, StableDoubleSpinBox,
 )
 from .io_utils import load_json, save_json, write_image
-from .review_history import review_history_counts
+from .review_history import review_history_counts, load_review_history
 from .review_action_state import review_action_availability
 from .font_catalog import discover_fonts, import_font_to_library, persist_font_expression, font_library_dir
 from .review_apply import (
@@ -750,6 +750,12 @@ class WorkbenchActionsMixin:
     def _undo_manual_effect_region(self):
         page_dir=self._current_page_dir()
         if page_dir is None: return
+        history=load_review_history(page_dir)
+        undo=history.get('undo') or []
+        if undo and str(undo[-1].get('reason','')).startswith('manual_effect:'):
+            # Keep the saved sparse patch: redo needs those exact pixels.
+            self._review_history_step('undo')
+            return
         override_path=page_dir/"review_overrides.json"; overrides=normalize_overrides(load_json(override_path) if override_path.exists() else {})
         rows=_json_dict_rows(overrides.get("manual_effect_regions"))
         if not rows:

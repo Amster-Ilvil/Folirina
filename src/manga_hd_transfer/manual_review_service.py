@@ -66,7 +66,7 @@ def _same_region_action_semantics(a: dict[str, Any], b: dict[str, Any]) -> bool:
 # rolled back here.  A failed local edit should be indistinguishable from no
 # edit at all, including project/review synchronization metadata.
 _MANUAL_COMMIT_MUTABLE_NAMES = (
-    "review_overrides.json", "project.json", "final.png", "final_reviewed.png",
+    "review_overrides.json", "review_history.json", "project.json", "final.png", "final_reviewed.png",
     "final_auto.png", "manual_effect_base.png", "review_sync.json",
     "review_applied.json", "review_base.png", "review_preview.png",
     "text_layer_reviewed.png", "inpainted_reviewed.png",
@@ -273,6 +273,7 @@ def commit_manual_effect(
             row["suggested_manual_mode"] = str(preset.get("suggested_manual_mode", "reveal_text") or "reveal_text")
 
         ensure_manual_baseline(page_dir)
+        record_review_state(page_dir, overrides, f"manual_effect:{mode}")
         _trace(trace, "commit_files_started", row_id=rid, mode=mode)
 
         if reveal is not None:

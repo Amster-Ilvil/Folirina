@@ -648,9 +648,15 @@ def run_page_flow(
             (target.shape[1], target.shape[0]), flags=cv2.INTER_NEAREST)
         aligned_raster = cv2.warpPerspective(source, matrix,
             (target.shape[1], target.shape[0]), borderValue=(255, 255, 255))
+        white_geometry_bubbles = []
+        if direct_container_plan is not None:
+            white_geometry_bubbles.extend(list(getattr(direct_container_plan, "target_bubbles", []) or []))
+        white_geometry_bubbles.extend(list(completion_display_target or []))
+        white_geometry_bubbles.extend(list(mask_target_bubbles or target_bubbles or []))
         target_first = compose_coloured_containers(
             target, rendered, aligned_raster, aligned_letters,
             mask_transfer.records, lama_inpaint_callback,
+            target_bubbles=white_geometry_bubbles,
         )
         if target_first.diagnostics.get("applied", 0):
             rendered = target_first.image

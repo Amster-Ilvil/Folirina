@@ -78,7 +78,13 @@ def _scoped_neutral_glyph_cores(target, gray, scope, text_seed):
 
 
 def outlined_target_text_mask(target: np.ndarray, *, scope: np.ndarray | None = None,
-                              text_seed: np.ndarray | None = None) -> np.ndarray:
+                              text_seed: np.ndarray | None = None,
+                              fringe_px: int = 4) -> np.ndarray:
+    """Find outlined glyphs; use fringe_px=0 for copying SOURCE glyphs.
+
+    The default fringe includes white AA remnants when erasing TARGET text.
+    That erasure halo must never become SOURCE background transfer authority.
+    """
     if target.ndim != 3 or target.shape[2] != 3 or target.dtype != np.uint8:
         raise ValueError("outlined text detection expects uint8 BGR")
     h, w = target.shape[:2]
@@ -184,13 +190,63 @@ def outlined_target_text_mask(target: np.ndarray, *, scope: np.ndarray | None = 
     # Printed white AA can extend farther than the solid white component. A
     # bounded four-pixel fringe removes that conditioning signal before LaMa.
     out |= _scoped_neutral_glyph_cores(target, gray, scope, text_seed)
-    out = cv2.dilate(out, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+    fringe=max(0,min(8,int(fringe_px)))
+    if fringe:
+        out = cv2.dilate(out, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*fringe+1, 2*fringe+1)))
     if scope is not None:
         out[scope == 0] = 0
     if text_seed is not None:
         close = cv2.dilate((text_seed > 0).astype(np.uint8), np.ones((17,17),np.uint8))
         out[close == 0] = 0
     return out
+
+
+def outlined_source_text_mask(source: np.ndarray, scope: np.ndarray,
+                              source_mask: np.ndarray) -> np.ndarray | None:
+    """Copy proven SOURCE lettering across dark and bright backgrounds.
+
+    TARGET erasure requires independent evidence for every glyph. SOURCE
+    lettering can also follow an established outlined text run through a bright
+    part of the artwork, where its white rim merges with the background.
+    """
+    glyphs=outlined_target_text_mask(source,scope=np.full(scope.shape,255,np.uint8),fringe_px=0)
+    if not np.any(glyphs):return None
+    gray=cv2.cvtColor(source,cv2.COLOR_BGR2GRAY)
+    paper=cv2.morphologyEx(gray,cv2.MORPH_CLOSE,np.ones((9,9),np.uint8))
+    cores=((gray<190)&(paper.astype(np.int16)-gray.astype(np.int16)>32)&(source_mask>0)&(scope>0)).astype(np.uint8)
+    n,labels,stats,_=cv2.connectedComponentsWithStats(cores,8)
+    # Keep the confirmed run's horizontal extent. This admits missing glyphs
+    # in the same columns without following neighbouring eyes or drawing lines.
+    _ys,xs=np.where(glyphs>0)
+    left,right=int(xs.min())-5,int(xs.max())+6
+    components=[]
+    for label in range(1,n):
+        x,y,w,h,area=map(int,stats[label])
+        if area<2 or max(w,h)>72 or w*h>3200 or max(w,h)>max(1,min(w,h))*12:continue
+        if x<left or x+w>right:continue
+        local=labels[y:y+h,x:x+w]==label
+        xa,ya,xb,yb=max(0,x-3),max(0,y-3),min(gray.shape[1],x+w+3),min(gray.shape[0],y+h+3)
+        core=(labels[ya:yb,xa:xb]==label).astype(np.uint8)
+        ring=(cv2.dilate(core,np.ones((5,5),np.uint8))>0)&(core==0)
+        if not np.any(ring) or np.mean(gray[ya:yb,xa:xb][ring]>=220)<.35:continue
+        components.append((x,y,w,h,local))
+    for _ in range(4):
+        near=cv2.dilate(glyphs,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(65,65)))>0
+        changed=False
+        for x,y,w,h,local in components:
+            if not np.any(local&near[y:y+h,x:x+w]):continue
+            view=glyphs[y:y+h,x:x+w]
+            if np.any(local&(view==0)):view[local]=255;changed=True
+        if not changed:break
+    envelope=cv2.dilate(glyphs,cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(9,9)))
+    rim=(source.min(axis=2)>=220)&(np.ptp(source,axis=2)<=24)&(envelope>0)
+    glyphs[rim]=255
+    glyphs=cv2.morphologyEx(glyphs,cv2.MORPH_CLOSE,np.ones((3,3),np.uint8))
+    glyphs[(scope==0)|(envelope==0)]=0
+    candidates=(source_mask>0)&(scope>0)
+    overlap=int(np.count_nonzero((glyphs>0)&candidates))
+    if overlap<32 or overlap<np.count_nonzero(candidates)*.30:return None
+    return glyphs
 
 
 def refine_smooth_inpainted_background(target: np.ndarray, mask: np.ndarray,

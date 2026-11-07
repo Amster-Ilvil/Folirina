@@ -17,7 +17,7 @@ import numpy as np
 
 from .debug import mask_overlay, matching_overlay, registration_overlay, structure_overlay
 from .export import export_openraster, export_psd_imagemagick, make_text_layer_rgba, write_rgba
-from .io_utils import save_json, write_image
+from .io_utils import atomic_hardlink, save_json, write_image
 from .mask_transfer_audit import manual_reletter_required_rows, transfer_records_to_dict
 from .storage_clone import publish_independent_png
 from .transfer_policy import (
@@ -29,12 +29,7 @@ from .transfer_policy import (
 
 
 def _replace_with_hardlink(alias: Path, target: Path) -> bool:
-    try:
-        alias.unlink(missing_ok=True)
-        os.link(target, alias)
-        return True
-    except OSError:
-        return False
+    return atomic_hardlink(alias, target)
 
 
 def _publish_existing_file(alias: Path, target: Path) -> None:

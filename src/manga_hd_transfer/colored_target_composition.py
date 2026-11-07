@@ -41,7 +41,14 @@ class TargetFirstComposition:
 
     def review_findings(self) -> tuple[list, list]:
         rows = self.diagnostics.get("rows", [])
-        unresolved = [row for row in rows if str(row.get("status", "")).startswith("deferred_")]
+        # Text-only regions without a semantic bubble are intentionally skipped
+        # by this whole-container cleaner. They remain visible in diagnostics,
+        # while the owning text-transfer audit reports any untranslated residue.
+        unresolved = [
+            row for row in rows
+            if str(row.get("status", "")).startswith("deferred_")
+            and row.get("status") != "deferred_white_geometry_missing"
+        ]
         residual = [row for row in rows if row.get("status") == "applied_target_first_lama"
                     and (int(row.get("unchanged_target_dark_pixels_outside_source_ink", 0)) > 16
                          or int(row.get("clean_base_dark_pixels", 0)) > 16)]
@@ -62,7 +69,9 @@ def _paper_is_spatially_flat(target, sample_mask):
     return len(medians) >= 3 and np.max(np.ptp(np.asarray(medians), axis=0)) <= 3
 
 
-def compose_coloured_containers(target, proposed, aligned_source, source_ink, records, callback):
+def compose_coloured_containers(
+    target, proposed, aligned_source, source_ink, records, callback, *, target_bubbles=None,
+):
     if proposed.shape != target.shape or aligned_source.shape != target.shape or source_ink.shape != target.shape[:2]:
         raise ValueError("TARGET-first composition dimensions differ")
     shape = target.shape[:2]
@@ -74,6 +83,11 @@ def compose_coloured_containers(target, proposed, aligned_source, source_ink, re
     source_gray = cv2.cvtColor(aligned_source, cv2.COLOR_BGR2GRAY)
     source_sat = cv2.cvtColor(aligned_source, cv2.COLOR_BGR2HSV)[..., 1]
     rows, plans, deferred_white_regions = [], [], []
+    semantic_bubbles = {}
+    for bubble in target_bubbles or ():
+        bubble_id = str(getattr(bubble, "id", "") or (bubble.get("id", "") if isinstance(bubble, dict) else ""))
+        if bubble_id:
+            semantic_bubbles[bubble_id] = bubble
     flat_fills = []
     for record in records or ():
         if not bool(getattr(record, "applied", False)):
@@ -97,12 +111,63 @@ def compose_coloured_containers(target, proposed, aligned_source, source_ink, re
         white_plan = plan.diagnostics.get("reason") == "target_white_container_holes"
         if white_plan:
             from .white_bubble_composite import white_bubble_interior
-            contours, _ = cv2.findContours(plan.domain, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            polygon = max(contours, key=cv2.contourArea).reshape(-1, 2).tolist() if contours else []
-            inner, _ = white_bubble_interior(target, {"polygon": polygon, "kind": "speech", "confidence": 1.0})
+            # Use the matched TARGET bubble geometry as the erase authority.
+            # Deriving a new polygon from the flood itself is circular: a flood
+            # that has escaped a burst balloon can look like a large, closed
+            # white panel and pass a paper test.  The semantic polygon is
+            # independent evidence and keeps rays, screentone and nearby art
+            # outside the bubble untouched.
+            bubble_id = str(getattr(record, "target_bubble_id", "") or "")
+            bubble = semantic_bubbles.get(bubble_id)
+            if bubble is None:
+                if target_bubbles is not None:
+                    rows.append({
+                        "id": bubble_id,
+                        "status": "deferred_white_geometry_missing",
+                        "white_domain_pixels": int(cv2.countNonZero(plan.domain)),
+                        "white_domain_bbox": list(cv2.boundingRect(plan.domain)),
+                    })
+                    continue
+                # Backward-compatible utility use without a semantic bubble
+                # collection. The production pipeline always supplies matched
+                # TARGET geometry; isolated callers retain the prior proof path.
+                contours, _ = cv2.findContours(plan.domain, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                polygon = max(contours, key=cv2.contourArea).reshape(-1, 2).tolist() if contours else []
+                bubble = {"polygon": polygon, "kind": "speech", "confidence": 1.0}
+            bubble_meta = getattr(bubble, "meta", None)
+            if bubble_meta is None and isinstance(bubble, dict):
+                bubble_meta = bubble.get("meta")
+            bubble_meta = bubble_meta if isinstance(bubble_meta, dict) else {}
+            bubble_confidence = float(
+                getattr(bubble, "confidence", None)
+                if getattr(bubble, "confidence", None) is not None
+                else (bubble.get("confidence", 0.0) if isinstance(bubble, dict) else 0.0)
+            )
+            trusted_direct_geometry = (
+                str(bubble_meta.get("backend") or "") == "source_direct_container"
+                and bubble_confidence >= 0.80
+            )
+            inner, guard_diag = white_bubble_interior(
+                target, bubble, require_enclosed=not trusted_direct_geometry,
+            )
+            guard_diag["trusted_direct_geometry"] = trusted_direct_geometry
             if inner is None:
+                rows.append({
+                    "id": bubble_id,
+                    "status": "deferred_white_geometry_unproven",
+                    "white_geometry_guard": guard_diag,
+                    "white_domain_pixels": int(cv2.countNonZero(plan.domain)),
+                    "white_domain_bbox": list(cv2.boundingRect(plan.domain)),
+                })
                 continue
+            plan.diagnostics["white_geometry_guard"] = guard_diag
+            plan.diagnostics["white_domain_pixels_before_geometry_clip"] = int(cv2.countNonZero(plan.domain))
+            plan.diagnostics["white_domain_bbox_before_geometry_clip"] = list(cv2.boundingRect(plan.domain))
+            plan.domain = inner.copy()
             plan.mask = inner
+            plan.diagnostics["domain_pixels"] = int(cv2.countNonZero(inner))
+            plan.diagnostics["domain_bbox"] = list(cv2.boundingRect(inner))
+            plan.diagnostics["clear_pixels"] = int(cv2.countNonZero(inner))
         domain = plan.domain > 0
         if np.count_nonzero(domain & (owned > 0)) / max(1, np.count_nonzero(domain)) > 0.5:
             continue

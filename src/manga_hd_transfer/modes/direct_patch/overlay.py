@@ -70,6 +70,48 @@ def classify_target_region(target: np.ndarray, region_mask: np.ndarray) -> dict[
     }
 
 
+def _white_container_target_flatness(target: np.ndarray, region_mask: np.ndarray) -> dict[str, Any]:
+    """Confirm the candidate TARGET paper is flat before using white blanking.
+
+    Sparse halftone and scan shadows can leave a white median. A white-route
+    candidate with meaningful neutral gray variation must keep the TARGET
+    underlay and use the text-only cleanup path instead.
+    """
+    use = np.asarray(region_mask) > 0
+    empty = {
+        "flat": False, "paper_ratio": 0.0, "robust_spread": 255.0,
+        "paper_median_bgr": [0, 0, 0], "reason": "empty_target_paper_region",
+    }
+    if not np.any(use):
+        return empty
+    gray = _gray(target)
+    hsv = cv2.cvtColor(target, cv2.COLOR_BGR2HSV) if target.ndim == 3 else None
+    support = use & (gray >= 205)
+    if hsv is not None:
+        support &= hsv[..., 1] <= 58
+    area = int(np.count_nonzero(use))
+    pixels = target[support]
+    paper_ratio = float(len(pixels) / max(1, area))
+    if len(pixels) < 12:
+        return {**empty, "paper_ratio": paper_ratio, "reason": "insufficient_neutral_paper"}
+    median = np.median(pixels.astype(np.float32), axis=0)
+    deviations = np.abs(pixels.astype(np.float32) - median)
+    spread = float(np.max(np.percentile(deviations, 90.0, axis=0)))
+    flat = bool(
+        paper_ratio >= 0.68 and spread <= 14.0
+        and float(np.min(median)) >= 248.0 and float(np.ptp(median)) <= 4.0
+    )
+    return {
+        "flat": flat,
+        "paper_ratio": paper_ratio,
+        "robust_spread": spread,
+        "paper_median_bgr": [float(x) for x in median.tolist()],
+        "min_paper_ratio": 0.68,
+        "max_robust_spread": 14.0,
+        "reason": "flat_neutral_white" if flat else "nonuniform_or_toned_target",
+    }
+
+
 def restore_target_structural_damage(
     candidate: np.ndarray,
     target_before: np.ndarray,
@@ -522,8 +564,21 @@ def compose_direct_overlay(
     chroma = np.ptp(target_region.astype(np.int16), axis=2)
     colored_fill = use & (hsv[..., 2] >= 160) & (hsv[..., 1] >= 12) & (chroma >= 12)
     colored_fill_ratio = float(np.count_nonzero(colored_fill) / max(1, np.count_nonzero(use)))
+    target_white_flatness: dict[str, Any] = {
+        "flat": True,
+        "reason": "not_checked_nonwhite_route",
+    }
+    nonuniform_white_rerouted = False
     if white_mode and colored_fill_ratio >= 0.02:
         white_mode = False
+    elif white_mode:
+        # A neutral gray screentone can look "white" to the color classifier.
+        # Do not normalize and repaint that whole region from SOURCE: that erases
+        # TARGET shadows/rays. Keep the TARGET underlay and transfer glyphs only.
+        target_white_flatness = _white_container_target_flatness(target_region, effective_mask)
+        if not bool(target_white_flatness.get("flat", False)):
+            white_mode = False
+            nonuniform_white_rerouted = True
     if bool(white_mode):
         candidate, write_mask, source_payload, diag = build_white_source_overlay(
             target_region, source_region, effective_mask,
@@ -571,7 +626,9 @@ def compose_direct_overlay(
     diag = dict(diag)
     diag["requested_white_mode"] = requested_white_mode
     diag["target_colored_fill_ratio"] = colored_fill_ratio
-    diag["target_color_rerouted"] = bool(requested_white_mode and not white_mode)
+    diag["target_color_rerouted"] = bool(requested_white_mode and colored_fill_ratio >= 0.02)
+    diag["target_white_flatness"] = target_white_flatness
+    diag["target_nonuniform_white_rerouted"] = nonuniform_white_rerouted
     diag["strict_support_guard"] = guard_diag
     diag["outside_allowed_source_payload_pixels"] = int(np.count_nonzero(source_payload[~allowed]))
     return candidate, write_mask, source_payload, diag

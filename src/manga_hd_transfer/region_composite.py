@@ -88,6 +88,19 @@ def _feather(mask: np.ndarray, amount: int) -> np.ndarray:
     return np.clip(alpha * 255.0, 0, 255).astype(np.uint8)
 
 
+def _outlined_source_glyphs(aligned_source: np.ndarray, selection: np.ndarray,
+                           source_mask: np.ndarray) -> np.ndarray | None:
+    """Recover SOURCE glyphs and their printed rim, without the erase halo."""
+    from .outlined_text_mask import outlined_source_text_mask
+    xa,ya,xb,yb=_roi_bounds(selection,halo=24)
+    scope=selection[ya:yb,xa:xb]
+    crop=aligned_source[ya:yb,xa:xb]
+    glyphs=outlined_source_text_mask(crop,scope,source_mask[ya:yb,xa:xb])
+    if glyphs is None:return None
+    result=np.zeros_like(selection);result[ya:yb,xa:xb]=glyphs
+    return result
+
+
 def _polygon_mask(shape: tuple[int, int], polygons: list[Any]) -> np.ndarray:
     h, w = shape; out = np.zeros((h, w), np.uint8)
     for poly in polygons or []:
@@ -499,7 +512,8 @@ def _clean_region_ocr_target(target: np.ndarray, clear: np.ndarray, selection: n
 
 def apply_region_action(current: np.ndarray, target: np.ndarray, source: np.ndarray,
                         project: dict[str, Any], row: dict[str, Any], cfg: Any,
-                        *, page_dir: str | Path | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+                        *, page_dir: str | Path | None = None,
+                        repaired_background_mask: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     mode = str(row.get("mode") or "").strip().lower()
     if mode not in REGION_MODES:
         raise ValueError(f"unknown region action: {mode}")
@@ -715,10 +729,24 @@ def apply_region_action(current: np.ndarray, target: np.ndarray, source: np.ndar
         request = deepcopy(row); request["mode"] = "effect_text"
         masks = local_ops.build_manual_effect_masks(source, target, project, request, cfg)
         src_mask = cv2.bitwise_and(np.asarray(masks.source_mask, np.uint8), selection)
+        outlined_source=_outlined_source_glyphs(masks.aligned_source,selection,src_mask)
+        if outlined_source is not None:
+            src_mask=outlined_source
         clear_base = cv2.bitwise_and(np.asarray(masks.target_clear_mask, np.uint8), selection)
         clear, clear_diag = _strengthen_region_transparent_clear_mask(
             target, masks.aligned_source, src_mask, clear_base, selection
         )
+        if outlined_source is not None:
+            from .outlined_text_mask import outlined_target_text_mask
+            xa,ya,xb,yb=_roi_bounds(selection,halo=24)
+            target_glyphs=outlined_target_text_mask(target[ya:yb,xa:xb],scope=selection[ya:yb,xa:xb])
+            if np.any(target_glyphs):
+                # Gray halftone differences near the lane are background, not
+                # Japanese strokes. Prefer proven outlined glyphs to the broad
+                # paired-difference corridor on these textured backgrounds.
+                clear[:]=0;clear[ya:yb,xa:xb]=target_glyphs
+                clear_diag['authority_policy']='outlined_target_glyphs_only'
+                clear_diag['final_target_clear_pixels']=int(np.count_nonzero(clear))
         flat_clear = np.zeros_like(clear); flat_domain = np.zeros_like(clear); flat_paper = None
         if cv2.countNonZero(src_mask):
             flat_clear, flat_domain, flat_paper, flat_diag = _manual_flat_colour_clear(target, selection)
@@ -758,10 +786,18 @@ def apply_region_action(current: np.ndarray, target: np.ndarray, source: np.ndar
         # stage.  This remains a TARGET-background-preserving operation: unlike
         # brush reveal, we do not replace the whole corridor with SOURCE pixels.
         clear = cv2.bitwise_and(clear, selection)
+        repaired=np.zeros_like(selection,dtype=bool)
+        if repaired_background_mask is not None:
+            if repaired_background_mask.shape!=selection.shape:
+                raise ValueError('repaired background mask shape mismatch')
+            repaired=(repaired_background_mask>0)&(selection>0)
+            clear[repaired]=0
+        diag['preserved_repaired_background_pixels']=int(np.count_nonzero(repaired))
         # Build a canonical TARGET-derived base for this region.  Never add the
         # SOURCE text delta to the *current* reviewed raster: doing so made a
         # repeated identical region action progressively darker/thicker.
         canonical_base = target.copy()
+        canonical_base[repaired]=current[repaired]
         if cv2.countNonZero(clear):
             from .lama_manga_runtime import status as lama_status, inpaint_koharu_text
             model_path = getattr(cfg.inpainting, "lama_model_path", None)
@@ -786,7 +822,16 @@ def apply_region_action(current: np.ndarray, target: np.ndarray, source: np.ndar
             alpha_u8 = _feather(src_mask, int(row.get("feather_px", 0) or 0))
             write = alpha_u8 > 0
             paper_safe, paper_diag = _neutral_paper_selection(canonical_base, selection)
-            if paper_safe:
+            if outlined_source is not None or np.any(repaired):
+                # A white outline is part of the lettering. Copy its exact
+                # SOURCE raster, never a brightness delta against old Japanese
+                # or the gray scan background around the glyph.
+                canonical=_alpha_composite(canonical_base,masks.aligned_source,alpha_u8)
+                delta_diag={'mode':'exact_outlined_source_raster','source_exact_pixels':int(np.count_nonzero(write)),
+                            'source_exact_byte_match':bool(int(row.get('feather_px',0) or 0)==0 and np.array_equal(canonical[write],masks.aligned_source[write]))}
+                if outlined_source is None:delta_diag['mode']='exact_source_raster_over_repaired_background'
+                paper_diag['policy']=delta_diag['mode']
+            elif paper_safe:
                 # Match the successful brush-reveal contract: on white/neutral
                 # paper the SOURCE pixels themselves contain the correct glyph
                 # antialiasing.  Do not dilate, threshold, outline, or re-render

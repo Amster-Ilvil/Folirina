@@ -110,6 +110,18 @@ def _promote_unmatched_targets_to_passthrough_pairs(
 
 
 def _planned_book_pages(pairs: list[PagePair], output: Path) -> list[tuple[int, PagePair, Path, Path]]:
+    # The workspace, page marks and resume cache all use stem_id.  Distinct
+    # final filenames alone cannot keep colliding page workspaces independent.
+    # Reject before processing rather than overwrite another page's edits.
+    page_ids: dict[str, str] = {}
+    for pair in pairs:
+        key = stem_id(pair.target_path).casefold()
+        if key in page_ids:
+            raise ValueError(
+                f"目标页面的工作目录名称冲突：{page_ids[key]} 与 {pair.target_path}。"
+                "请重命名目标图片，确保不含扩展名的页面名称互不重复（空格、标点和全半角也可能归一化为同名）。"
+            )
+        page_ids[key] = str(pair.target_path)
     pages_root = output / "pages"
     final_root = output / "final"
     pages_root.mkdir(parents=True, exist_ok=True)

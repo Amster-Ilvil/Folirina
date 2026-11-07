@@ -96,6 +96,7 @@ def _apply_manual_effect_regions(
     out = rendered.copy()
     effect_layer = np.zeros((h, w, 4), np.uint8)
     all_clear = np.zeros((h, w), np.uint8)
+    repaired_background = np.zeros((h, w), np.uint8)
     applied: list[dict] = []
     for index, row in enumerate(rows):
         row_owner = str(row.get("owner_transfer_mode", "") or "").strip().lower()
@@ -112,7 +113,13 @@ def _apply_manual_effect_regions(
         mode = str(row.get("mode", "effect_text") or "effect_text")
         if is_region_mode(mode):
             try:
-                out, region_layer, region_clear, rec = apply_region_action(out, target, source, project, row, cfg, page_dir=page_dir)
+                action=apply_region_action
+                if mode=='region_transparent':
+                    from .region_replay_cache import replay_transparent
+                    from functools import partial
+                    action=partial(replay_transparent,apply_region_action)
+                out, region_layer, region_clear, rec = action(out, target, source, project, row, cfg, page_dir=page_dir,
+                    repaired_background_mask=repaired_background)
             except Exception as exc:
                 applied.append({
                     "id": str(row.get("id", f"manual-effect-{index:03d}")),
@@ -121,6 +128,13 @@ def _apply_manual_effect_regions(
                 })
                 continue
             effect_layer = _alpha_over_bgra(effect_layer, region_layer)
+            if mode=='region_brush_reveal':
+                # Only opaque pixels of an applied LaMa patch certify a fully
+                # repaired background. Later reveal/restore strokes revoke it.
+                written=region_layer[:,:,3]>0
+                repaired_background[written]=0
+                if row.get('background_repair')=='lama_manga':
+                    repaired_background[region_layer[:,:,3]==255]=255
             if region_clear.shape == target.shape[:2]:
                 all_clear = np.maximum(all_clear, region_clear)
             applied.append(rec)

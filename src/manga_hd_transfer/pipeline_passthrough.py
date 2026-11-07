@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import cv2
 from pathlib import Path
 
@@ -9,7 +8,7 @@ import numpy as np
 from .cache import page_job_fingerprint
 from .config import PipelineConfig
 from .storage_clone import publish_independent_png
-from .io_utils import read_image, save_json, stem_id, write_image
+from .io_utils import atomic_hardlink, read_image, save_json, stem_id, write_image
 from .mode_contracts import get_mode_contract, mode_artifact_violations
 from .models import PagePair, PageProject, QAItem, RegistrationResult
 from .page_management import PageMark
@@ -18,12 +17,7 @@ from .qa import qa_summary
 
 def _replace_with_hardlink(alias: Path, target: Path) -> bool:
     """Make a lossless same-filesystem alias without duplicating page bytes."""
-    try:
-        alias.unlink(missing_ok=True)
-        os.link(target, alias)
-        return True
-    except OSError:
-        return False
+    return atomic_hardlink(alias, target)
 
 
 def emit_passthrough_page(

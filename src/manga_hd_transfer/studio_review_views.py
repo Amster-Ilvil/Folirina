@@ -710,6 +710,7 @@ class RegionSelectView(QGraphicsView):
     renderers never depend on Qt scene geometry.
     """
     selection_changed = Signal(object)          # compatibility: emits bbox
+    selection_finished = Signal(object)         # user completed a drawn region
     selection_spec_changed = Signal(object)
     brush_stroke_started = Signal(object)
     brush_stroke_segment = Signal(object)
@@ -1015,7 +1016,9 @@ class RegionSelectView(QGraphicsView):
                 spec={"schema":"folirina.region_selection.v1","kind":"freehand","points":self._points,"bbox":[]}
             else:
                 kind="smart" if self._selection_mode=="smart" else self._selection_mode; spec={"schema":"folirina.region_selection.v1","kind":kind,"bbox":[start[0],start[1],end[0],end[1]],"points":[]}
-            self._apply_raw_spec(spec,final=True); event.accept(); return
+            self._apply_raw_spec(spec,final=True)
+            self.selection_finished.emit(self.selection_spec())
+            event.accept(); return
         super().mouseReleaseEvent(event)
 
 

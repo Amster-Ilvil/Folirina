@@ -72,6 +72,15 @@ def runtime_log_dir() -> Path:
     for candidate in (preferred, Path(tempfile.gettempdir()) / "Folirina" / "logs"):
         try:
             candidate.mkdir(parents=True, exist_ok=True)
+            # An existing directory can be readable but not writable.  Merely
+            # creating it with exist_ok does not establish that logs can be
+            # opened there (for example, in a sandbox or portable install).
+            with tempfile.TemporaryFile(dir=candidate):
+                pass
+            # A previously created log can itself be read-only even when the
+            # directory permits new files.  Check the actual handler target.
+            with (candidate / "folirina.log").open("a", encoding="utf-8"):
+                pass
             return candidate
         except OSError:
             continue

@@ -277,8 +277,8 @@ def _compact_text_components(candidate: np.ndarray, *, core: np.ndarray | None =
     return keep[labels]
 
 
-def _source_text_ink_layer(source_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Extract compact black/grey SOURCE lettering, never coloured foreground.
+def _source_text_ink_layer(source_bgr: np.ndarray, *, scope: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Extract compact black/grey SOURCE lettering and proven printed rims.
 
     The SOURCE may be colour artwork, so a global ``pixel < white`` threshold
     mistakes yellow paper and other saturated fills for ink.  Estimate the
@@ -286,6 +286,7 @@ def _source_text_ink_layer(source_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarr
     stroke-like components. A one-pixel colour-mixed antialias fringe may be
     recovered around black seeds; coloured lettering has no such authority.
     Recover black-ink coverage relative to the SOURCE paper, never its colour.
+    A confirmed outlined run retains its actual white SOURCE rim as well.
     Returns coverage [0..1] and a BGR foreground colour image.
     """
     source = np.asarray(source_bgr, np.uint8)
@@ -384,6 +385,12 @@ def _source_text_ink_layer(source_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarr
         alpha = np.clip((observed @ direction) / denom, 0.0, 1.0)
         coverage[ys, xs] = alpha
         foreground[ys, xs] = ink_colour
+    if scope is not None and np.any(scope):
+        from .outlined_text_mask import outlined_source_text_mask
+        glyphs=outlined_source_text_mask(source,scope,(coverage>0).astype(np.uint8)*255)
+        if glyphs is not None:
+            use=glyphs>0
+            coverage[use]=1.0;foreground[use]=source[use]
     return coverage, foreground
 
 
@@ -400,6 +407,7 @@ def compose_reveal_patch(
     restore_mask: np.ndarray | None = None,
     inpaint_callback: Callable[[np.ndarray, np.ndarray], tuple[np.ndarray, dict]] | None = None,
     target_text_mask: np.ndarray | None = None,
+    repair_full_selection: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Clean TARGET ink in the stroke, then reveal SOURCE ink over its colour.
 
@@ -415,19 +423,26 @@ def compose_reveal_patch(
         transparent_feather_px=transparent_feather_px,
         transparent_opacity=transparent_opacity,
     )
-    # Transparent strokes reveal only the SOURCE lettering layer, not SOURCE
-    # paper/art or coloured lettering. Recover only black/grey foreground and
-    # its antialias coverage relative to the local SOURCE paper.
+    # Transparent strokes reveal the SOURCE lettering and proven printed white
+    # rims, never SOURCE paper/art or coloured lettering.
     # Hole strokes deliberately retain their exact full-underlay semantics.
-    ink, source_foreground = _source_text_ink_layer(underlay_bgr)
-    transparent_alpha = alpha.astype(np.float32) * ink
     support = (transparent_mask > 0) & (hole_mask == 0)
+    ink, source_foreground = _source_text_ink_layer(underlay_bgr,scope=support.astype(np.uint8)*255)
+    # A small bright-background stroke may not contain enough of an outlined
+    # run to establish its rim again. Keep the rim already present in both the
+    # reviewed result and SOURCE instead of erasing it using old TARGET ink.
+    near_source_ink=cv2.dilate((ink>.1).astype(np.uint8),cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(9,9)))>0
+    preserve_rim=(support & near_source_ink & (base_bgr.min(axis=2)>=220)
+                  & (underlay_bgr.min(axis=2)>=220)) if inpaint_callback is None else np.zeros_like(support)
+    transparent_alpha = alpha.astype(np.float32) * ink
     if verified_white_mask is not None and verified_white_mask.shape != support.shape:
         raise ValueError("brush white-bubble authority shape mismatch")
     white_support = support & (verified_white_mask > 0) if verified_white_mask is not None else np.zeros_like(support)
     reference = base_bgr if target_bgr is None else target_bgr
     if reference.shape != base_bgr.shape:
         raise ValueError("brush TARGET reference shape mismatch")
+    reviewed_change=(np.max(np.abs(base_bgr.astype(np.int16)-reference.astype(np.int16)),axis=2)>24).astype(np.uint8)
+    preserve_rim &= cv2.dilate(reviewed_change,np.ones((9,9),np.uint8))>0
     from .outlined_text_mask import outlined_target_text_mask
     if target_text_mask is not None and target_text_mask.shape != support.shape:
         raise ValueError('brush TARGET text evidence mask shape mismatch')
@@ -487,10 +502,24 @@ def compose_reveal_patch(
     # leaks or immutable illustration highlights. Remove their complete proven
     # footprint before revealing Chinese, including cores already erased white.
     clear[outlined > 0] = 255
+    clear[preserve_rim]=0
     if np.any(outlined) and inpaint_callback is not None:
+        from .textured_text_cleanup import outlined_text_clear
+        clear = outlined_text_clear(reference, clear, support.astype(np.uint8)*255)
+        clear[~support] = 0
+        if repair_full_selection:
+            # Explicit manual LaMa repair owns the user's painted/selected
+            # footprint. Re-detecting only glyph cores leaves white remnants
+            # inside that footprint, even after the user asked to erase them.
+            clear = support.astype(np.uint8) * 255
         # Model conditioning must use pristine TARGET, never partially erased
         # white silhouettes or Chinese pixels from the current result.
-        repaired, _diagnostics = inpaint_callback(reference.copy(), clear.copy())
+        # Final-image retouch conditions on the current result. Japanese below
+        # a partial selection must not guide the model to grow old strokes back
+        # into an area the user has just erased. Detector evidence still comes
+        # from the original TARGET above.
+        model_input = base_bgr if repair_full_selection else reference
+        repaired, _diagnostics = inpaint_callback(model_input.copy(), clear.copy())
         if not isinstance(repaired, np.ndarray) or repaired.shape != reference.shape or repaired.dtype != np.uint8:
             raise ValueError("background repair must return matching uint8 BGR")
         cleaned = working.copy()
@@ -574,6 +603,7 @@ def compose_reveal_patch(
             ).astype(np.uint8)
             replacement[white_damage] = repaired[white_damage]
         publish_alpha = np.where(white_damage, alpha, publish_alpha)
+    publish_alpha=np.where(preserve_rim,0,publish_alpha)
     replacement = np.where((hole_mask > 0)[:, :, None], underlay_bgr, replacement)
     alpha = np.where(hole_mask > 0, alpha, publish_alpha).astype(np.uint8)
     # Restore owns original TARGET pixels even when base already contains a
